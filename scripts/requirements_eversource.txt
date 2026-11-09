@@ -1,0 +1,11 @@
+ezDxf
+geopandas
+shapely
+pyproj
+pyogrio
+pandas
+numpy
+scipy
+laspy
+lazrs
+psutil
