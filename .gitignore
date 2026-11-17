@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+scripts/workspace_config.json
+output/*
+!output/.gitkeep
+input/*
+!input/.gitkeep

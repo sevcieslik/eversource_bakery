@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+from bakery_version import BAKERY_VERSION, BAKERY_RELEASE
 
 import csv
 import json
@@ -11,6 +12,7 @@ import sys
 import threading
 import psutil
 import time
+import webbrowser
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -222,7 +224,7 @@ def hidden_process_kwargs():
 class BakeryGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("NM Group - TX Veg Delivery Bakery")
+        self.title(f"NM Group - TX Veg Delivery Bakery {BAKERY_VERSION}")
         self.geometry("1500x900")
         self.minsize(1180, 760)
         self.configure(bg=BG)
@@ -379,7 +381,7 @@ class BakeryGUI(tk.Tk):
         ttk.Label(left, text="TX VEG DELIVERY BAKERY", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             left,
-            text="NMIP26068 Eversource Production Tool  •  production workflow with a bakery problem",
+            text=f"NMIP26068 Eversource Tester {BAKERY_VERSION}  •  {BAKERY_RELEASE}",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(2, 0))
         self.ready_badge = tk.Label(
@@ -418,6 +420,12 @@ class BakeryGUI(tk.Tk):
             tk.Label(txtbox, text=sub, bg=PANEL_2, fg=MUTED,
                      font=("Segoe UI", 8)).pack(anchor="w")
             self.stage_labels[name] = (box, lbl)
+
+        # Always-visible help action, bottom of left navigation.
+        ttk.Button(
+            sidebar, text="Operator Manual", style="Secondary.TButton",
+            command=self._open_operator_manual
+        ).pack(side="bottom", fill="x", pady=(12, 0))
 
         # Main + right
         main = ttk.Frame(body, style="Bakery.TFrame")
@@ -824,6 +832,21 @@ class BakeryGUI(tk.Tk):
             return
         self._open_folder(Path(self.output_var.get()) / "QA")
 
+    def _open_operator_manual(self):
+        manual = ROOT / "docs" / "operator_manual.html"
+        if not manual.is_file():
+            messagebox.showerror(
+                "Operator Manual",
+                f"Manual not found:\n{manual}\n\nReinstall the complete R01.04 package.",
+            )
+            return
+        try:
+            opened = webbrowser.open(manual.resolve().as_uri())
+            if not opened:
+                raise RuntimeError("No browser accepted the manual URL")
+        except Exception as exc:
+            messagebox.showerror("Operator Manual", f"Could not open manual:\n{exc}")
+
     def _validate_start(self):
         inp = Path(self.input_var.get().strip())
         out = Path(self.output_var.get().strip())
@@ -877,7 +900,8 @@ class BakeryGUI(tk.Tk):
         self.summary_badge.configure(text="BATCH IN PROGRESS", bg="#f6ddc8", fg=ACCENT_DARK)
         self._set_stage("PREHEATING", "Validating inputs, AOIs and LiDAR coverage")
         self._clear_log()
-        self._append_log("TX Veg Delivery Bakery batch started.")
+        self._append_log(f"TX Veg Delivery Bakery {BAKERY_VERSION} batch started.")
+        self._append_log(f"Release: {BAKERY_RELEASE}")
         self._append_log(f"Input:  {inp}")
         self._append_log(f"Source: {SOURCE}")
         self._append_log(f"Output: {out}")
