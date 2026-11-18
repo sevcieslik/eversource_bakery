@@ -21,6 +21,7 @@ PRODUCTS = {
     "3": ("pls", "PLS XYZ - 15 NMIP26068 feature files + Full Class backups"),
     "4": ("tile_index", "Tile Index"),
     "5": ("management_units", "Management Units"),
+    "6": ("geometry_from_gpkg", "Geometry re-export from edited QA GPKG (01_eversource_geometry.gpkg)"),
 }
 
 
@@ -60,7 +61,7 @@ def choose_products():
         if mode == "Q":
             return []
         if mode == "A":
-            return [v[0] for v in PRODUCTS.values()]
+            return [v[0] for v in PRODUCTS.values() if v[0] != "geometry_from_gpkg"]
         if mode == "S":
             print("\nSelect product groups:")
             for k, (_, label) in PRODUCTS.items():
@@ -134,7 +135,14 @@ def main():
             "--selection", str(selection_path),
         )
 
-    point_products = [p for p in products if p != "geometry"]
+    if "geometry_from_gpkg" in products:
+        call(
+            "RE-PACKING",
+            "scripts/04_export_geometry_from_gpkg.py",
+            "--output-root", str(output_root),
+        )
+
+    point_products = [p for p in products if p not in ("geometry", "geometry_from_gpkg")]
     if point_products:
         point_stage_bits = []
         if "lidar" in point_products:

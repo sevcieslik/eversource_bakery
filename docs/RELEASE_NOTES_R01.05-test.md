@@ -2,12 +2,12 @@
 
 Test build for the NMIP26028 Bakery Geometry feedback (Clusters 12, 17, 39, 55).
 Before/after on Cluster 12: `R01.05-test_Cluster12_before_after.png`.
-Built on R01.04. Only the 01 Geometry stage changes. LiDAR, PLS and points stages are untouched.
+Built on R01.04. Only the 01 Geometry stage changes, plus a new re-export from the edited QA GPKG (F). LiDAR, PLS and points stages are untouched.
 
 ## Install
 
 1. Make a copy of an existing `Eversource_Tester_R01.04` folder (keep `.venv`, `source`, `input`).
-2. Copy `scripts/eversource_pipeline_core.py` and `scripts/bakery_version.py` from this package over the copy.
+2. Copy these files from `scripts/` over the copy: `eversource_pipeline_core.py`, `bakery_version.py`, `04_export_geometry_from_gpkg.py`, `run_eversource_pipeline.py`, `tx_veg_bakery_gui.py`.
 3. Run Geometry as usual. The console shows `EVERSOURCE TESTER R01.05-test - 01 GEOMETRY`.
 
 Do not overwrite the production R01.04 folder.
@@ -35,6 +35,36 @@ Feedback addressed: missing wires and gaps; circuits stopping mid-span; POAs wit
 A Caydence wire attributed to a circuit is moved to the nearest RoW that carries that circuit, if its nearest-centreline RoW does not. The moves are listed in the new `01_geometry/01_caydence_row_circuit_fix.csv`.
 Feedback addressed: Caydence wires mixed between RoWs in shared tiles (C55).
 
+**E. RoW boundaries fall on Structures (update 2026-11-18)**
+- **Spans:** each span keeps the RoW of the SoW circuit line it follows; the switch between RoWs happens on a Structure. A span is delivered in both RoWs only where both RoWs' SoW lines run along it (start/end overlap, mean distance ≤ 15 m).
+- **Structures:** a Structure is delivered in every RoW whose spans end on it. The last Structure of one RoW is also the first of the next (`ROW_RULE = BOUNDARY_SPAN_END` in `structures_final`). Extra Structures are deliberate: removing one is easier than adding a missing one.
+- **Caydence wires:** a Caydence 3D wire takes the RoW of the span it belongs to (`ROW_RULE = SPAN`). All conductors of a span now sit in one RoW and end on the same Structures. Wires outside delivered spans take the RoW of the nearest Structure of the same circuit (`STRUCTURE`).
+- **QA:** every move and duplicate is listed in `01_geometry/01_row_boundary_qa.csv`.
+
+Feedback addressed: X116 at NH_05/NH_25 (DXF_W004321/W004323 split between RoWs) and S188 at NH_05/NH_11 (DXF_W007247 in NH_05). The same fix covered Z119 (NH_05/NH_25) and H123/K165 (NH_05/NH_09).
+
+**F. Export from an edited QA GPKG (new)**
+1. Run Geometry.
+2. Open `output/01_geometry/01_eversource_geometry.gpkg` in QGIS and edit:
+
+   | Layer | What to edit |
+   |---|---|
+   | `selected_span_wires` | 2D spans: `ROW` / `CIRCUIT`; delete a feature to drop a span. One feature per span and RoW. |
+   | `recovered_terminal_2d` | 2D conductors into substations: `CIRCUIT`. Their RoW follows the nearest span of that circuit. |
+   | `structures_final` | Circuit and Caydence Structures: `ROW` / `CIRCUIT`; delete or copy features. |
+   | `caydence_wires_3d` | Caydence 3D wires: `ROW` / `CIRCUIT` / `WIRE_TYPE`. |
+
+   `ROW` may hold several RoWs, e.g. `NH_05;NH_25`, to deliver a feature in both. Caydence 3D Structures are always rebuilt from `structures_final`.
+3. Save the edits and run **Export from edited GPKG**: a GUI button, launcher product 6, or `python scripts/04_export_geometry_from_gpkg.py --output-root <output>`.
+   - Only `deliverables/<RoW>/Circuit` and `deliverables/<RoW>/Caydence` are rebuilt.
+   - The previous folders are first copied to `QA/<time>_01_geometry_export_from_gpkg/deliverables_before`.
+   - Tile Index, Management Units and LAS are not touched.
+4. Check `01_gpkg_export_checks.csv` in the same QA folder. It flags:
+   - span ends without a Structure of that circuit in the same RoW,
+   - spans, Structures or Caydence wires placed in a RoW whose SoW does not carry the circuit.
+
+Re-exporting an unedited GPKG gives identical deliverables: Cluster 12, 78/78 files, same feature counts, lengths within 0.1 m. The GPKG now also holds an `export_settings` table (year, selected RoWs, units).
+
 ## Cluster 12 test results (NH_05/09/11/14/25, same inputs)
 
 | Check | R01.04 | R01.05-test |
@@ -45,10 +75,11 @@ Feedback addressed: Caydence wires mixed between RoWs in shared tiles (C55).
 | Circuit length discarded as disconnected | 18.4 km | 0 km |
 | Total delivered 2D circuit length | 214.4 km | 233.2 km |
 | Recovered terminal POAs | 173 | 6 |
-| Structure pairs closer than 3 m | 39 | 5 |
+| Structure pairs closer than 3 m | 39 | 5 shared towers + 5 deliberate boundary Structures in the neighbouring RoW (E) |
 | Structures in a RoW without their circuit (SoW) | 26 | 0 |
 | Caydence wires in a RoW without their circuit | 67 | 0 |
-| Source structure reused within a circuit | 33 | 1 |
+| Source structure reused within a circuit and RoW | 33 | 1 |
+| Caydence wires moved to their span's RoW (E) | – | 18 |
 
 Recovered circuit length:
 - 326: +7.7 km
@@ -57,7 +88,7 @@ Recovered circuit length:
 
 Folders removed as wrong: NH_05 I158 and W144; NH_09 326 and 380; NH_11 3124, 326 and 380; NH_14 3124, 326, 380 and T120.
 
-The R01.04 SCHF/SCSH regression tests still pass.
+The R01.03/R01.04 SCHF/SCSH regression tests still pass. New: `scripts/test_row_boundary_r0105.py` (RoW boundaries and GPKG re-export).
 The baseline run reproduced the operator's R01.04 Cluster 12 output exactly: 173 terminal POAs, 38 terminal 2D, 62 corridor matches.
 
 ## Known limits / please check

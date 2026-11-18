@@ -610,6 +610,11 @@ class BakeryGUI(tk.Tk):
             btns, text="Open QA", style="Secondary.TButton",
             command=self._open_qa
         ).pack(fill="x", pady=3)
+        self.gpkg_export_btn = ttk.Button(
+            btns, text="Export from edited GPKG", style="Secondary.TButton",
+            command=self._start_gpkg_export
+        )
+        self.gpkg_export_btn.pack(fill="x", pady=3)
 
         self._refresh_qa()
 
@@ -837,7 +842,7 @@ class BakeryGUI(tk.Tk):
         if not manual.is_file():
             messagebox.showerror(
                 "Operator Manual",
-                f"Manual not found:\n{manual}\n\nReinstall the complete R01.04 package.",
+                f"Manual not found:\n{manual}\n\nReinstall the complete Eversource Tester package.",
             )
             return
         try:
@@ -931,6 +936,58 @@ class BakeryGUI(tk.Tk):
         )
         self.worker_thread.start()
 
+
+    def _start_gpkg_export(self):
+        """R01.05: rebuild Circuit/Caydence deliverables from the edited QA GPKG."""
+        if self.worker_thread and self.worker_thread.is_alive():
+            return
+        out_txt = self.output_var.get().strip()
+        if not out_txt:
+            messagebox.showerror("Export from edited GPKG", "Choose the output folder first.")
+            return
+        out = Path(out_txt)
+        gpkg = out / "01_geometry" / "01_eversource_geometry.gpkg"
+        if not gpkg.is_file():
+            messagebox.showerror(
+                "Export from edited GPKG",
+                f"Geometry GPKG not found:\n{gpkg}\n\nRun Geometry first.",
+            )
+            return
+        if not messagebox.askyesno(
+            "Export from edited GPKG",
+            "Rebuild the Circuit and Caydence deliverables from:\n"
+            f"{gpkg}\n\nClose the GPKG in QGIS (or save your edits) first.\n"
+            "The current Circuit/Caydence folders are copied to QA before they are replaced.\n"
+            "Tile Index, Management Units and LAS are not touched.\n\nContinue?",
+        ):
+            return
+        self.cancel_requested = False
+        self.started_at = time.monotonic()
+        self.total_paused_seconds = 0.0
+        self.status_var.set("Running")
+        self.start_btn.configure(state="disabled")
+        self.gpkg_export_btn.configure(state="disabled")
+        self._clear_log()
+        self._append_log(f"TX Veg Delivery Bakery {BAKERY_VERSION}: export from edited GPKG.")
+        self._append_log(f"GPKG: {gpkg}")
+
+        def work():
+            try:
+                rc = self._run_process(
+                    "RE-PACKING",
+                    ROOT / "scripts" / "04_export_geometry_from_gpkg.py",
+                    "--output-root", str(out),
+                )
+                if rc != 0:
+                    raise RuntimeError("Export from GPKG failed.")
+                self.events.put(("done", None))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+            finally:
+                self.after(0, lambda: self.gpkg_export_btn.configure(state="normal"))
+
+        self.worker_thread = threading.Thread(target=work, daemon=True)
+        self.worker_thread.start()
 
     def _read_preflight_rows(self, output_root: Path):
         """Read the preflight coverage table for the GUI RoW selection dialog."""
@@ -1679,6 +1736,7 @@ class BakeryGUI(tk.Tk):
                         "PREHEATING": "Checking source data, AOIs and LiDAR coverage",
                         "MIXING": "Building geometry and Caydence products",
                         "BAKING / ICING / PACKING": "Building selected point-cloud products",
+                        "RE-PACKING": "Rebuilding Circuit/Caydence from the edited GPKG",
                     }.get(st, "Processing")
                     self._set_stage(st, detail)
                 elif kind == "progress":

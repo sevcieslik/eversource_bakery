@@ -7539,6 +7539,150 @@ def reassign_caydence_row_to_circuit_rows(cayd_w, kmz, selected_rows, unit_to_m)
     return out, pd.DataFrame(qa)
 
 
+ROW_OVERLAP_TOL_M = 15.0
+ROW_STRUCTURE_ANCHOR_M = 15.0
+
+
+def _split_rows(value) -> list[str]:
+    return [t.strip() for t in str(value or "").replace(",", ";").split(";")
+            if t.strip() and t.strip().lower() not in {"nan", "none"}]
+
+
+def apply_row_boundaries_at_structures(
+    span_edges, structures_final, cayd_w, bundles, kmz, selected_rows,
+    unit_to_m, overlap_tol_m=ROW_OVERLAP_TOL_M,
+    structure_anchor_m=ROW_STRUCTURE_ANCHOR_M,
+):
+    """R01.05: RoW boundaries fall on Structures, never inside a span.
+
+    1. Each delivered span keeps its RoW. It is also given every other RoW of
+       its circuit whose SoW circuit line runs along the same span (mean
+       distance <= overlap_tol_m): spans in the start/end overlap of two RoWs
+       are delivered in both.
+    2. A Structure is delivered in every RoW of the spans that end on it, so
+       the last Structure of one RoW is also the first of the next.
+    3. A Caydence 3D wire takes the RoW(s) of the span it belongs to, so all
+       conductors of a span sit in the same RoW and end on the same
+       Structures. Wires outside delivered spans take the RoWs of the nearest
+       same-circuit Structure (<= structure_anchor_m); others are unchanged.
+    """
+    sel = {txt(x) for x in (selected_rows or []) if txt(x)}
+    qa = []
+    if span_edges is None or span_edges.empty:
+        return span_edges, structures_final, cayd_w, pd.DataFrame()
+    se = span_edges.copy()
+    tol = overlap_tol_m / unit_to_m
+
+    def circuit_rows(c):
+        rows = dict((kmz.get(circuit_key(c)) or {}).get("rows", {}) or {})
+        return {k: v for k, v in rows.items() if (not sel or k in sel) and v is not None}
+
+    span_rows = []
+    for i, r in se.iterrows():
+        prim = txt(r.get("ROW"))
+        rows = {prim} if prim else set()
+        g = r.geometry
+        if g is not None and not g.is_empty:
+            pts = [g.interpolate(t, normalized=True) for t in np.linspace(0, 1, 11)]
+            for rn, rg in circuit_rows(txt(r.get("CIRCUIT"))).items():
+                if rn in rows:
+                    continue
+                if float(np.mean([p.distance(rg) for p in pts])) <= tol:
+                    rows.add(rn)
+                    qa.append({"KIND": "SPAN_OVERLAP_DUPLICATE", "CIRCUIT": txt(r.get("CIRCUIT")),
+                               "ID": f"{txt(r.get('STRUCT_A'))}-{txt(r.get('STRUCT_B'))}",
+                               "ROW": prim, "ADDED_ROW": rn})
+        span_rows.append(";".join(sorted(rows)))
+    se["ROWS"] = span_rows
+
+    node_rows = defaultdict(set)
+    bundle_rows = {}
+    for _, r in se.iterrows():
+        c = txt(r.get("CIRCUIT"))
+        rows = set(_split_rows(r["ROWS"]))
+        for n in (txt(r.get("STRUCT_A")), txt(r.get("STRUCT_B"))):
+            if n:
+                node_rows[(c, n)].update(rows)
+        try:
+            bundle_rows[(c, int(r.get("BUNDLE_ID")))] = rows
+        except (TypeError, ValueError):
+            pass
+
+    # Structures: one record per RoW of the spans meeting at it.
+    sf = structures_final
+    if sf is not None and not sf.empty and "TOPO_ID" in sf.columns:
+        extra = []
+        sf = sf.copy()
+        sf["ROW_RULE"] = "OWN"
+        for i, r in sf.iterrows():
+            c, own = txt(r.get("CIRCUIT")), txt(r.get("ROW"))
+            want = node_rows.get((c, txt(r.get("TOPO_ID"))), set())
+            for rn in sorted(want - {own}):
+                if sel and rn not in sel:
+                    continue
+                d = r.copy()
+                d["ROW"] = rn
+                d["ROW_RULE"] = "BOUNDARY_SPAN_END"
+                extra.append(d)
+                qa.append({"KIND": "STRUCTURE_BOUNDARY_DUPLICATE", "CIRCUIT": c,
+                           "ID": f"{txt(r.get('TOPO_ID'))}/{txt(r.get('STRUCT_ID'))}",
+                           "ROW": own, "ADDED_ROW": rn})
+        if extra:
+            sf = gpd.GeoDataFrame(pd.concat([sf, gpd.GeoDataFrame(extra, crs=sf.crs)],
+                                            ignore_index=True), geometry="geometry", crs=sf.crs)
+
+    # Caydence: RoW of the wire's span.
+    cw = cayd_w
+    if cw is not None and not cw.empty:
+        wire_bundle = {}
+        for b in bundles or []:
+            for wi in b.get("ALL_WIRE_ROWS", []) or []:
+                wire_bundle.setdefault(int(wi), []).append(int(b["BUNDLE_ID"]))
+        st_idx = defaultdict(list)
+        if sf is not None and not sf.empty:
+            for c, g in sf.groupby(sf["CIRCUIT"].astype(str)):
+                st_idx[c] = list(zip(g.geometry, g["ROW"].astype(str)))
+        anchor = structure_anchor_m / unit_to_m
+        out_rows = []
+        for _, r in cw.iterrows():
+            c = txt(r.get("CIRCUIT"))
+            cur = txt(r.get("ROW"))
+            rows, rule = None, "NEAREST_ROW"
+            src = r.get("SOURCE_IDX")
+            if c and pd.notna(src):
+                for bid in wire_bundle.get(int(src), []):
+                    if (c, bid) in bundle_rows:
+                        rows, rule = set(bundle_rows[(c, bid)]), "SPAN"
+                        break
+            if rows is None and c and st_idx.get(c) and r.geometry is not None:
+                co = list(r.geometry.coords)
+                ends = [Point(co[0][:2]), Point(co[-1][:2])]
+                near = {rn for gpt, rn in st_idx[c]
+                        if min(gpt.distance(e) for e in ends) <= anchor}
+                if near:
+                    rows, rule = near, "STRUCTURE"
+            if not rows:
+                rows = {cur}
+            rows = sorted(x for x in rows if x)
+            if cur in rows:
+                rows.remove(cur)
+                rows.insert(0, cur)
+            for k, rn in enumerate(rows):
+                d = r.copy()
+                d["ROW"] = rn
+                d["ROW_RULE"] = rule if k == 0 else rule + "_DUPLICATE"
+                out_rows.append(d)
+                if rn != cur:
+                    qa.append({"KIND": "CAYDENCE_" + ("MOVED" if k == 0 else "DUPLICATE"),
+                               "CIRCUIT": c, "ID": txt(r.get("WIRE_ID")), "ROW": cur,
+                               "ADDED_ROW": rn, "RULE": rule})
+        cw = gpd.GeoDataFrame(out_rows, geometry="geometry", crs=cayd_w.crs).reset_index(drop=True)
+        for k in ("continuity_qa", "earth_continuity_qa"):
+            if k in getattr(cayd_w, "attrs", {}):
+                cw.attrs[k] = cayd_w.attrs[k]
+    return se, sf, cw, pd.DataFrame(qa)
+
+
 def _circuit_wire_parts_by_row(wire_geom, spans_c, unit_to_m, tol_m=0.5):
     """Split one circuit's delivered 2D wire into RoW parts using span RoWs.
 
@@ -7550,6 +7694,8 @@ def _circuit_wire_parts_by_row(wire_geom, spans_c, unit_to_m, tol_m=0.5):
         return {}
     if spans_c is None or spans_c.empty:
         return {}
+    if "ROWS" in spans_c.columns:
+        spans_c = spans_c.assign(ROW=spans_c["ROWS"].map(_split_rows)).explode("ROW")
     by_row = {}
     for row, g in spans_c.groupby(spans_c["ROW"].astype(str)):
         if txt(row):
@@ -7585,6 +7731,276 @@ def _circuit_wire_parts_by_row(wire_geom, spans_c, unit_to_m, tol_m=0.5):
         merged = linemerge(MultiLineString(ls)) if len(ls) > 1 else ls[0]
         out[r] = merged
     return out
+
+
+EXPORT_SETTINGS_LAYER = "export_settings"
+GPKG_EDITABLE_LAYERS = ("selected_span_wires", "recovered_terminal_2d",
+                        "structures_final", "caydence_wires_3d")
+
+
+def spans_one_row_per_feature(span_edges):
+    """QA/edit view of delivered spans: one feature per (span, RoW).
+
+    A span delivered in two RoWs (start/end overlap) appears twice, so the
+    operator can delete or re-assign each copy on its own.
+    """
+    if span_edges is None or span_edges.empty or "ROWS" not in span_edges.columns:
+        return span_edges
+    out = span_edges.copy()
+    out["ROW_RULE"] = [
+        ["OWN" if r == txt(prim) else "OVERLAP_DUPLICATE" for r in _split_rows(rows)]
+        for rows, prim in zip(out["ROWS"], out["ROW"])
+    ]
+    out["ROW"] = out["ROWS"].map(_split_rows)
+    out = out.explode(["ROW", "ROW_RULE"]).drop(columns=["ROWS"])
+    return gpd.GeoDataFrame(out.reset_index(drop=True), geometry="geometry", crs=span_edges.crs)
+
+
+def _bakery_version_text():
+    try:
+        from bakery_version import BAKERY_VERSION
+        return BAKERY_VERSION
+    except Exception:
+        return ""
+
+
+def write_export_settings(gpkg, year, selected_rows, unit_to_m, epsg=None):
+    """Store what a later re-export from this GPKG needs to reproduce the run."""
+    import pyogrio
+    try:
+        epsg_txt = txt(epsg.to_epsg()) if hasattr(epsg, "to_epsg") else txt(epsg)
+    except Exception:
+        epsg_txt = ""
+    vals = {
+        "BAKERY_VERSION": _bakery_version_text(),
+        "YEAR": str(int(year)),
+        "SELECTED_ROWS": ";".join(sorted(txt(r) for r in (selected_rows or []) if txt(r))),
+        "UNIT_TO_M": repr(float(unit_to_m)),
+        "EPSG": epsg_txt,
+        "EDITABLE_LAYERS": ";".join(GPKG_EDITABLE_LAYERS),
+    }
+    df = pd.DataFrame({"KEY": list(vals), "VALUE": list(vals.values())})
+    pyogrio.write_dataframe(gpd.GeoDataFrame(df), str(gpkg), layer=EXPORT_SETTINGS_LAYER)
+
+
+def _read_export_settings(gpkg):
+    import pyogrio
+    names = {n for n, _ in pyogrio.list_layers(str(gpkg))}
+    if EXPORT_SETTINGS_LAYER not in names:
+        return {}
+    df = gpd.read_file(gpkg, layer=EXPORT_SETTINGS_LAYER)
+    return {txt(k): txt(v) for k, v in zip(df["KEY"], df["VALUE"])}
+
+
+def _explode_row_field(gdf):
+    """ROW may hold several RoWs separated by ';' -> one feature per RoW."""
+    if gdf is None or gdf.empty or "ROW" not in gdf.columns:
+        return gdf
+    out = gdf.copy()
+    out["ROW"] = out["ROW"].map(_split_rows)
+    out = out.explode("ROW")
+    out = out[out["ROW"].notna() & (out["ROW"].astype(str).str.len() > 0)]
+    return gpd.GeoDataFrame(out.reset_index(drop=True), geometry="geometry", crs=gdf.crs)
+
+
+def export_geometry_from_gpkg(gpkg, deliverables, year=None, backup_dir=None):
+    """R01.05: rebuild the geometry deliverables from an operator-edited QA GPKG.
+
+    Editable layers (QGIS: edit attributes, delete or copy features):
+      selected_span_wires   2D spans. ROW / CIRCUIT decide where each span goes.
+      recovered_terminal_2d 2D conductors into substations. CIRCUIT; the RoW
+                            follows the nearest span of that circuit.
+      structures_final      Circuit + Caydence Structures. ROW / CIRCUIT.
+      caydence_wires_3d     Caydence 3D wires. ROW / CIRCUIT / WIRE_TYPE.
+    ROW may list several RoWs as 'NH_05;NH_25' to deliver a feature in both.
+    Caydence 3D Structures are always regenerated from structures_final.
+    Only the Circuit and Caydence folders of the affected RoWs are replaced;
+    Tile Index, Management Units and LAS products are left untouched.
+    """
+    import pyogrio
+    from shapely.ops import linemerge, unary_union
+    gpkg = Path(gpkg)
+    deliverables = Path(deliverables)
+    layers = {n for n, _ in pyogrio.list_layers(str(gpkg))}
+    need = {"selected_span_wires", "structures_final", "caydence_wires_3d"}
+    missing = need - layers
+    if missing:
+        raise RuntimeError(f"GPKG is missing layer(s): {', '.join(sorted(missing))}")
+    settings = _read_export_settings(gpkg)
+    year = int(year or settings.get("YEAR") or 2026)
+
+    spans = _explode_row_field(gpd.read_file(gpkg, layer="selected_span_wires"))
+    term = (gpd.read_file(gpkg, layer="recovered_terminal_2d")
+            if "recovered_terminal_2d" in layers else None)
+    structures = _explode_row_field(gpd.read_file(gpkg, layer="structures_final"))
+    cayd_w = _explode_row_field(gpd.read_file(gpkg, layer="caydence_wires_3d"))
+    kref = gpd.read_file(gpkg, layer="kmz_reference") if "kmz_reference" in layers else None
+    crs = spans.crs
+    try:
+        unit_to_m = float(settings.get("UNIT_TO_M") or crs.axis_info[0].unit_conversion_factor)
+    except Exception:
+        unit_to_m = 1.0
+
+    spans = spans[spans["CIRCUIT"].astype(str).str.strip().str.len() > 0].copy()
+    spans = spans[spans.geometry.notna() & ~spans.geometry.is_empty]
+    spans = gpd.GeoDataFrame(spans, geometry="geometry", crs=crs)
+
+    def first_val(series):
+        for v in series:
+            if txt(v):
+                return txt(v)
+        return ""
+
+    kmz_meta = {}
+    if kref is not None and not kref.empty:
+        for c, g in kref.groupby(kref["CIRCUIT"].astype(str)):
+            kmz_meta[c] = {"VOLTAGE": first_val(g.get("VOLTAGE", [])),
+                           "COMPANY": first_val(g.get("COMPANY", [])),
+                           "ROWS": {txt(x) for x in g["ROW"]}}
+
+    # Short connectors that join consecutive spans at a Structure exist only
+    # in wires_2d. Keep a connector for a circuit while both of its ends still
+    # touch that circuit's (edited) spans, so the 2D wire stays continuous.
+    orig = gpd.read_file(gpkg, layer="wires_2d") if "wires_2d" in layers else None
+    all_lines = list(spans.geometry)
+    if term is not None and not term.empty:
+        all_lines += [x for x in term.geometry if x is not None and not x.is_empty]
+    covered = unary_union(all_lines).buffer(0.3 / unit_to_m) if all_lines else None
+    max_conn = 10.0 / unit_to_m
+    touch = 1.0 / unit_to_m
+
+    def connectors(c, own):
+        if orig is None or covered is None:
+            return []
+        g0 = orig[orig["CIRCUIT"].astype(str) == c]
+        if g0.empty:
+            return []
+        own_u = unary_union(own)
+        out = []
+        for geom in g0.geometry:
+            rest = geom.difference(covered)
+            for piece in getattr(rest, "geoms", [rest]):
+                if piece.is_empty or piece.geom_type != "LineString" or piece.length > max_conn:
+                    continue
+                a, b = Point(piece.coords[0]), Point(piece.coords[-1])
+                if a.distance(own_u) <= touch and b.distance(own_u) <= touch:
+                    out.append(piece)
+        return out
+
+    def lines_of(g):
+        if g is None or g.is_empty:
+            return []
+        if g.geom_type == "LineString":
+            return [g]
+        return [x for gg in getattr(g, "geoms", []) for x in lines_of(gg)]
+
+    wires = []
+    for c, g in spans.groupby(spans["CIRCUIT"].astype(str)):
+        own = list(g.geometry)
+        if term is not None and not term.empty and "CIRCUIT" in term.columns:
+            own += [x for x in term[term["CIRCUIT"].astype(str) == c].geometry
+                    if x is not None and not x.is_empty]
+        own_buf = unary_union(own).buffer(0.5 / unit_to_m)
+        base = None
+        if orig is not None:
+            g0 = orig[orig["CIRCUIT"].astype(str) == c]
+            if not g0.empty:
+                base = unary_union(list(g0.geometry))
+        if base is not None:
+            # Original (simplified, joined) 2D where the circuit's spans remain,
+            # plus spans that were moved to this circuit in the GPKG.
+            kept = lines_of(base.intersection(own_buf))
+            base_buf = base.buffer(1.0 / unit_to_m)
+            added = [x for x in own
+                     if x.length > 0 and x.intersection(base_buf).length < 0.9 * x.length]
+            own_u = unary_union(own)
+            conn = [
+                piece for piece in lines_of(base.difference(own_buf))
+                if piece.length <= max_conn
+                and Point(piece.coords[0]).distance(own_u) <= touch
+                and Point(piece.coords[-1]).distance(own_u) <= touch
+            ]
+            parts = kept + conn + added
+        else:
+            parts = own + connectors(c, own)
+        merged = unary_union(parts)
+        try:
+            merged = linemerge(merged)
+        except Exception:
+            pass
+        m = kmz_meta.get(c, {})
+        wires.append({
+            "ROW": ";".join(sorted({txt(x) for x in g["ROW"]})),
+            "CIRCUIT": c,
+            "VOLTAGE": m.get("VOLTAGE") or first_val(g.get("VOLTAGE", [])),
+            "COMPANY": m.get("COMPANY") or first_val(g.get("COMPANY", [])),
+            "geometry": merged,
+        })
+    final_wires = rows_to_gdf(wires, crs)
+
+    rows = set(_split_rows(settings.get("SELECTED_ROWS", "")))
+    for df in (spans, structures, cayd_w):
+        if df is not None and not df.empty:
+            rows |= {txt(x) for x in df["ROW"] if txt(x)}
+
+    if backup_dir is not None:
+        backup_dir = Path(backup_dir)
+        for row in sorted(rows):
+            for sub in ("Circuit", "Caydence"):
+                src = deliverables / safe_filename(row) / sub
+                if src.exists():
+                    shutil.copytree(src, backup_dir / safe_filename(row) / sub, dirs_exist_ok=True)
+
+    cayd_structures = build_caydence_structures_by_row(structures, rows)
+    inv = write_geometry_delivery_products(
+        final_wires, structures, cayd_w, cayd_structures, rows, year, deliverables,
+        span_edges=spans, unit_to_m=unit_to_m,
+    )
+    checks = check_gpkg_export_consistency(spans, structures, cayd_w, kmz_meta, unit_to_m)
+    return inv, checks
+
+
+def check_gpkg_export_consistency(spans, structures, cayd_w, kmz_meta, unit_to_m,
+                                  end_tol_m=ROW_STRUCTURE_ANCHOR_M):
+    """Flag edits that leave the products inconsistent (reported, not fixed)."""
+    out = []
+    tol = end_tol_m / unit_to_m
+    st = defaultdict(list)
+    if structures is not None and not structures.empty:
+        for (row, c), g in structures.groupby(
+            [structures["ROW"].astype(str), structures["CIRCUIT"].astype(str)]
+        ):
+            st[(row, c)] = list(g.geometry)
+    for (row, c), g in spans.groupby([spans["ROW"].astype(str), spans["CIRCUIT"].astype(str)]):
+        allowed = kmz_meta.get(c, {}).get("ROWS")
+        if allowed and row not in allowed:
+            out.append({"CHECK": "SPAN_ROW_NOT_IN_SOW", "ROW": row, "CIRCUIT": c, "ID": "", "N": len(g)})
+        pts = st.get((row, c), [])
+        for _, r in g.iterrows():
+            geom = r.geometry
+            if geom is None or geom.geom_type != "LineString":
+                continue
+            co = list(geom.coords)
+            for e in (co[0], co[-1]):
+                p = Point(e[:2])
+                if not pts or min(q.distance(p) for q in pts) > tol:
+                    out.append({"CHECK": "SPAN_END_WITHOUT_STRUCTURE_IN_ROW", "ROW": row,
+                                "CIRCUIT": c,
+                                "ID": f"{txt(r.get('STRUCT_A'))}-{txt(r.get('STRUCT_B'))}", "N": 1})
+    if structures is not None and not structures.empty:
+        for _, r in structures.iterrows():
+            allowed = kmz_meta.get(txt(r.get("CIRCUIT")), {}).get("ROWS")
+            if allowed and txt(r.get("ROW")) not in allowed:
+                out.append({"CHECK": "STRUCTURE_ROW_NOT_IN_SOW", "ROW": txt(r.get("ROW")),
+                            "CIRCUIT": txt(r.get("CIRCUIT")), "ID": txt(r.get("STRUCT_ID")), "N": 1})
+    if cayd_w is not None and not cayd_w.empty:
+        for _, r in cayd_w.iterrows():
+            c = txt(r.get("CIRCUIT"))
+            allowed = kmz_meta.get(c, {}).get("ROWS")
+            if c and allowed and txt(r.get("ROW")) not in allowed:
+                out.append({"CHECK": "CAYDENCE_ROW_NOT_IN_SOW", "ROW": txt(r.get("ROW")),
+                            "CIRCUIT": c, "ID": txt(r.get("WIRE_ID")), "N": 1})
+    return pd.DataFrame(out, columns=["CHECK", "ROW", "CIRCUIT", "ID", "N"])
 
 
 def write_geometry_delivery_products(
@@ -8247,6 +8663,13 @@ def run_geometry_stage(
 
         # Caydence Structures are exactly the final 3D circuit Structure product,
         # simply collected at RoW level instead of split into Circuit folders.
+        span_edges, structures_final, cayd_w, row_boundary_qa = apply_row_boundaries_at_structures(
+            span_edges, structures_final, cayd_w, bundles, kmz, selected_rows, u2m
+        )
+        row_boundary_qa.to_csv(output/"01_row_boundary_qa.csv", index=False)
+        if not row_boundary_qa.empty:
+            info("RoW boundaries at Structures: " + ", ".join(
+                f"{k} {v}" for k, v in row_boundary_qa["KIND"].value_counts().items()))
         cayd_structures=build_caydence_structures_by_row(
             structures_final,selected_rows
         )
@@ -8294,7 +8717,7 @@ def run_geometry_stage(
         if gpkg.exists(): gpkg.unlink()
         for g,l in [
             (final_wires,"wires_2d"),(structures_xy,"structures_xy"),(structures_final,"structures_final"),
-            (ground_qa,"structure_ground_qa"),(span_edges,"selected_span_wires"),
+            (ground_qa,"structure_ground_qa"),(spans_one_row_per_feature(span_edges),"selected_span_wires"),
             (cayd_w,"caydence_wires_3d"),(cayd_structures,"caydence_structures_3d"),
             (build_structure_source_match_lines(structures_xy),"structure_source_match"),
             (recovered_terminal_poa,"recovered_terminal_poa"),
@@ -8310,6 +8733,8 @@ def run_geometry_stage(
         kmz_rows=[{"ROW":r.row,"CIRCUIT":r.circuit,"VOLTAGE":r.voltage,"COMPANY":r.company,
                    "GLOBALID":r.globalid,"geometry":r.geometry} for r in kmz_refs if r.geometry is not None]
         write_layer(rows_to_gdf(kmz_rows,crs),gpkg,"kmz_reference")
+        write_export_settings(gpkg, year=year, selected_rows=selected_rows,
+                              unit_to_m=u2m, epsg=crs)
 
         structures_xy.drop(columns="geometry",errors="ignore").to_csv(output/"01_structure_position_review.csv",index=False)
         shift_rows=[]
