@@ -55,7 +55,7 @@ Feedback addressed: X116 at NH_05/NH_25 (DXF_W004321/W004323 split between RoWs)
    | `caydence_wires_3d` | Caydence 3D wires: `ROW` / `CIRCUIT` / `WIRE_TYPE`. |
 
    `ROW` may hold several RoWs, e.g. `NH_05;NH_25`, to deliver a feature in both. Caydence 3D Structures are always rebuilt from `structures_final`.
-3. Save the edits and run **Export from edited GPKG**: a GUI button, launcher product 6, or `python scripts/04_export_geometry_from_gpkg.py --output-root <output>`.
+3. Save the edits and run **Re-export from GPKG**: a GUI button, launcher product 6, or `python scripts/04_export_geometry_from_gpkg.py --output-root <output>`.
    - Only `deliverables/<RoW>/Circuit` and `deliverables/<RoW>/Caydence` are rebuilt.
    - The previous folders are first copied to `QA/<time>_01_geometry_export_from_gpkg/deliverables_before`.
    - Tile Index, Management Units and LAS are not touched.
@@ -64,6 +64,13 @@ Feedback addressed: X116 at NH_05/NH_25 (DXF_W004321/W004323 split between RoWs)
    - spans, Structures or Caydence wires placed in a RoW whose SoW does not carry the circuit.
 
 Re-exporting an unedited GPKG gives identical deliverables: Cluster 12, 78/78 files, same feature counts, lengths within 0.1 m. The GPKG now also holds an `export_settings` table (year, selected RoWs, units).
+
+**G. GUI layout fix (update 2026-11-18)**
+- **Right column:** keeps its full width (it was being cut, already in R01.04).
+- **Display scaling:** the side columns and the start-up window size follow Windows display scaling (125%/150%).
+- **Narrow windows:** Workspace Setup and Product Selection stack when they do not fit side by side.
+- **Small windows:** the work area scrolls instead of cutting off the log and buttons.
+- **Buttons:** arranged in two columns. Labels: Deliverables / QA / Re-export from GPKG.
 
 ## Cluster 12 test results (NH_05/09/11/14/25, same inputs)
 
