@@ -2962,7 +2962,15 @@ def _run_phase_dp(states, local_key, unit_to_m):
     return chosen,total
 
 
-def select_phase_sequence(path, bundle_lookup, supports, unit_to_m):
+def bundle_is_mixed(b) -> bool:
+    """Non-horizontal bundle whose phases are laterally spread (not a vertical stack)."""
+    if b.get("ARRANGEMENT") == "HORIZONTAL":
+        return False
+    offs=[(float(c["OFF_A_M"])+float(c["OFF_B_M"]))/2.0 for c in b.get("CANDIDATES", [])]
+    return len(offs) >= 2 and (max(offs)-min(offs)) >= LANE_MIN_SPREAD_M
+
+
+def select_phase_sequence(path, bundle_lookup, supports, unit_to_m, outer_on_horizontal=None):
     """Dynamic programming across a circuit path.
 
     Horizontal bundle: central phase has a strong local preference.
@@ -2973,6 +2981,10 @@ def select_phase_sequence(path, bundle_lookup, supports, unit_to_m):
     neighbours the cheaper side wins. Leaving the lane costs LANE_PENALTY_M, so it
     only happens where geometry forces it (reported as LANE_OK = 0).
     BAKERY_LANE_RULE=0 restores the R01.04 rule (weak sign-less outer preference).
+
+    outer_on_horizontal (R01.05): when the circuit has any mixed span, horizontal
+    spans also use the outer lane, so the representative never steps between the
+    central phase and an outer phase. None = decide from this path alone.
     """
     by_sid=support_lookup(supports)
     lane_rule=_lane_rule_enabled()
@@ -2980,16 +2992,19 @@ def select_phase_sequence(path, bundle_lookup, supports, unit_to_m):
     others=[b for bid,b in bundle_lookup.items() if int(bid) not in own]
     other_mid=np.asarray([_bundle_mid(b) for b in others]) if others else np.zeros((0,2))
     vote_left=0.0  # >0: neighbours sit on the left -> use right lane
+    if outer_on_horizontal is None:
+        outer_on_horizontal=any(bundle_is_mixed(bundle_lookup[x]) for x in path["BUNDLES"])
+    outer_h=bool(lane_rule and outer_on_horizontal)
     states=[]
     for i,bid in enumerate(path["BUNDLES"]):
         b=bundle_lookup[bid]
         s0,s1=path["NODES"][i],path["NODES"][i+1]
         sign=1.0 if txt(b["STRUCT_A"])==txt(s0) else -1.0
-        horizontal=b["ARRANGEMENT"]=="HORIZONTAL"
+        horizontal=b["ARRANGEMENT"]=="HORIZONTAL" and not outer_h
         cand=[]
         for c in b["CANDIDATES"]:
             coords,off0,off1=oriented_candidate(c,s0,s1,b,by_sid)
-            if horizontal:
+            if b["ARRANGEMENT"]=="HORIZONTAL":
                 legacy=8.0*float(c["CENTRAL_SCORE"])
             else:
                 legacy=0.35*float(c["OUTER_PENALTY"])
@@ -3047,7 +3062,7 @@ def select_phase_sequence(path, bundle_lookup, supports, unit_to_m):
     for i,ci in enumerate(chosen):
         c=dict(states[i][ci])
         b=bundle_lookup[path["BUNDLES"][i]]
-        if b["ARRANGEMENT"]=="HORIZONTAL":
+        if b["ARRANGEMENT"]=="HORIZONTAL" and not outer_h:
             c["LANE"]="CENTRAL"; c["LANE_OK"]=1
         elif lane is None:
             c["LANE"]="LEGACY"; c["LANE_OK"]=1
@@ -3056,7 +3071,7 @@ def select_phase_sequence(path, bundle_lookup, supports, unit_to_m):
             c["LANE"]="OUTER_LEFT" if lane=="L" else "OUTER_RIGHT"
             c["LANE_OK"]=int(ok)
         c["LANE_WHY"]=why
-        if b["ARRANGEMENT"]=="HORIZONTAL":
+        if b["ARRANGEMENT"]=="HORIZONTAL" and not outer_h:
             c["SIDE_CLASS"]="H"
         elif c["IS_L"] and c["IS_R"]:
             c["SIDE_CLASS"]="STACK"
@@ -4782,7 +4797,121 @@ def build_caydence_structures_by_row(
     selected = {txt(x) for x in (selected_rows or set()) if txt(x)}
     if selected and "ROW" in out.columns:
         out = out[out["ROW"].astype(str).isin(selected)].copy()
-    return out
+    return dedupe_caydence_structures(out)
+
+
+# Fields that describe the structure itself, not how the tool positioned it.
+_CAYD_ATTR_SKIP = {
+    "ROW", "CIRCUIT", "VOLTAGE", "COMPANY", "TOPO_ID", "PATH_ROLE", "geometry",
+}
+
+
+def dedupe_caydence_structures(out: gpd.GeoDataFrame, same_xy_m: float | None = None) -> gpd.GeoDataFrame:
+    """R01.05: one Caydence record per physical structure within a RoW.
+
+    A support carrying several circuits produces one circuit Structure per
+    circuit. Caydence RoW Structures keep only the record with the fullest
+    source attribution: most filled attributes, then a real (non-dummy) source
+    match, then the smallest source distance, then circuit name. Duplicates of
+    the same support in two different RoWs (RoW boundary rule) are kept.
+    Same support = same TOPO_ID, or markers within 0.5 m in the same RoW.
+    The dropped records are listed in out.attrs["dedupe_qa"].
+    """
+    out.attrs["dedupe_qa"] = pd.DataFrame()
+    if same_xy_m is None and out.crs is not None:
+        try:
+            same_xy_m = 0.5 / float(out.crs.axis_info[0].unit_conversion_factor)
+        except Exception:
+            same_xy_m = None
+    if out.empty or "TOPO_ID" not in out.columns or "ROW" not in out.columns:
+        return out
+    topo = out["TOPO_ID"].astype(str).str.strip()
+    has_topo = topo.ne("") & topo.str.lower().ne("nan") & topo.str.lower().ne("none")
+    # Union-find per RoW: same support TOPO_ID, or a different marker at the
+    # same position (<= same_xy_m, e.g. a terminal POA on another circuit's pole).
+    pos = list(out.index)
+    parent = {i: i for i in pos}
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    rowv = out["ROW"].astype(str)
+    for row in sorted(set(rowv)):
+        idx = list(out.index[rowv == row])
+        first = {}
+        for i in idx:
+            if has_topo.loc[i]:
+                t = topo.loc[i]
+                if t in first:
+                    union(first[t], i)
+                else:
+                    first[t] = i
+        if len(idx) > 1 and same_xy_m is not None and same_xy_m > 0:
+            xy = np.asarray([[float(out.at[i, "geometry"].x), float(out.at[i, "geometry"].y)] for i in idx])
+            from scipy.spatial import cKDTree
+            for a, b in cKDTree(xy).query_pairs(float(same_xy_m)):
+                union(idx[a], idx[b])
+    groups = defaultdict(list)
+    for i in pos:
+        groups[find(i)].append(i)
+    dup_groups = [g for g in groups.values() if len(g) > 1]
+    if not dup_groups:
+        return out
+    attr_cols = [c for c in out.columns if c not in _CAYD_ATTR_SKIP]
+
+    def filled(r):
+        n = 0
+        for c in attr_cols:
+            v = r.get(c)
+            if v is None:
+                continue
+            if isinstance(v, float) and np.isnan(v):
+                continue
+            if txt(v) == "":
+                continue
+            n += 1
+        return n
+
+    drop, qa = [], []
+    for idx in dup_groups:
+        scored = []
+        for i in idx:
+            r = out.loc[i]
+            dummy = txt(r.get("IS_DUMMY")) in {"1", "True", "true", "Y"}
+            sd = r.get("SRC_DIST_M")
+            try:
+                sd = float(sd)
+                if np.isnan(sd):
+                    sd = 1e9
+            except Exception:
+                sd = 1e9
+            scored.append((-filled(r), int(dummy), sd, txt(r.get("CIRCUIT")), i))
+        scored.sort()
+        keep = scored[0][-1]
+        for sc in scored[1:]:
+            i = sc[-1]
+            drop.append(i)
+            qa.append({
+                "ROW": txt(out.at[i, "ROW"]), "TOPO_ID": txt(out.at[i, "TOPO_ID"]),
+                "KEPT_TOPO_ID": txt(out.at[keep, "TOPO_ID"]),
+                "KEPT_CIRCUIT": txt(out.at[keep, "CIRCUIT"]),
+                "KEPT_STRUCT_ID": txt(out.at[keep, "STRUCT_ID"]) if "STRUCT_ID" in out else "",
+                "KEPT_FILLED": -scored[0][0],
+                "DROPPED_CIRCUIT": txt(out.at[i, "CIRCUIT"]),
+                "DROPPED_STRUCT_ID": txt(out.at[i, "STRUCT_ID"]) if "STRUCT_ID" in out else "",
+                "DROPPED_FILLED": -sc[0],
+            })
+    res = out.drop(index=drop)
+    res.attrs["dedupe_qa"] = pd.DataFrame(qa)
+    return res
 
 
 
@@ -7694,12 +7823,14 @@ def build_final_products(
         total_spans = 0
         tap_spans = 0
 
-        for route in _route_records_for_circuit(path):
-            if not route["BUNDLES"]:
-                continue
-
+        circuit_routes = [r for r in _route_records_for_circuit(path) if r["BUNDLES"]]
+        circuit_mixed = any(
+            bundle_is_mixed(blookup[x]) for r in circuit_routes for x in r["BUNDLES"]
+        )
+        for route in circuit_routes:
             selected, joins = select_phase_sequence(
-                route, blookup, supports, unit_to_m
+                route, blookup, supports, unit_to_m,
+                outer_on_horizontal=circuit_mixed,
             )
             if not selected:
                 continue
@@ -7771,10 +7902,9 @@ def build_final_products(
                     "ARRANGEMENT": b["ARRANGEMENT"],
                     "ATTR_CONF": txt(b.get("CONF")),
                     "SELECT_METHOD": (
-                        "HORIZONTAL_CENTRAL"
-                        if b["ARRANGEMENT"] == "HORIZONTAL"
+                        "HORIZONTAL_CENTRAL" if sel.get("LANE") == "CENTRAL"
                         else ("VERTICAL_CONTINUITY" if sel.get("LANE") == "LEGACY"
-                              else "VERTICAL_OUTER_LANE")
+                              else "OUTER_LANE")
                     ),
                     "LANE": txt(sel.get("LANE")),
                     "LANE_OK": int(sel.get("LANE_OK", 1)),
@@ -8869,8 +8999,12 @@ def relocate_schf_to_middle_phase(structures, cayd_w, unit_to_m,
                                   max_phase_distance_m=35.0,
                                   max_tangent_degrees=15.0,
                                   min_phase_spacing_m=1.0,
-                                  max_spacing_asymmetry=0.45):
+                                  max_spacing_asymmetry=0.45,
+                                  outer_lane_circuits=None):
     """Move SCHF and single-marker SCSH transversely to the middle PHASE.
+
+    R01.05: circuits whose 2D representative uses the outer lane keep their
+    structures on that 2D wire (Structure-on-Wire); they are not moved.
 
     The local perpendicular cross-section is set by the middle conductor tangent.
     We retain along-circuit station and use the closest point on the central
@@ -8921,6 +9055,9 @@ def relocate_schf_to_middle_phase(structures, cayd_w, unit_to_m,
                       OLD_X=p.x, OLD_Y=p.y, NEW_X=p.x, NEW_Y=p.y,
                       SHIFT_M=0., STATUS='UNCHANGED', REASON='',
                       PHASE_WIRES='', MID_WIRE_ID='')
+        if outer_lane_circuits and circuit in outer_lane_circuits:
+            result.update(STATUS='UNCHANGED', REASON='OUTER_LANE_CIRCUIT')
+            records.append(result); continue
         if st == 'SCSH':
             if raw_poa is None or raw_poa.empty:
                 result.update(STATUS='REVIEW', REASON='NO_RAW_POA_FOR_SCSH')
@@ -9193,8 +9330,13 @@ def run_geometry_stage(
         # SCHF and single-top SCSH use three classified horizontal PHASE
         # wires. SCSH with neighboring same-circuit POA stays untouched.
         # This step runs after LiDAR role assignment and before final ground Z.
+        outer_lane_circuits = set()
+        if span_edges is not None and "LANE" in span_edges.columns:
+            outer_lane_circuits = set(
+                span_edges.loc[span_edges["LANE"].astype(str).str.startswith("OUTER"), "CIRCUIT"].astype(str))
         positioned_xy, schf_qa = relocate_schf_to_middle_phase(
-            structures_xy, cayd_w, u2m, raw_poa=raw_points)
+            structures_xy, cayd_w, u2m, raw_poa=raw_points,
+            outer_lane_circuits=outer_lane_circuits)
         schf_qa.to_csv(output/"01_structure_middle_phase_qa.csv", index=False)
         moved_schf = int((schf_qa.get('STATUS',pd.Series(dtype=str))=='MOVED').sum())
         review_schf = int((schf_qa.get('STATUS',pd.Series(dtype=str))=='REVIEW').sum())
@@ -9231,6 +9373,10 @@ def run_geometry_stage(
         cayd_structures=build_caydence_structures_by_row(
             structures_final,selected_rows
         )
+        cayd_dedupe_qa = cayd_structures.attrs.get("dedupe_qa", pd.DataFrame())
+        cayd_dedupe_qa.to_csv(output/"01_caydence_structure_dedupe_qa.csv", index=False)
+        if not cayd_dedupe_qa.empty:
+            info(f"Caydence Structures: {len(cayd_dedupe_qa)} duplicate records of shared supports removed")
 
         deliverables=output.parent/"deliverables"
         structure_source_fields=list(

@@ -156,3 +156,22 @@ Test clusters:
 | Side switches in non-horizontal runs | 59 | 0 | 13 | 0 |
 | Joins > 3 m (all at horizontal↔non-horizontal transitions) | 7 | 72 | 0 | 11 |
 | Maximum join | 4.9 m | 10.3 m | 0.9 m | 8.0 m |
+
+## O. Outer lane also on horizontal spans (circuits with mixed spans)
+If a circuit has any non-horizontal span with laterally spread phases, all of its spans use the outer lane, including horizontal ones. Circuits that are horizontal on their whole length keep the central phase. This removes the step from the central phase to the outer phase at transitions.
+- C12: joins > 3 m went from 72 (rule N) to 0. The maximum join went from 10.3 m to 2.1 m.
+- C39: joins > 3 m went from 38 to 12. The remaining ones are same-side joins at multi-pole structures.
+
+**SCHF/SCSH on outer-lane circuits.** These structures are no longer moved to the middle phase. They stay on the circuit's 2D wire (Structure-on-Wire). `01_structure_middle_phase_qa.csv` gives `STATUS = UNCHANGED`, `REASON = OUTER_LANE_CIRCUIT`. In practice most circuits have at least one mixed span, so the R01.04 middle-phase rule now applies only to circuits that are horizontal end to end (C12: 152 moved, 823 kept on the outer wire). **Decision needed:** keep it this way, or move SCHF to the middle phase and accept the structure sitting about one phase spacing off the 2D wire.
+
+## P. Caydence RoW Structures: one record per physical structure
+A support that carries several circuits produced one Caydence record per circuit. Now only one record is kept per RoW, the one with the fullest attribution: the most filled source attributes, then a real (non-dummy) source match, then the smallest source distance.
+- Same support means the same `TOPO_ID`, or markers within 0.5 m in the same RoW (e.g. a terminal POA of one circuit on another circuit's pole).
+- Circuit folders still have one Structure per circuit.
+- QA: `01_caydence_structure_dedupe_qa.csv`.
+- Records removed: C12 6, C39 100, C55 37, C17 0.
+
+## Assumptions
+- **Structures on RoW boundaries are duplicated into each RoW.** A structure at the start or end of two RoWs (or circuits) appears in both RoW deliverables, by design (rule E). It is easier for QA to delete an extra structure than to add a missing one. Within one RoW, Caydence keeps one record per physical structure (P).
+- **The 2D wire is a representative conductor, not a centreline.** Horizontal circuits use the central phase. Other circuits use the outermost phase on the side away from neighbouring circuits, kept along the whole circuit.
+- **Units.** All distance thresholds are in metres and are converted with the CRS unit factor. EPSG 6525, 6434 and 6492 use US survey feet: 1 m = 3.2808 ft.
