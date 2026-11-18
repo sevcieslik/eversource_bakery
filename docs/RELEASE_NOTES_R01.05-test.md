@@ -175,3 +175,21 @@ A support that carries several circuits produced one Caydence record per circuit
 - **Structures on RoW boundaries are duplicated into each RoW.** A structure at the start or end of two RoWs (or circuits) appears in both RoW deliverables, by design (rule E). It is easier for QA to delete an extra structure than to add a missing one. Within one RoW, Caydence keeps one record per physical structure (P).
 - **The 2D wire is a representative conductor, not a centreline.** Horizontal circuits use the central phase. Other circuits use the outermost phase on the side away from neighbouring circuits, kept along the whole circuit.
 - **Units.** All distance thresholds are in metres and are converted with the CRS unit factor. EPSG 6525, 6434 and 6492 use US survey feet: 1 m = 3.2808 ft.
+
+## Q. Caydence wires split at crossings (C17 NH_02 × NH_27)
+The DXF can split a conductor where it crosses another line. If a piece does not belong to any analytical bundle, it used to take the circuit of the nearest Structure within 15 m. That is often a pole of the line being crossed: in C17, two 345 kV pieces of 391 (NH_02) ended up as Y170 in NH_27.
+
+Two changes:
+- **Parallel-bundle attribution (`ATTR_METHOD = PARALLEL_BUNDLE`).** A non-bundled wire first takes the circuit of the bundled conductors it runs alongside: within 10° of their direction and within 12 m along its whole length.
+- **Voltage guard.** When the DXF layer names a voltage (e.g. `Mainline_345kV`), a parallel-bundle or Structure-anchor match to a circuit with a different voltage is rejected.
+
+Wires whose layer voltage differs from their circuit's voltage:
+
+| Cluster | Before | After |
+|---|---|---|
+| C17 | 2 | 0 |
+| C39 | 7 | 4 |
+| C55 | 9 | 5 |
+| C12 | 0 | 0 |
+
+The remaining cases come from the main track/bundle attribution (shared-corridor issue, still open).

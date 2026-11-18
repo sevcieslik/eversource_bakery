@@ -105,6 +105,7 @@ import pandas as pd
 import pyogrio
 from pyproj import CRS, Transformer
 from scipy.spatial import cKDTree, Delaunay, QhullError
+import shapely
 from shapely.geometry import LineString, MultiLineString, Point, box
 from shapely.ops import linemerge, transform, unary_union
 
@@ -4330,6 +4331,84 @@ def _nearest_structure_anchor_for_wire(
     return best
 
 
+# R01.05: a source wire outside every analytical bundle (e.g. a conductor that the
+# DXF splits where it crosses another line) takes the circuit of the bundled
+# conductors it runs parallel to, before any Structure-anchor guess.
+PARALLEL_MAX_ANGLE_DEG = 10.0
+PARALLEL_MAX_DIST_M = 12.0
+
+
+def _wire_dir2d(geom):
+    parts = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+    cs = [c for p in parts if hasattr(p, "coords") for c in p.coords]
+    if len(cs) < 2:
+        return None
+    d = np.asarray(cs[-1][:2], dtype=float) - np.asarray(cs[0][:2], dtype=float)
+    n = float(np.linalg.norm(d))
+    return d / n if n > 1e-9 else None
+
+
+class _BundledWireIndex:
+    def __init__(self, wires_r, by_wire, unit_to_m, voltage_of=None):
+        from shapely.strtree import STRtree
+        self.u2m = float(unit_to_m)
+        self.voltage_of = voltage_of
+        self.items = []
+        for wi, cands in by_wire.items():
+            if wi < 0 or wi >= len(wires_r) or not cands:
+                continue
+            best = sorted(cands, key=lambda c: (float(c["DIST_M"]), txt(c["CIRCUIT"])))[0]
+            if not txt(best["CIRCUIT"]):
+                continue
+            g = wires_r.geometry.iloc[wi]
+            d = _wire_dir2d(g)
+            if g is None or d is None:
+                continue
+            g2 = shapely.force_2d(g)
+            self.items.append((g2, d, best))
+        self.tree = STRtree([it[0] for it in self.items]) if self.items else None
+
+    def match(self, geom, layer=""):
+        if self.tree is None or geom is None:
+            return None
+        d = _wire_dir2d(geom)
+        if d is None:
+            return None
+        g2 = shapely.force_2d(geom)
+        reach = PARALLEL_MAX_DIST_M / self.u2m
+        cos_max = np.cos(np.radians(PARALLEL_MAX_ANGLE_DEG))
+        samples = [g2.interpolate(f, normalized=True) for f in (0.1, 0.3, 0.5, 0.7, 0.9)]
+        per_circuit = {}
+        for k in self.tree.query(g2.buffer(reach)):
+            og, od, rec = self.items[int(k)]
+            if abs(float(np.dot(d, od))) < cos_max:
+                continue
+            dists = [float(og.distance(pt)) * self.u2m for pt in samples]
+            # The candidate must run alongside the whole wire, not just touch it.
+            if max(dists) > PARALLEL_MAX_DIST_M:
+                continue
+            m = float(np.median(dists))
+            key = (txt(rec["CKEY"]), txt(rec["CIRCUIT"]))
+            if self.voltage_of is not None and not _layer_voltage_compatible(
+                    layer, self.voltage_of(*key)):
+                continue
+            if key not in per_circuit or m < per_circuit[key]["DIST_M"]:
+                per_circuit[key] = {"CKEY": key[0], "CIRCUIT": key[1], "DIST_M": m}
+        if not per_circuit:
+            return None
+        ranked = sorted(per_circuit.values(), key=lambda x: (x["DIST_M"], x["CIRCUIT"]))
+        return ranked[0]
+
+
+def _layer_voltage_compatible(layer: str, voltage: str) -> bool:
+    """False only when the DXF layer names a kV that differs from the circuit kV."""
+    m = re.search(r"(\d{2,3})\s*kv", layer or "", re.I)
+    v = re.search(r"(\d{2,3})", voltage or "")
+    if not m or not v:
+        return True
+    return int(m.group(1)) == int(v.group(1))
+
+
 def build_caydence_wire_attribution(
     wires: gpd.GeoDataFrame,
     bundles: list[dict[str, Any]],
@@ -4370,8 +4449,19 @@ def build_caydence_wire_attribution(
                 "METHOD": "TRACK_BUNDLE",
             })
 
+    wires_r = wires.reset_index(drop=True)
+    _volt_cache = {}
+
+    def _voltage_of(ckey, circuit):
+        k = (ckey, circuit)
+        if k not in _volt_cache:
+            _volt_cache[k] = txt(circuit_attributes(ckey, circuit, client, kmz)[0])
+        return _volt_cache[k]
+
+    parallel_index = _BundledWireIndex(wires_r, by_wire, unit_to_m, voltage_of=_voltage_of)
+
     result: dict[int, dict[str, Any]] = {}
-    for wi, r in wires.reset_index(drop=True).iterrows():
+    for wi, r in wires_r.iterrows():
         candidates = by_wire.get(int(wi), [])
         if candidates:
             # Prefer the circuit seen most often for this source entity; distance
@@ -4396,13 +4486,27 @@ def build_caydence_wire_attribution(
             method = "TRACK_BUNDLE"
             role = txt(best["WIRE_TYPE"])
         else:
-            anchor = _nearest_structure_anchor_for_wire(
-                r.geometry,
-                structures,
-                unit_to_m,
-                max_anchor_m=structure_anchor_m,
-            )
-            if anchor is not None:
+            parallel = parallel_index.match(r.geometry, txt(r.get("SOURCE_LAYER")))
+            anchor = None
+            if parallel is None:
+                anchor = _nearest_structure_anchor_for_wire(
+                    r.geometry,
+                    structures,
+                    unit_to_m,
+                    max_anchor_m=structure_anchor_m,
+                )
+                if anchor is not None and not _layer_voltage_compatible(
+                        txt(r.get("SOURCE_LAYER")), txt(anchor["row"].get("VOLTAGE"))):
+                    anchor = None
+            if parallel is not None:
+                ckey = txt(parallel["CKEY"])
+                circuit = txt(parallel["CIRCUIT"])
+                attr_dist = float(parallel["DIST_M"])
+                method = "PARALLEL_BUNDLE"
+                role = ""
+                voltage = ""
+                company = ""
+            elif anchor is not None:
                 sr = anchor["row"]
                 ckey = circuit_key(sr.get("CIRCUIT"))
                 circuit = txt(sr.get("CIRCUIT"))
