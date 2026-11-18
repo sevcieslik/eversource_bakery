@@ -6275,6 +6275,74 @@ def print_preflight_table(table: pd.DataFrame) -> None:
             f"{mu_s:>8}   {aoi_s:>8}   {inside_s:>12}   {aoi:<9} {action}"
         )
 
+PREFLIGHT_CACHE_VERSION = 1
+
+
+def _path_fingerprint(path) -> dict:
+    """Cheap fingerprint of a file or folder: names, sizes and mtimes only."""
+    if path is None:
+        return {"path": None}
+    p = Path(path)
+    if not p.exists():
+        return {"path": str(p), "missing": True}
+    items = []
+    if p.is_file():
+        st = p.stat()
+        items.append((p.name, int(st.st_size), int(st.st_mtime_ns)))
+    else:
+        for q in sorted(x for x in p.rglob("*") if x.is_file()):
+            st = q.stat()
+            items.append((q.relative_to(p).as_posix(), int(st.st_size), int(st.st_mtime_ns)))
+    enc = json.dumps(items, separators=(",", ":")).encode("utf-8")
+    return {"name": p.name, "n": len(items), "sha256": hashlib.sha256(enc).hexdigest()}
+
+
+def _code_fingerprint(*funcs) -> str:
+    import inspect
+    h = hashlib.sha256()
+    for f in funcs:
+        try:
+            h.update(inspect.getsource(f).encode("utf-8"))
+        except Exception:
+            h.update(getattr(f, "__name__", repr(f)).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _preflight_cached(cache_dir, name, key: dict, compute, label: str):
+    """Return compute() through a pickle cache keyed by key (inputs + code)."""
+    import pickle
+    import platform
+    key = dict(key)
+    key["_cache_version"] = PREFLIGHT_CACHE_VERSION
+    key["_python"] = platform.python_version()
+    key["_pandas"] = pd.__version__
+    key["_geopandas"] = gpd.__version__
+    digest = hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    cache_dir = Path(cache_dir)
+    data = cache_dir / f"{name}.pkl"
+    meta = cache_dir / f"{name}.json"
+    if os.environ.get("BAKERY_NO_PREFLIGHT_CACHE") != "1" and data.is_file() and meta.is_file():
+        try:
+            if json.loads(meta.read_text(encoding="utf-8")).get("digest") == digest:
+                with data.open("rb") as fh:
+                    value = pickle.load(fh)
+                info(f"  Reusing cached {label} (inputs unchanged).")
+                return value, digest
+        except Exception as exc:
+            info(f"  Cache for {label} not usable ({exc}); recalculating.")
+    value = compute()
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp = data.with_suffix(".pkl.tmp")
+        with tmp.open("wb") as fh:
+            pickle.dump(value, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(data)
+        meta.write_text(json.dumps({"digest": digest, "key": key}, indent=2, default=str), encoding="utf-8")
+    except Exception as exc:
+        info(f"  WARNING: could not write preflight cache {name}: {exc}")
+    return value, digest
+
+
 def run_preflight(
     lidar_source: Path,
     client_source: Path,
@@ -6296,16 +6364,44 @@ def run_preflight(
     crs = CRS.from_epsg(epsg)
     with tempfile.TemporaryDirectory(prefix="eversource_preflight_") as td_raw:
         td = Path(td_raw)
+        # R01.05: the LiDAR tile index, SoW/MU reading and the coverage table
+        # are cached under 00_preflight/00_cache. Each cache is keyed by a
+        # cheap fingerprint of its inputs (names, sizes, mtimes; ZIP directory)
+        # and by the code that builds it, so any change recalculates it.
+        # Set BAKERY_NO_PREFLIGHT_CACHE=1 or delete 00_cache to force a rebuild.
+        cache_dir = output / "00_cache"
         info("Indexing LiDAR input...")
-        physical_tiles, inferred = build_lidar_tile_footprints(lidar_source, crs, td, year, None)
+        lidar_fp = _lidar_source_fingerprint(lidar_source)["sha256"]
+        (physical_tiles, inferred), tiles_key = _preflight_cached(
+            cache_dir, "lidar_tiles",
+            {"lidar": lidar_fp, "epsg": int(epsg), "year": int(year),
+             "code": _code_fingerprint(build_lidar_tile_footprints, discover_lidar_files)},
+            lambda: build_lidar_tile_footprints(lidar_source, crs, td, year, None),
+            "LiDAR tile index",
+        )
         info(f"  tiles: {len(physical_tiles):,}")
         if inferred:
             info(f"  nominal tile size: {inferred:g} CRS units")
 
         info("Reading Project SoW + Management Units...")
-        kmz_refs = project_kmz(parse_sow_kmz(kmz_path), crs)
-        gdb = resolve_management_units_gdb(management_units_source, client_source, td)
-        mus, mu_review = load_management_units(gdb, crs, kmz_refs, "Eversource")
+
+        def _read_sow_mu():
+            refs = project_kmz(parse_sow_kmz(kmz_path), crs)
+            gdb_path = resolve_management_units_gdb(management_units_source, client_source, td)
+            m, mr = load_management_units(gdb_path, crs, refs, "Eversource")
+            return refs, m, mr
+
+        (kmz_refs, mus, mu_review), mus_key = _preflight_cached(
+            cache_dir, "sow_management_units",
+            {"kmz": _path_fingerprint(kmz_path),
+             "mu_source": _path_fingerprint(management_units_source),
+             "client_source": _path_fingerprint(client_source),
+             "epsg": int(epsg),
+             "code": _code_fingerprint(parse_sow_kmz, project_kmz,
+                                       resolve_management_units_gdb, load_management_units)},
+            _read_sow_mu,
+            "SoW + Management Units",
+        )
         known_rows = sorted({txt(r.row) for r in kmz_refs if txt(r.row)} | set(mus["ROW"].astype(str)))
 
         info(f"Checking AOIs under: {aoi_dir}")
@@ -6329,11 +6425,25 @@ def run_preflight(
             except Exception as exc:
                 info(f"  WARNING: could not read per-tile boundary QA for candidate coverage: {exc}")
 
-        table = build_preflight_table(
-            mus, physical_tiles, aois, lidar_boundary=lidar_boundary,
-            lidar_boundary_tiles=boundary_tiles
+        def _coverage_table():
+            t = build_preflight_table(
+                mus, physical_tiles, aois, lidar_boundary=lidar_boundary,
+                lidar_boundary_tiles=boundary_tiles
+            )
+            return add_point_processing_summary(t, physical_tiles, aois)
+
+        info("Calculating RoW / AOI / LiDAR coverage...")
+        table, _ = _preflight_cached(
+            cache_dir, "coverage_table",
+            {"tiles": tiles_key, "mus": mus_key,
+             "aoi": _path_fingerprint(aoi_dir),
+             "boundary": _path_fingerprint(output / "00_lidar_boundary_cache.json"),
+             "boundary_tiles": _path_fingerprint(boundary_tiles_gpkg),
+             "code": _code_fingerprint(build_preflight_table, add_point_processing_summary,
+                                       discover_aoi_polygons)},
+            _coverage_table,
+            "coverage table",
         )
-        table = add_point_processing_summary(table, physical_tiles, aois)
 
         spatial_gpkg = output / "00_preflight_spatial.gpkg"
         if spatial_gpkg.exists():

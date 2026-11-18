@@ -72,6 +72,16 @@ Re-exporting an unedited GPKG gives identical deliverables: Cluster 12, 78/78 fi
 - **Small windows:** the work area scrolls instead of cutting off the log and buttons.
 - **Buttons:** arranged in two columns. Labels: Deliverables / QA / Re-export from GPKG.
 
+**H. Preflight cache (update 2026-11-18)**
+Only the lasboundary footprint was cached before; everything else was recalculated on every run. Now three more steps are cached under `00_preflight/00_cache`:
+- the LiDAR tile index (a LiDAR ZIP is no longer extracted just to read headers),
+- the SoW + Management Units read,
+- the RoW/AOI/LiDAR coverage table.
+
+Each cache is keyed by a cheap fingerprint of its inputs (file names, sizes and modification times; for a ZIP, its directory) and of the code that builds it. Any change to the LiDAR, AOI files, SoW, MU source or the tool recalculates only the affected steps; adding an AOI recalculates only the coverage table. On Cluster 12 an unchanged preflight drops from 2.6 s to 0.2 s, excluding LiDAR; with full LiDAR the saving is larger.
+
+To force a rebuild: run `00_preflight_eversource.py --no-cache`, set `BAKERY_NO_PREFLIGHT_CACHE=1`, or delete `00_preflight/00_cache`.
+
 ## Cluster 12 test results (NH_05/09/11/14/25, same inputs)
 
 | Check | R01.04 | R01.05-test |
