@@ -2140,6 +2140,40 @@ def partition_sorted_indices(n: int, k: int):
     return out
 
 
+# R01.05: DXF layer names as attribution evidence.
+#   Mainline_345kV          -> voltage 345
+#   Mainline_1_115kV        -> voltage 115, line tag "1" (same-voltage lines
+#                              crossing or sharing a corridor get _1, _2, ...)
+#   Mainline_391_345kV      -> circuit 391 (when 391 is a known circuit name)
+_LAYER_KV_RE = re.compile(r"(\d{2,3})\s*kv", re.I)
+
+
+def layer_voltage(layer: str) -> str:
+    m = _LAYER_KV_RE.search(layer or "")
+    return m.group(1) if m else ""
+
+
+def layer_tokens(layer: str) -> list[str]:
+    body = _LAYER_KV_RE.sub("", layer or "")
+    return [t for t in re.split(r"[^A-Za-z0-9]+", body) if t]
+
+
+def layer_group_key(layer: str) -> str:
+    """Physical line identity encoded in the layer: voltage + tag/circuit tokens."""
+    kv = layer_voltage(layer)
+    if not kv:
+        return ""
+    toks = [t for t in layer_tokens(layer) if t.lower() not in {"mainline", "main", "line", "wire", "wires", "conductor"}]
+    return kv + "|" + "_".join(toks)
+
+
+def layer_circuit_hint(layer: str, known_labels: set[str]) -> str:
+    for t in layer_tokens(layer):
+        if len(t) >= 3 and t in known_labels:
+            return t
+    return ""
+
+
 def build_span_bundles(wire_matches, supports, unit_to_m,
                        horizontal_z_range_m, horizontal_z_ratio):
     by_sid = support_lookup(supports)
@@ -2186,8 +2220,20 @@ def build_span_bundles(wire_matches, supports, unit_to_m,
         if not records:
             continue
         recs = pd.DataFrame(records).sort_values("OFF_MEAN_M", kind="stable").reset_index(drop=True)
-        k = choose_bundle_count(len(recs))
-        partitions = partition_sorted_indices(len(recs), k)
+        # R01.05: when every wire carries a layer line identity (voltage, tag or
+        # circuit) and the pair holds >=2 such lines of >=3 wires each, bundle each
+        # line separately instead of slicing the mixed lateral order.
+        gkeys = recs["SOURCE_LAYER"].apply(lambda x: layer_group_key(txt(x)))
+        sizes = gkeys.value_counts()
+        if (gkeys != "").all() and len(sizes) >= 2 and int(sizes.min()) >= 3:
+            partitions = []
+            for gk in sorted(sizes.index, key=lambda g: float(recs.loc[gkeys == g, "OFF_MEAN_M"].mean())):
+                pos = list(recs.index[gkeys == gk])
+                kk = choose_bundle_count(len(pos))
+                partitions.extend([[pos[i] for i in part] for part in partition_sorted_indices(len(pos), kk)])
+        else:
+            k = choose_bundle_count(len(recs))
+            partitions = partition_sorted_indices(len(recs), k)
 
         for local_idx, positions in enumerate(partitions, 1):
             part = recs.iloc[positions].copy().reset_index(drop=True)
@@ -2477,35 +2523,92 @@ def assign_tracks_to_circuits(bundles, track_lookup, wires, client, kmz, unit_to
     for b in bundles:
         by_track[track_lookup[b["BUNDLE_ID"]]].append(b)
 
+    ref_kv = {}
+    for key in refs:
+        try:
+            v = txt(circuit_attributes(key, labels.get(key, key), client, kmz)[0])
+        except Exception:
+            v = ""
+        m = re.search(r"(\d{2,3})", v)
+        ref_kv[key] = m.group(1) if m else ""
+    label_to_keys = defaultdict(list)
+    for key in refs:
+        lab = txt(client.get(key, {}).get("line_no") or labels.get(key, key))
+        label_to_keys[lab].append(key)
+        label_to_keys[txt(key)].append(key)
+    known_labels = {k for k in label_to_keys if k}
+    layer_col = "SOURCE_LAYER" if "SOURCE_LAYER" in wires.columns else None
+
     rows, track_meta = [], {}
     for tid, bs in sorted(by_track.items()):
         samples = []
+        kv_votes = Counter(); hint_votes = Counter()
         for b in bs:
             # use all three phase candidates; circuit attribution is track-level, not phase-level
             for c in b["CANDIDATES"]:
                 g = force_2d(c["geometry3d"])
                 samples.extend([g.interpolate(f, normalized=True) for f in (0.2,0.5,0.8)])
+                if layer_col is not None:
+                    wi = int(c["WIRE_ROW"])
+                    if 0 <= wi < len(wires):
+                        lay = txt(wires.iloc[wi][layer_col])
+                        kv = layer_voltage(lay)
+                        if kv:
+                            kv_votes[kv] += 1
+                        h = layer_circuit_hint(lay, known_labels)
+                        if h:
+                            hint_votes[h] += 1
+        n_votes = sum(kv_votes.values())
+        track_kv = ""
+        if n_votes:
+            kv, cnt = kv_votes.most_common(1)[0]
+            if cnt >= 0.8 * n_votes:
+                track_kv = kv
+        hint_keys = set()
+        if hint_votes:
+            h, cnt = hint_votes.most_common(1)[0]
+            if cnt >= 0.8 * sum(hint_votes.values()):
+                hint_keys = set(label_to_keys.get(h, []))
         scores = []
         for key, ref in refs.items():
             ds = np.asarray([float(p.distance(ref))*unit_to_m for p in samples], dtype=float)
             if len(ds):
-                scores.append((float(np.median(ds)), float(np.quantile(ds,0.9)), key))
+                med = float(np.median(ds))
+                # Layer evidence: circuit named in the layer wins; a circuit whose
+                # voltage differs from the layer voltage is pushed behind every
+                # same-voltage candidate (kept as a last resort, CONF -> REVIEW).
+                if hint_keys:
+                    rank = 0 if key in hint_keys else 2
+                elif track_kv and ref_kv.get(key) and ref_kv[key] != track_kv:
+                    rank = 2
+                else:
+                    rank = 1
+                scores.append((rank, med, float(np.quantile(ds,0.9)), key))
         scores.sort()
+        layer_rule = "LAYER_CIRCUIT" if hint_keys else ("LAYER_KV" if track_kv else "")
+        if scores and scores[0][0] == 2:
+            layer_rule = "KV_MISMATCH"
+        scores = [(m, q, k) for _, m, q, k in scores]
         if not scores:
             best_key, best_d, second_d = "", None, None
         else:
             best_d, _, best_key = scores[0]
             second_d = scores[1][0] if len(scores)>1 else None
         margin = (second_d-best_d) if best_d is not None and second_d is not None else None
+        if margin is not None and margin < 0:
+            margin = None  # winner chosen by layer evidence, not by distance
         conf = "HIGH" if best_d is not None and best_d <= 15 and (margin is None or margin >= 5) else (
             "MEDIUM" if best_d is not None and best_d <= 40 and (margin is None or margin >= 2) else "REVIEW"
         )
+        if layer_rule == "KV_MISMATCH":
+            conf = "REVIEW"
         label = client.get(best_key, {}).get("line_no") or labels.get(best_key, best_key)
         track_meta[tid] = {"CKEY":best_key, "CIRCUIT":label, "DIST_M":best_d,
                            "SECOND_M":second_d, "MARGIN_M":margin, "CONF":conf}
         rows.append({
             "TRACK_ID":tid, "N_BUNDLES":len(bs), "CKEY":best_key, "CIRCUIT":label,
             "DIST_M":best_d, "SECOND_M":second_d, "MARGIN_M":margin, "CONF":conf,
+            "LAYER_KV":track_kv, "LAYER_RULE":layer_rule,
             "geometry": unary_union([b["geometry"] for b in bs]),
         })
         for b in bs:

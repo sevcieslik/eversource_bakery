@@ -193,3 +193,28 @@ Wires whose layer voltage differs from their circuit's voltage:
 | C12 | 0 | 0 |
 
 The remaining cases come from the main track/bundle attribution (shared-corridor issue, still open).
+
+## R. DXF layer names as attribution evidence (voltage, line tag, circuit name)
+The 3D wire layer name is parsed. Examples:
+
+| Layer | Read as |
+|---|---|
+| `Mainline_345kV` | voltage 345 |
+| `Mainline_1_115kV` | voltage 115, line tag 1 |
+| `Mainline_391_345kV` | circuit 391 (if 391 is a known circuit), voltage 345 |
+
+The parsed values are used in two places:
+- **Bundling.** When all wires on a support pair carry a layer line identity and there are at least 2 identities of at least 3 wires each, each line is bundled separately. Wires of a 115 kV and a 345 kV line, or of `_1` and `_2`, are no longer mixed by lateral order.
+- **Track → circuit attribution.**
+  - A circuit named in the layer wins.
+  - Otherwise, candidates whose SoW/client voltage differs from the layer voltage go behind every same-voltage candidate. If only a different-voltage candidate exists, the track keeps it with `CONF = REVIEW` and `LAYER_RULE = KV_MISMATCH`.
+  - `track_assignment_review` has the new fields `LAYER_KV` and `LAYER_RULE`.
+
+Results: Caydence wires whose layer kV differs from their circuit kV are now 0 in all four test clusters (before: C39 4, C55 5). C39 also lost its 2D gaps on 364 and 371: no discarded parts, 2D +0.6 km.
+
+Layer naming recommendation for operators:
+- Keep the voltage in every layer name.
+- Add `_1`, `_2`, … when two lines of the same voltage cross or share a corridor.
+- Best of all, put the circuit name in the layer, e.g. `Mainline_391_345kV`.
+
+Crossings between circuits of **different** voltages are usually real. Only same-voltage crossings point to attribution problems: C12 12, C39 2, C17 0, C55 0.
