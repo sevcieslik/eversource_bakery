@@ -2925,50 +2925,144 @@ def oriented_candidate(candidate, start_sid, end_sid, bundle, supports_by_id):
     return out,float(off_start),float(off_end)
 
 
-def select_phase_sequence(path, bundle_lookup, supports, unit_to_m):
-    """Dynamic programming across a circuit path.
+# R01.05: outermost-lane representative for non-horizontal bundles.
+LANE_PENALTY_M = 15.0      # cost of leaving the chosen outer lane in one span
+LANE_TOL_M = 0.5           # conductors within this of the extreme count as extreme
+LANE_MIN_SPREAD_M = 0.5    # below this lateral spread the bundle is a vertical stack
+LANE_NEIGHBOUR_M = 40.0    # other bundles within this radius vote for the far lane
 
-    Horizontal bundle: central phase has a strong local preference.
-    Vertical/mixed bundle: continuity dominates; outermost is a weak tie-break.
-    """
-    by_sid=support_lookup(supports)
-    states=[]
-    for i,bid in enumerate(path["BUNDLES"]):
-        b=bundle_lookup[bid]
-        s0,s1=path["NODES"][i],path["NODES"][i+1]
-        cand=[]
-        for c in b["CANDIDATES"]:
-            coords,off0,off1=oriented_candidate(c,s0,s1,b,by_sid)
-            if b["ARRANGEMENT"]=="HORIZONTAL":
-                local=8.0*float(c["CENTRAL_SCORE"])
-            else:
-                local=0.35*float(c["OUTER_PENALTY"])
-            cand.append({**c,"coords_oriented":coords,"OFF_START_M":off0,"OFF_END_M":off1,"LOCAL_COST":local})
-        states.append(cand)
 
-    if not states:
-        return [],[]
-    costs=[np.asarray([c["LOCAL_COST"] for c in states[0]],dtype=float)]
+def _lane_rule_enabled() -> bool:
+    return os.environ.get("BAKERY_LANE_RULE", "1").strip() not in {"0", "false", "no", "off"}
+
+
+def _bundle_mid(b):
+    return np.asarray([(float(b["END_A_X"]) + float(b["END_B_X"])) / 2.0,
+                       (float(b["END_A_Y"]) + float(b["END_B_Y"])) / 2.0])
+
+
+def _run_phase_dp(states, local_key, unit_to_m):
+    costs=[np.asarray([c[local_key] for c in states[0]],dtype=float)]
     back=[]
-    join_mats=[]
     for i in range(1,len(states)):
         prev,curr=states[i-1],states[i]
         cur_cost=np.full(len(curr),np.inf); cur_back=np.full(len(curr),-1,dtype=int)
-        join_mat=np.zeros((len(prev),len(curr)),dtype=float)
         for a,p in enumerate(prev):
             pxy=np.asarray(p["coords_oriented"][-1][:2])
             for b,c in enumerate(curr):
                 cxy=np.asarray(c["coords_oriented"][0][:2])
                 j=float(np.linalg.norm(pxy-cxy))*unit_to_m
-                join_mat[a,b]=j
-                val=costs[-1][a]+j+float(c["LOCAL_COST"])
+                val=costs[-1][a]+j+float(c[local_key])
                 if val<cur_cost[b]: cur_cost[b]=val;cur_back[b]=a
-        costs.append(cur_cost);back.append(cur_back);join_mats.append(join_mat)
-    idx=int(np.argmin(costs[-1])); chosen=[idx]
+        costs.append(cur_cost);back.append(cur_back)
+    idx=int(np.argmin(costs[-1])); total=float(costs[-1][idx]); chosen=[idx]
     for b in reversed(back):
         idx=int(b[idx]);chosen.append(idx)
     chosen.reverse()
-    selected=[states[i][chosen[i]] for i in range(len(states))]
+    return chosen,total
+
+
+def select_phase_sequence(path, bundle_lookup, supports, unit_to_m):
+    """Dynamic programming across a circuit path.
+
+    Horizontal bundle: central phase has a strong local preference.
+    Vertical/mixed bundle (R01.05): the outermost conductor on ONE side of the
+    circuit (left or right of the path direction) is kept along the whole path.
+    Offsets are re-signed by travel direction so the side is consistent across
+    corners. The side is the one away from neighbouring circuits; without
+    neighbours the cheaper side wins. Leaving the lane costs LANE_PENALTY_M, so it
+    only happens where geometry forces it (reported as LANE_OK = 0).
+    BAKERY_LANE_RULE=0 restores the R01.04 rule (weak sign-less outer preference).
+    """
+    by_sid=support_lookup(supports)
+    lane_rule=_lane_rule_enabled()
+    own=set(int(x) for x in path["BUNDLES"])
+    others=[b for bid,b in bundle_lookup.items() if int(bid) not in own]
+    other_mid=np.asarray([_bundle_mid(b) for b in others]) if others else np.zeros((0,2))
+    vote_left=0.0  # >0: neighbours sit on the left -> use right lane
+    states=[]
+    for i,bid in enumerate(path["BUNDLES"]):
+        b=bundle_lookup[bid]
+        s0,s1=path["NODES"][i],path["NODES"][i+1]
+        sign=1.0 if txt(b["STRUCT_A"])==txt(s0) else -1.0
+        horizontal=b["ARRANGEMENT"]=="HORIZONTAL"
+        cand=[]
+        for c in b["CANDIDATES"]:
+            coords,off0,off1=oriented_candidate(c,s0,s1,b,by_sid)
+            if horizontal:
+                legacy=8.0*float(c["CENTRAL_SCORE"])
+            else:
+                legacy=0.35*float(c["OUTER_PENALTY"])
+            soff=sign*(float(c["OFF_A_M"])+float(c["OFF_B_M"]))/2.0
+            cand.append({**c,"coords_oriented":coords,"OFF_START_M":off0,"OFF_END_M":off1,
+                         "LOCAL_COST":legacy,"SIDE_OFF_M":soff})
+        if not cand:
+            states.append(cand); continue
+        offs=np.asarray([c["SIDE_OFF_M"] for c in cand])
+        spread=float(offs.max()-offs.min())
+        stack=spread<LANE_MIN_SPREAD_M
+        for c in cand:
+            if horizontal:
+                c["COST_L"]=c["COST_R"]=c["LOCAL_COST"]
+                c["IS_L"]=c["IS_R"]=True
+            elif stack:
+                c["COST_L"]=c["COST_R"]=0.0
+                c["IS_L"]=c["IS_R"]=True
+            else:
+                c["IS_L"]=(offs.max()-c["SIDE_OFF_M"])<=LANE_TOL_M
+                c["IS_R"]=(c["SIDE_OFF_M"]-offs.min())<=LANE_TOL_M
+                c["COST_L"]=0.0 if c["IS_L"] else LANE_PENALTY_M
+                c["COST_R"]=0.0 if c["IS_R"] else LANE_PENALTY_M
+        if lane_rule and not horizontal and not stack and len(other_mid):
+            mid=_bundle_mid(b)
+            d=np.linalg.norm(other_mid-mid,axis=1)*unit_to_m
+            near=np.where(d<=LANE_NEIGHBOUR_M)[0]
+            if len(near):
+                A=np.asarray([by_sid[s0].geometry.x,by_sid[s0].geometry.y],dtype=float)
+                B=np.asarray([by_sid[s1].geometry.x,by_sid[s1].geometry.y],dtype=float)
+                t=B-A; n=float(np.linalg.norm(t))
+                if n>1e-9:
+                    t=t/n; normal=np.asarray([-t[1],t[0]])
+                    for k in near:
+                        side=float(np.dot(other_mid[k]-mid,normal))*unit_to_m
+                        if abs(side)>1.0:
+                            vote_left+=1.0 if side>0 else -1.0
+        states.append(cand)
+
+    if not states or any(len(s)==0 for s in states):
+        return [],[]
+
+    if lane_rule:
+        ch_l,tot_l=_run_phase_dp(states,"COST_L",unit_to_m)
+        ch_r,tot_r=_run_phase_dp(states,"COST_R",unit_to_m)
+        if vote_left>0:   lane,chosen,why="R",ch_r,"AWAY_FROM_NEIGHBOUR"
+        elif vote_left<0: lane,chosen,why="L",ch_l,"AWAY_FROM_NEIGHBOUR"
+        elif tot_r<tot_l: lane,chosen,why="R",ch_r,"LOWER_COST"
+        else:             lane,chosen,why="L",ch_l,"LOWER_COST"
+    else:
+        chosen,_=_run_phase_dp(states,"LOCAL_COST",unit_to_m)
+        lane,why=None,"LEGACY"
+
+    selected=[]
+    for i,ci in enumerate(chosen):
+        c=dict(states[i][ci])
+        b=bundle_lookup[path["BUNDLES"][i]]
+        if b["ARRANGEMENT"]=="HORIZONTAL":
+            c["LANE"]="CENTRAL"; c["LANE_OK"]=1
+        elif lane is None:
+            c["LANE"]="LEGACY"; c["LANE_OK"]=1
+        else:
+            ok=bool(c["IS_L"] if lane=="L" else c["IS_R"])
+            c["LANE"]="OUTER_LEFT" if lane=="L" else "OUTER_RIGHT"
+            c["LANE_OK"]=int(ok)
+        c["LANE_WHY"]=why
+        if b["ARRANGEMENT"]=="HORIZONTAL":
+            c["SIDE_CLASS"]="H"
+        elif c["IS_L"] and c["IS_R"]:
+            c["SIDE_CLASS"]="STACK"
+        else:
+            c["SIDE_CLASS"]="L" if c["IS_L"] else ("R" if c["IS_R"] else "INNER")
+        selected.append(c)
     joins=[]
     for i in range(1,len(selected)):
         a=np.asarray(selected[i-1]["coords_oriented"][-1][:2]);b=np.asarray(selected[i]["coords_oriented"][0][:2])
@@ -7679,8 +7773,13 @@ def build_final_products(
                     "SELECT_METHOD": (
                         "HORIZONTAL_CENTRAL"
                         if b["ARRANGEMENT"] == "HORIZONTAL"
-                        else "VERTICAL_CONTINUITY"
+                        else ("VERTICAL_CONTINUITY" if sel.get("LANE") == "LEGACY"
+                              else "VERTICAL_OUTER_LANE")
                     ),
+                    "LANE": txt(sel.get("LANE")),
+                    "LANE_OK": int(sel.get("LANE_OK", 1)),
+                    "LANE_WHY": txt(sel.get("LANE_WHY")),
+                    "SIDE_CLASS": txt(sel.get("SIDE_CLASS")),
                     "ROW_DIST_M": row_dist,
                     "LENGTH_M": float(geom2.length) * unit_to_m,
                     "geometry": geom2,

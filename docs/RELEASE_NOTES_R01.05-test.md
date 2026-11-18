@@ -139,3 +139,20 @@ GPKG re-export now writes only the RoWs that were selected: the GUI shows a chec
 
 ## M. Corridor attribution: single pending POA (feedback item 14)
 When a dummy POA is the only unmatched POA between two known anchors on a corridor, it now gets the nearest source structure even when the candidates are close in distance. It is marked SRC_MATCH `CORRIDOR_AMBIGUOUS_NEAREST` and QA status `MATCHED_AMBIGUOUS_NEAREST` so it can be reviewed.
+
+## N. 2D representative: outer lane for non-horizontal bundles
+For vertical, mixed and line-post bundles, the 2D wire is now the outermost conductor on one side of the circuit, kept along the whole path. Previously only continuity decided, so the representative could jump between conductors, especially at corners.
+- The side is defined relative to the circuit's direction of travel, so it stays the same across corners.
+- The side away from neighbouring circuits (within 40 m) is used. Without neighbours, the cheaper side is used.
+- Horizontal bundles keep the central phase, unchanged.
+- At transitions between horizontal and non-horizontal spans, the wire steps from the central phase to the outer one at the structure.
+- New `selected_span_wires` fields: `LANE` (CENTRAL / OUTER_LEFT / OUTER_RIGHT), `LANE_OK`, `LANE_WHY` and `SIDE_CLASS`. `SELECT_METHOD` is `VERTICAL_OUTER_LANE`.
+- `BAKERY_LANE_RULE=0` restores the R01.04 behaviour.
+
+Test clusters:
+
+| Metric | C12 R01.04 | C12 new | C17 R01.04 | C17 new |
+|---|---|---|---|---|
+| Side switches in non-horizontal runs | 59 | 0 | 13 | 0 |
+| Joins > 3 m (all at horizontal↔non-horizontal transitions) | 7 | 72 | 0 | 11 |
+| Maximum join | 4.9 m | 10.3 m | 0.9 m | 8.0 m |
