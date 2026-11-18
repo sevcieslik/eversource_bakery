@@ -82,6 +82,19 @@ Each cache is keyed by a cheap fingerprint of its inputs (file names, sizes and 
 
 To force a rebuild: run `00_preflight_eversource.py --no-cache`, set `BAKERY_NO_PREFLIGHT_CACHE=1`, or delete `00_preflight/00_cache`.
 
+**I. Faster LiDAR sampling in Geometry, with progress (update 2026-11-18)**
+The step "Sampling Structure ground and 3D wire classes 187/210 from source LiDAR" (unchanged since R01.04) ran in one thread with no progress output.
+
+The work is unchanged: it reads every LAZ tile with structures or conductors, takes class-2 ground at each Structure, and counts class 187/210 points along each observed 3D conductor. What changed:
+- **Progress:** tile headers and sampling show a progress bar with file count, elapsed time and ETA. The GUI also shows it in the Mixing stage.
+- **Parallel:** tiles are processed in parallel worker processes (`--workers`, the GUI Workers value, or `BAKERY_WORKERS`; default up to 8).
+- **Fewer tiles:** tiles with no Structure and no conductor are skipped. Before, every tile inside the bounding box of all wires was read.
+- **Smaller KD-trees:** only ground points in grid cells next to a Structure go into the KD-tree. Before, all ground points of every 2-million-point chunk did; on dense tiles this alone halved the time.
+- **Less decompression:** only XYZ and classification are decompressed where the LAS format allows (LAS 1.4, laspy ≥ 2.4).
+- **ZIP progress:** a LiDAR ZIP shows unzip progress, and only LAS/LAZ members are extracted.
+
+Results are identical to R01.04 on synthetic Cluster 12 LiDAR (191 LAZ tiles): ground Z for 1,734 Structures, class 187/210 votes and wire roles for 8,044 wires. This holds with 1 and with several workers.
+
 ## Cluster 12 test results (NH_05/09/11/14/25, same inputs)
 
 | Check | R01.04 | R01.05-test |

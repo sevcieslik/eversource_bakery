@@ -1564,6 +1564,7 @@ class BakeryGUI(tk.Tk):
                     ROOT / "scripts" / "01_build_eversource_geometry.py",
                     *common,
                     "--selection", str(selection),
+                    "--workers", str(workers),
                 )
                 if rc != 0:
                     raise RuntimeError("Geometry stage failed.")
@@ -1833,7 +1834,7 @@ class BakeryGUI(tk.Tk):
                     st = event[1]
                     detail = {
                         "PREHEATING": "Checking source data, AOIs and LiDAR coverage",
-                        "MIXING": "Building geometry and Caydence products",
+                        "MIXING": "Building geometry and Caydence products (LiDAR sampling shows a progress bar)",
                         "BAKING / ICING / PACKING": "Building selected point-cloud products",
                         "RE-PACKING": "Rebuilding Circuit/Caydence from the edited GPKG",
                     }.get(st, "Processing")

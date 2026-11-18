@@ -893,7 +893,12 @@ def discover_lidar_files(source: Path, temp_dir: Path) -> list[Path]:
         root = temp_dir / "lidar_source"
         root.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(source) as zf:
-            zf.extractall(root)
+            members = [m for m in zf.infolist()
+                       if not m.is_dir() and Path(m.filename).suffix.lower() in {".las", ".laz"}]
+            info(f"Extracting {len(members):,} LiDAR file(s) from {source.name}...")
+            for k, m in enumerate(members, 1):
+                zf.extract(m, root)
+                console_progress("lidar_unzip", "LiDAR | unzip", k, len(members), Path(m.filename).name)
         files = sorted([p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {".las", ".laz"}])
         if not files:
             raise RuntimeError("No LAS/LAZ files found inside LiDAR ZIP")
@@ -1015,16 +1020,21 @@ class _WireLidarVotes:
                 if not hasattr(part, 'coords'): continue
                 coords = np.asarray(part.coords, dtype=float)
                 if len(coords) < 2 or coords.shape[1] < 3: continue
-                for start, end in zip(coords[:-1], coords[1:]):
+                # Vectorised; same values and order as np.linspace(0, 1, n+1)
+                # per segment (step = 1/n, last value exactly 1.0).
+                starts = coords[:-1, :3]
+                ends = coords[1:, :3]
+                for start, end in zip(starts, ends):
                     length = float(np.linalg.norm((end-start)[:3])) * unit_to_m
                     n = max(1, int(np.ceil(length / sample_step_m)))
-                    # A sample at the final vertex of every part is included.
-                    for t in np.linspace(0., 1., n + 1):
-                        samples.append(start[:3] * (1-t) + end[:3] * t)
-                        owners.append(i)
+                    t = np.arange(n + 1, dtype=float) * (1.0 / n)
+                    t[-1] = 1.0
+                    t = t[:, None]
+                    samples.append(start * (1 - t) + end * t)
+                    owners.append(np.full(n + 1, i, dtype=np.int32))
         if samples:
-            self.xyz = np.asarray(samples, dtype=np.float64)
-            self.owners = np.asarray(owners, dtype=np.int32)
+            self.xyz = np.ascontiguousarray(np.vstack(samples), dtype=np.float64)
+            self.owners = np.concatenate(owners).astype(np.int32)
             self.tree = cKDTree(self.xyz)
             self.xy_min = np.min(self.xyz[:, :2],axis=0)-self.threshold
             self.xy_max = np.max(self.xyz[:, :2],axis=0)+self.threshold
@@ -1088,6 +1098,124 @@ class _WireLidarVotes:
         return out, pd.DataFrame(report)
 
 
+_LIDAR_WORKER: dict[str, Any] = {}
+
+
+def _lidar_workers(requested, n_jobs) -> int:
+    """Worker processes for LiDAR sampling: --workers, BAKERY_WORKERS, or auto."""
+    try:
+        n = int(requested) if requested else int(os.environ.get("BAKERY_WORKERS", "0") or 0)
+    except ValueError:
+        n = 0
+    if n <= 0:
+        n = max(1, min(8, (os.cpu_count() or 2) - 1))
+    return max(1, min(n, max(1, n_jobs)))
+
+
+def _lidar_worker_init(wire_xyz, wire_owners, threshold, xy_min, xy_max):
+    _LIDAR_WORKER.clear()
+    if wire_xyz is not None and len(wire_xyz):
+        _LIDAR_WORKER["tree"] = cKDTree(wire_xyz)
+        _LIDAR_WORKER["owners"] = wire_owners
+        _LIDAR_WORKER["threshold"] = float(threshold)
+        _LIDAR_WORKER["xy_min"] = xy_min
+        _LIDAR_WORKER["xy_max"] = xy_max
+    else:
+        _LIDAR_WORKER["tree"] = None
+
+
+def _open_las_xyz_class(path):
+    """Open LAS/LAZ decompressing only XY, Z and classification where the
+    format allows (LAS 1.4 point formats 6-10, laspy >= 2.4). Other fields
+    are not used here; older laspy or formats fall back to a full read."""
+    try:
+        from laspy import DecompressionSelection as _D
+        sel = _D.XY_RETURNS_CHANNEL | _D.Z | _D.CLASSIFICATION
+        return laspy.open(path, decompression_selection=sel)
+    except (ImportError, AttributeError, TypeError):
+        return laspy.open(path)
+
+
+def _lidar_sample_file(job):
+    """One LiDAR tile: class-2 ground candidates near structures and class
+    187/210 votes for observed 3D conductors (same rules as _WireLidarVotes)."""
+    path, hit, local_queries, wire_overlap, max_radius_src, max_fit_points = job
+    W = _LIDAR_WORKER
+    tree_w = W.get("tree")
+    cands = []
+    vote_keys, pairs = [], []
+    try:
+        with _open_las_xyz_class(path) as fh:
+            for chunk in fh.chunk_iterator(2_000_000):
+                try:
+                    cls = np.asarray(chunk.classification)
+                except Exception:
+                    continue
+                if wire_overlap and tree_w is not None:
+                    take = (cls == 187) | (cls == 210)
+                    if np.any(take):
+                        xyz = np.column_stack((np.asarray(chunk.x)[take], np.asarray(chunk.y)[take],
+                                               np.asarray(chunk.z)[take]))
+                        labels = cls[take]
+                        lo, hi = W["xy_min"], W["xy_max"]
+                        within = ((xyz[:, 0] >= lo[0]) & (xyz[:, 0] <= hi[0]) &
+                                  (xyz[:, 1] >= lo[1]) & (xyz[:, 1] <= hi[1]))
+                        if np.any(within):
+                            xyz = xyz[within]; labels = labels[within]
+                            dist, sid = tree_w.query(xyz, k=1, distance_upper_bound=W["threshold"], workers=1)
+                            valid = np.isfinite(dist) & (sid < len(W["owners"]))
+                            if np.any(valid):
+                                sid = sid[valid]
+                                owner = W["owners"][sid].astype(np.int64)
+                                lab = np.where(labels[valid] == 187, 0, 1)
+                                vote_keys.append(owner * 2 + lab)
+                                pairs.append(np.unique(np.column_stack((owner, sid)), axis=0))
+                mask = cls == 2
+                if len(hit) == 0 or not np.any(mask):
+                    continue
+                x = np.asarray(chunk.x)[mask]
+                y = np.asarray(chunk.y)[mask]
+                z = np.asarray(chunk.z)[mask]
+                # Only ground within the search radius of a structure matters:
+                # keep points in grid cells next to a structure (cell = radius)
+                # before building the KD-tree. The kept set is a superset of
+                # every point any structure query can return.
+                if len(x):
+                    cell = float(max_radius_src)
+                    px = np.floor(x / cell).astype(np.int64)
+                    py = np.floor(y / cell).astype(np.int64)
+                    qx = np.floor(local_queries[:, 0] / cell).astype(np.int64)
+                    qy = np.floor(local_queries[:, 1] / cell).astype(np.int64)
+                    off = np.array([-1, 0, 1], dtype=np.int64)
+                    nx = (qx[:, None, None] + off[None, :, None]).repeat(3, axis=2).ravel()
+                    ny = (qy[:, None, None] + off[None, None, :]).repeat(3, axis=1).ravel()
+                    big = np.int64(1) << np.int64(32)
+                    keep = np.isin(px * big + py, np.unique(nx * big + ny))
+                    x, y, z = x[keep], y[keep], z[keep]
+                if len(x) == 0:
+                    continue
+                tree = cKDTree(np.column_stack([x, y]))
+                for local_i, global_i in enumerate(hit):
+                    ids = tree.query_ball_point(local_queries[local_i], r=max_radius_src)
+                    if not ids:
+                        continue
+                    q = local_queries[local_i]
+                    ids_arr = np.asarray(ids, dtype=int)
+                    d = np.hypot(x[ids_arr] - q[0], y[ids_arr] - q[1])
+                    for j in np.argsort(d)[:max_fit_points]:
+                        cands.append((int(global_i), float(d[j]), float(x[ids_arr[j]]),
+                                      float(y[ids_arr[j]]), float(z[ids_arr[j]])))
+    except Exception as exc:
+        raise RuntimeError(f"Failed reading LiDAR {path}: {exc}") from exc
+    if vote_keys:
+        uk, cnt = np.unique(np.concatenate(vote_keys), return_counts=True)
+        pr = np.unique(np.concatenate(pairs), axis=0)
+    else:
+        uk = np.empty(0, dtype=np.int64); cnt = np.empty(0, dtype=np.int64)
+        pr = np.empty((0, 2), dtype=np.int64)
+    return {"cands": cands, "vote_keys": uk, "vote_counts": cnt, "pairs": pr}
+
+
 def add_ground_elevation_from_lidar(
     structures: gpd.GeoDataFrame,
     lidar_source: Path,
@@ -1097,6 +1225,7 @@ def add_ground_elevation_from_lidar(
     search_radii_m: tuple[float, ...] = (3.0, 6.0, 12.0, 25.0),
     max_fit_points: int = 60,
     wire_votes: _WireLidarVotes | None = None,
+    workers: int | None = None,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """Populate final circuit-structure Z from classified LiDAR ground (class 2).
 
@@ -1124,7 +1253,16 @@ def add_ground_elevation_from_lidar(
     candidates: dict[int, list[tuple[float, float, float, float, str]]] = defaultdict(list)
     used_files = 0
 
-    for path in files:
+    # R01.05: read headers first, keep only tiles that hold a structure or an
+    # observed 3D conductor, then decompress those tiles in parallel worker
+    # processes with a progress bar. Results are merged in file order, so the
+    # output is identical to the former single-threaded loop.
+    wire_xy_tree = None
+    if wire_votes is not None and wire_votes.tree is not None:
+        wire_xy_tree = cKDTree(wire_votes.xyz[:, :2])
+    jobs = []
+    n_files = len(files)
+    for k, path in enumerate(files, 1):
         try:
             with laspy.open(path) as fh:
                 h = fh.header
@@ -1137,54 +1275,76 @@ def add_ground_elevation_from_lidar(
                     )
                 mins = np.asarray(h.mins[:2], dtype=float)
                 maxs = np.asarray(h.maxs[:2], dtype=float)
-                hit = np.where(
-                    (qxy[:, 0] >= mins[0] - max_radius_src) &
-                    (qxy[:, 0] <= maxs[0] + max_radius_src) &
-                    (qxy[:, 1] >= mins[1] - max_radius_src) &
-                    (qxy[:, 1] <= maxs[1] + max_radius_src)
-                )[0]
-                wire_overlap = wire_votes is not None and wire_votes.overlaps(mins, maxs)
-                if len(hit) == 0 and not wire_overlap:
-                    continue
-                if len(hit): used_files += 1
-                if wire_overlap: wire_votes.files_seen += 1
-                local_queries = qxy[hit]
-                for chunk in fh.chunk_iterator(2_000_000):
-                    try:
-                        cls = np.asarray(chunk.classification)
-                    except Exception:
-                        continue
-                    if wire_overlap:
-                        wire_votes.add_chunk(chunk, cls)
-                    mask = cls == 2
-                    if len(hit) == 0 or not np.any(mask):
-                        continue
-                    x = np.asarray(chunk.x)[mask]
-                    y = np.asarray(chunk.y)[mask]
-                    z = np.asarray(chunk.z)[mask]
-                    if len(x) == 0:
-                        continue
-                    pts = np.column_stack([x, y])
-                    tree = cKDTree(pts)
-                    for local_i, global_i in enumerate(hit):
-                        ids = tree.query_ball_point(local_queries[local_i], r=max_radius_src)
-                        if not ids:
-                            continue
-                        q = local_queries[local_i]
-                        ids_arr = np.asarray(ids, dtype=int)
-                        dx = x[ids_arr] - q[0]
-                        dy = y[ids_arr] - q[1]
-                        d = np.hypot(dx, dy)
-                        order = np.argsort(d)[:max_fit_points]
-                        for j in order:
-                            candidates[int(global_i)].append(
-                                (float(d[j]), float(x[ids_arr[j]]), float(y[ids_arr[j]]),
-                                 float(z[ids_arr[j]]), path.name)
-                            )
         except RuntimeError:
             raise
         except Exception as exc:
             raise RuntimeError(f"Failed reading LiDAR {path}: {exc}") from exc
+        console_progress("lidar_headers", "Mixing | LiDAR headers", k, n_files, path.name)
+        hit = np.where(
+            (qxy[:, 0] >= mins[0] - max_radius_src) &
+            (qxy[:, 0] <= maxs[0] + max_radius_src) &
+            (qxy[:, 1] >= mins[1] - max_radius_src) &
+            (qxy[:, 1] <= maxs[1] + max_radius_src)
+        )[0]
+        wire_overlap = False
+        if wire_xy_tree is not None and wire_votes.overlaps(mins, maxs):
+            th = wire_votes.threshold
+            c = (mins + maxs) / 2.0
+            rad = float(np.hypot(*(maxs - mins))) / 2.0 + th
+            for j in wire_xy_tree.query_ball_point(c, r=rad):
+                x, y = wire_votes.xyz[j, 0], wire_votes.xyz[j, 1]
+                if mins[0] - th <= x <= maxs[0] + th and mins[1] - th <= y <= maxs[1] + th:
+                    wire_overlap = True
+                    break
+        if len(hit) == 0 and not wire_overlap:
+            continue
+        if len(hit):
+            used_files += 1
+        if wire_overlap:
+            wire_votes.files_seen += 1
+        jobs.append((str(path), hit, qxy[hit], wire_overlap, max_radius_src, max_fit_points))
+
+    if wire_votes is not None and wire_votes.tree is not None:
+        init_args = (wire_votes.xyz, wire_votes.owners, wire_votes.threshold,
+                     wire_votes.xy_min, wire_votes.xy_max)
+    else:
+        init_args = (None, None, 0.0, None, None)
+    nworkers = _lidar_workers(workers, len(jobs))
+    skipped = n_files - len(jobs)
+    info(f"  LiDAR tiles to read: {len(jobs):,} of {n_files:,} "
+         f"({skipped:,} without structures or conductors skipped); workers: {nworkers}")
+    results = [None] * len(jobs)
+    label = "Mixing | LiDAR sampling"
+    if jobs:
+        console_progress("lidar_sampling", label, 0, len(jobs))
+    if nworkers <= 1 or len(jobs) <= 1:
+        _lidar_worker_init(*init_args)
+        for k, job in enumerate(jobs):
+            results[k] = _lidar_sample_file(job)
+            console_progress("lidar_sampling", label, k + 1, len(jobs), Path(job[0]).name)
+    else:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=nworkers, mp_context=ctx,
+                                 initializer=_lidar_worker_init, initargs=init_args) as pool:
+            futs = {pool.submit(_lidar_sample_file, job): k for k, job in enumerate(jobs)}
+            done = 0
+            for fut in as_completed(futs):
+                k = futs[fut]
+                results[k] = fut.result()
+                done += 1
+                console_progress("lidar_sampling", label, done, len(jobs), Path(jobs[k][0]).name)
+
+    for job, res in zip(jobs, results):
+        name = Path(job[0]).name
+        for gi, d, x, y, z in res["cands"]:
+            candidates[int(gi)].append((d, x, y, z, name))
+        if wire_votes is not None and len(res["vote_keys"]):
+            keys = res["vote_keys"]
+            np.add.at(wire_votes.counts, (keys // 2, keys % 2), res["vote_counts"])
+            for w, sample in res["pairs"]:
+                wire_votes.sample_hits[int(w)].add(int(sample))
 
     if used_files == 0:
         raise RuntimeError("No LiDAR tile overlaps the final structure locations")
@@ -8614,6 +8774,7 @@ def run_geometry_stage(
     horizontal_z_ratio: float = 0.35,
     max_join_review_m: float = 25.0,
     wire_simplify_m: float = 0.25,
+    lidar_workers: int | None = None,
 ):
     output.mkdir(parents=True, exist_ok=True)
     crs=CRS.from_epsg(epsg); u2m=unit_to_metre(crs)
@@ -8737,7 +8898,8 @@ def run_geometry_stage(
         info("Sampling Structure ground and 3D wire classes 187/210 from source LiDAR...")
         wire_votes = _WireLidarVotes(cayd_w, u2m)
         structures_final,ground_qa=add_ground_elevation_from_lidar(
-            structures_xy,lidar_source,crs,u2m,td,wire_votes=wire_votes
+            structures_xy,lidar_source,crs,u2m,td,wire_votes=wire_votes,
+            workers=lidar_workers,
         )
         cayd_w, lidar_role_qa = wire_votes.apply(cayd_w)
         lidar_role_qa.to_csv(output/"01_caydence_lidar_wire_roles.csv", index=False)
@@ -8757,7 +8919,7 @@ def run_geometry_stage(
             # pass deliberately disables wire voting to avoid double counts.
             repl_final, repl_qa = add_ground_elevation_from_lidar(
                 positioned_xy.loc[changed_indices],lidar_source,crs,u2m,td,
-                wire_votes=None)
+                wire_votes=None, workers=lidar_workers)
             for i, (_, new_row) in zip(changed_indices, repl_final.iterrows()):
                 for col in repl_final.columns:
                     structures_final.at[i,col] = new_row[col]

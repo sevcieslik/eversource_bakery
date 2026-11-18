@@ -35,6 +35,8 @@ def main():
     p.add_argument("--epsg", type=int, default=None)
     p.add_argument("--year", type=int, default=2026)
     p.add_argument("--selection", default=None)
+    p.add_argument("--workers", type=int, default=None,
+                   help="Processes for LiDAR ground/wire sampling (default: auto, max 8).")
     p.add_argument(
         "-o", "--output", default=None,
         help="Explicit Stage 01 output. Overrides --output-root.",
@@ -77,6 +79,7 @@ def main():
             wires, points, lidar, client, kmz,
             epsg, args.year, output,
             selection if selection.exists() else None,
+            lidar_workers=args.workers,
         )
         print("\nGEOMETRY COMPLETE")
         return 0
