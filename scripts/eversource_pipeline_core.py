@@ -731,11 +731,120 @@ def assign_poa_circuit_ownership(points: gpd.GeoDataFrame, sow_rows, unit_to_m: 
     return output
 
 
-def build_support_sites(points: gpd.GeoDataFrame, unit_to_m: float, support_cluster_m: float):
+SUPPORT_ATTACH_M = 3.0
+
+
+def _split_parallel_line_groups(groups, points, wires, unit_to_m, attach_m=SUPPORT_ATTACH_M):
+    """R01.05: undo distance-only merges of POAs that belong to separate lines.
+
+    Two POAs of separate parallel structures can lie within the support radius
+    (Cluster 17 ST00665: C129 and G128 POAs 14.3 m apart; Cluster 12 ST01172).
+    A POA is a through point of its own line when the conductors attached to it
+    (endpoint within attach_m) lead to two different neighbouring supports on
+    opposite sides. A merged group is split only when at least two such
+    through POAs lead to disjoint neighbours. POAs that lead one way only
+    (e.g. one pole per phase at an angle structure) stay together.
+    Returns (new_groups, qa_rows).
+    """
+    if wires is None or wires.empty or not groups:
+        return groups, []
+    xy = np.column_stack([points.geometry.x, points.geometry.y])
+    tree = cKDTree(xy)
+    tol = attach_m / unit_to_m
+    gid = {}
+    for g, inds in groups.items():
+        for i in inds:
+            gid[i] = g
+    multi = {g for g, inds in groups.items() if len(inds) >= 2}
+    if not multi:
+        return groups, []
+    nbr = defaultdict(lambda: defaultdict(list))  # marker -> neighbour group -> [xy]
+    for geom in wires.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        parts = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+        for part in parts:
+            c = list(part.coords)
+            if len(c) < 2:
+                continue
+            a, b = c[0][:2], c[-1][:2]
+            da, ia = tree.query(a)
+            db, ib = tree.query(b)
+            if da > tol or db > tol:
+                continue
+            ia, ib = int(ia), int(ib)
+            ga, gb = gid[ia], gid[ib]
+            if ga == gb:
+                continue
+            if ga in multi:
+                nbr[ia][gb].append(xy[ib])
+            if gb in multi:
+                nbr[ib][ga].append(xy[ia])
+    out = {}
+    qa = []
+    for g, inds in groups.items():
+        if g not in multi:
+            out[g] = inds
+            continue
+        through = []
+        for i in inds:
+            dirs = []
+            for pts in nbr[i].values():
+                v = np.mean(pts, axis=0) - xy[i]
+                n = float(np.hypot(*v))
+                if n > 0:
+                    dirs.append(v / n)
+            opposite = any(float(np.dot(dirs[a], dirs[b])) < 0.0
+                           for a in range(len(dirs)) for b in range(a + 1, len(dirs)))
+            if len(nbr[i]) >= 2 and opposite:
+                through.append(i)
+        if len(through) < 2:
+            out[g] = inds
+            continue
+        # Union through POAs that share a neighbour; disjoint ones are separate lines.
+        uf = UnionFind(len(through))
+        for a in range(len(through)):
+            for b in range(a + 1, len(through)):
+                if set(nbr[through[a]]) & set(nbr[through[b]]):
+                    uf.union(a, b)
+        seeds = defaultdict(list)
+        for k, i in enumerate(through):
+            seeds[uf.find(k)].append(i)
+        if len(seeds) < 2:
+            out[g] = inds
+            continue
+        sub = {r: list(m) for r, m in seeds.items()}
+        for i in inds:
+            if i in through:
+                continue
+            best = None
+            for r, members in sub.items():
+                shared = set(nbr[i]) & set().union(*(set(nbr[m]) for m in members))
+                d = min(float(np.hypot(*(xy[i] - xy[m]))) for m in members)
+                key = (0 if shared else 1, d)
+                if best is None or key < best[0]:
+                    best = (key, r)
+            sub[best[1]].append(i)
+        parts = sorted(sub.values(), key=lambda m: min(m))
+        out[g] = sorted(parts[0])
+        for k, m in enumerate(parts[1:], 1):
+            out[(g, "split", k)] = sorted(m)
+        span = max(float(np.hypot(*(xy[a] - xy[b]))) for a in inds for b in inds) * unit_to_m
+        qa.append({"GROUP": str(g), "N_POA": len(inds), "N_PARTS": len(parts),
+                   "SPREAD_M": round(span, 2),
+                   "X": float(xy[inds].mean(axis=0)[0]), "Y": float(xy[inds].mean(axis=0)[1])})
+    return out, qa
+
+
+def build_support_sites(points: gpd.GeoDataFrame, unit_to_m: float, support_cluster_m: float,
+                        wires: gpd.GeoDataFrame | None = None):
     """Cluster nearby contractor attachment markers into one physical support site.
 
     This intentionally only creates a support topology key. It does NOT move source
     wire geometry. The final wire is always derived from an actual source conductor.
+    With wires given (R01.05), POAs of separate parallel lines merged by distance
+    alone are split again (see _split_parallel_line_groups). Supports created by a
+    split are numbered after all others, so existing support IDs do not change.
     """
     xy = np.column_stack([points.geometry.x, points.geometry.y])
     tree = cKDTree(xy)
@@ -751,10 +860,18 @@ def build_support_sites(points: gpd.GeoDataFrame, unit_to_m: float, support_clus
     groups = defaultdict(list)
     for i in range(len(points)):
         groups[uf.find(i)].append(i)
+    split_qa = []
+    if wires is not None:
+        groups, split_qa = _split_parallel_line_groups(dict(groups), points, wires, unit_to_m)
+        # Keep original numbering; split-off parts go last.
+        ordered = [v for k, v in groups.items() if not isinstance(k, tuple)] + \
+                  [v for k, v in groups.items() if isinstance(k, tuple)]
+    else:
+        ordered = list(groups.values())
 
     rows = []
     point_to_support = {}
-    for n, inds in enumerate(groups.values(), 1):
+    for n, inds in enumerate(ordered, 1):
         sg = points.iloc[inds]
         x = float(sg.geometry.x.mean())
         y = float(sg.geometry.y.mean())
@@ -770,7 +887,11 @@ def build_support_sites(points: gpd.GeoDataFrame, unit_to_m: float, support_clus
             "X": x, "Y": y, "Z": z,
             "geometry": Point(x, y, z),
         })
-    return gpd.GeoDataFrame(rows, geometry="geometry", crs=points.crs), point_to_support
+    out = gpd.GeoDataFrame(rows, geometry="geometry", crs=points.crs)
+    out.attrs["split_qa"] = split_qa
+    if split_qa:
+        info(f"Supports split into separate parallel-line structures: {len(split_qa)}")
+    return out, point_to_support
 
 
 def _wire_endpoint_tangent(geom, at_start: bool, sample_source: float) -> np.ndarray | None:
@@ -4504,7 +4625,21 @@ def attribute_unmatched_structures_along_corridor(
                         d_lateral = abs(soff-lateral)
                         choices.append((d_along + 0.25*d_lateral, j, sr, spos, ident, d_along))
                     choices.sort(key=lambda v: (v[0],v[1]))
-                    if len(choices)>1 and choices[1][0] <= choices[0][0]*1.5 + 5.0:
+                    ambiguous = len(choices)>1 and choices[1][0] <= choices[0][0]*1.5 + 5.0
+                    alone_in_bracket = False
+                    if ambiguous:
+                        # R01.05: when this is the only unmatched POA between
+                        # its two known anchors, the order cannot be broken by
+                        # choosing: take the nearest source and flag it, instead
+                        # of leaving STRUCT_ID blank (Cluster 21: one POA between
+                        # 242 and 239.5 with source 240 at 38 m, 241 at 59 m).
+                        lo = max([k for k, _, _ in known if k < opos], default=None)
+                        hi = min([k for k, _, _ in known if k > opos], default=None)
+                        if lo is not None and hi is not None:
+                            n_pending = sum(1 for pos_, idx_ in pending if lo < pos_ < hi and
+                                            int(result.at[idx_, "IS_DUMMY"] or 0) == 1)
+                            alone_in_bracket = n_pending == 1
+                    if ambiguous and not alone_in_bracket:
                         status = "AMBIGUOUS_ORDER"
                     elif choices:
                         score, j, src, srcpos, ident, along_m = choices[0]
@@ -4524,11 +4659,12 @@ def attribute_unmatched_structures_along_corridor(
                             if fld in result.columns:
                                 result.at[i,fld] = src.get(fld)
                         result.at[i,"SRC_DIST_M"] = float(r.geometry.distance(src.geometry))*unit_to_m
-                        result.at[i,"SRC_MATCH"] = "CORRIDOR_ORDERED"
+                        result.at[i,"SRC_MATCH"] = ("CORRIDOR_AMBIGUOUS_NEAREST" if ambiguous
+                                                    else "CORRIDOR_ORDERED")
                         result.at[i,"IS_DUMMY"] = 0
                         used.add(ident)
                         known.append((opos,srcpos,i))
-                        status = "MATCHED"
+                        status = "MATCHED_AMBIGUOUS_NEAREST" if ambiguous else "MATCHED"
                 qa.append({"OUTPUT_INDEX":i,"CIRCUIT":str(circuit),"STATUS":status,
                            "CROSS_OFFSET_M":round(lateral,2),
                            "SOURCE_STRUCT":txt(choices[0][2].get("STRUCTURE_")) if choices else "",
@@ -8073,7 +8209,23 @@ def _explode_row_field(gdf):
     return gpd.GeoDataFrame(out.reset_index(drop=True), geometry="geometry", crs=gdf.crs)
 
 
-def export_geometry_from_gpkg(gpkg, deliverables, year=None, backup_dir=None):
+def gpkg_export_rows(gpkg):
+    """(selected RoWs stored by the run, every RoW found in the editable layers)."""
+    import pyogrio
+    gpkg = Path(gpkg)
+    settings = _read_export_settings(gpkg)
+    selected = sorted(set(_split_rows(settings.get("SELECTED_ROWS", ""))))
+    found = set()
+    names = {n for n, _ in pyogrio.list_layers(str(gpkg))}
+    for layer in ("selected_span_wires", "structures_final", "caydence_wires_3d"):
+        if layer in names:
+            df = pyogrio.read_dataframe(str(gpkg), layer=layer, columns=["ROW"], read_geometry=False)
+            for v in df["ROW"]:
+                found.update(_split_rows(v))
+    return selected, sorted(found)
+
+
+def export_geometry_from_gpkg(gpkg, deliverables, year=None, backup_dir=None, rows=None):
     """R01.05: rebuild the geometry deliverables from an operator-edited QA GPKG.
 
     Editable layers (QGIS: edit attributes, delete or copy features):
@@ -8208,10 +8360,31 @@ def export_geometry_from_gpkg(gpkg, deliverables, year=None, backup_dir=None):
         })
     final_wires = rows_to_gdf(wires, crs)
 
-    rows = set(_split_rows(settings.get("SELECTED_ROWS", "")))
-    for df in (spans, structures, cayd_w):
+    # RoWs to publish: given by the operator, else the RoWs selected for the
+    # run (export_settings), else every RoW in the data (GPKG older than
+    # R01.05). Features in any other RoW are not published and are reported.
+    if rows:
+        rows = {txt(r) for r in rows if txt(r)}
+    else:
+        rows = set(_split_rows(settings.get("SELECTED_ROWS", "")))
+    if not rows:
+        rows = set()
+        for df in (spans, structures, cayd_w):
+            if df is not None and not df.empty:
+                rows |= {txt(x) for x in df["ROW"] if txt(x)}
+    skipped = []
+    for name, df in (("selected_span_wires", spans), ("structures_final", structures),
+                     ("caydence_wires_3d", cayd_w)):
         if df is not None and not df.empty:
-            rows |= {txt(x) for x in df["ROW"] if txt(x)}
+            other = df[~df["ROW"].astype(str).isin(rows)]
+            for r, n in other["ROW"].astype(str).value_counts().items():
+                skipped.append({"CHECK": "ROW_NOT_EXPORTED", "ROW": r, "CIRCUIT": "",
+                                "ID": name, "N": int(n)})
+    spans = spans[spans["ROW"].astype(str).isin(rows)]
+    if structures is not None and not structures.empty:
+        structures = structures[structures["ROW"].astype(str).isin(rows)]
+    if cayd_w is not None and not cayd_w.empty:
+        cayd_w = cayd_w[cayd_w["ROW"].astype(str).isin(rows)]
 
     if backup_dir is not None:
         backup_dir = Path(backup_dir)
@@ -8227,6 +8400,9 @@ def export_geometry_from_gpkg(gpkg, deliverables, year=None, backup_dir=None):
         span_edges=spans, unit_to_m=unit_to_m,
     )
     checks = check_gpkg_export_consistency(spans, structures, cayd_w, kmz_meta, unit_to_m)
+    if skipped:
+        checks = pd.concat([checks, pd.DataFrame(skipped)], ignore_index=True)
+    inv.attrs["rows"] = sorted(rows)
     return inv, checks
 
 
@@ -8478,7 +8654,8 @@ def recover_terminal_2d_from_3d(
     unit_to_m: float,
     near_m: float = 6.0,
     min_extension_m: float = 6.0,
-    min_forward_cos: float = 0.15,
+    min_forward_cos: float = -0.35,
+    min_away_ratio: float = 0.5,
 ) -> tuple[gpd.GeoDataFrame, pd.DataFrame, gpd.GeoDataFrame]:
     """Extend retained 2D endpoints using *observed* 3D conductor vectors.
 
@@ -8535,6 +8712,13 @@ def recover_terminal_2d_from_3d(
                             # by an existing 2D section in this formal circuit.
                             tip=Point(float(b[0]),float(b[1]))
                             if original.distance(tip)*unit_to_m < min_extension_m:
+                                continue
+                            # R01.05: spans into a substation often leave the
+                            # last structure at ~90 deg (R01.04 required < ~81
+                            # deg). Accept up to ~110 deg, but only if the wire
+                            # really leaves the line: its far end must be at
+                            # least min_away_ratio of its length away from it.
+                            if original.distance(tip) < min_away_ratio*length:
                                 continue
                             options.append((near, -dot, -length, txt(wr.get('WIRE_ID')), a, b, wpart))
                 if not options:
@@ -8792,7 +8976,10 @@ def run_geometry_stage(
     kmz_ownership_refs=project_kmz(parse_sow_kmz(kmz_path),crs)
     sow_ownership_rows=_load_sow_circuits(package_root()/"source",crs,kmz_ownership_refs)
     raw_points=assign_poa_circuit_ownership(raw_points,sow_ownership_rows,u2m,wires=wires)
-    supports,point_to_support=build_support_sites(raw_points,u2m,support_cluster_m)
+    supports,point_to_support=build_support_sites(raw_points,u2m,support_cluster_m,wires=wires)
+    pd.DataFrame(supports.attrs.get("split_qa", []),
+                 columns=["GROUP","N_POA","N_PARTS","SPREAD_M","X","Y"]).to_csv(
+        output/"01_support_split_qa.csv", index=False)
     raw_points=raw_points.copy().reset_index(drop=True)
     raw_points["TOPO_ID"]=[point_to_support.get(int(i), "") for i in raw_points.index]
     wm,wire_review=endpoint_assignment(wires,supports,u2m,max_endpoint_m)

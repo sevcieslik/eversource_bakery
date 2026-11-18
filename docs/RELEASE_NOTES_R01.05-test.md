@@ -127,3 +127,15 @@ The baseline run reproduced the operator's R01.04 Cluster 12 output exactly: 173
 - **MAIN_PART quality:** these parts are delivered with the circuit attribution they already had. Please QA them first. They are listed in `selected_span_wires` with `PATH_ROLE = MAIN_PART`.
 - **Attribution not yet changed:** circuit attribution on shared centrelines is unchanged (e.g. 3195/380, H123/K165, CONF = REVIEW). That is the next step.
 - **No LiDAR in our test run:** ground Z and LiDAR wire roles in our run are not meaningful. They do not affect the 2D/attribution changes above.
+
+## J. Parallel-line supports split (feedback item 10)
+POAs within 15 m used to be merged into one structure in the middle, even when they belonged to two separate parallel lines. A merged group is now split when at least two "through" POAs (wires attached within 3 m continuing in opposite directions) lead to different neighbouring structures. Split parts get new ST IDs appended at the end, so existing IDs do not change. QA: `01_support_split_qa.csv`.
+
+## K. Terminal spans at substations (feedback item 8)
+Recovery of terminal 2D spans from observed 3D now accepts spans that turn up to ~110° from the line direction, e.g. into a substation bay. It still requires the new tip to move at least half a span away from the original end. The new tips found in the test clusters all lie inside SoW substations.
+
+## L. Re-export RoW selection
+GPKG re-export now writes only the RoWs that were selected: the GUI shows a checkbox dialog, and `04_export_geometry_from_gpkg.py` takes `--rows NH_02,NH_27` and `--list-rows`. Features in other RoWs, for example boundary structures duplicated from a neighbouring RoW, are skipped and reported as CHECK `ROW_NOT_EXPORTED`.
+
+## M. Corridor attribution: single pending POA (feedback item 14)
+When a dummy POA is the only unmatched POA between two known anchors on a corridor, it now gets the nearest source structure even when the candidates are close in distance. It is marked SRC_MATCH `CORRIDOR_AMBIGUOUS_NEAREST` and QA status `MATCHED_AMBIGUOUS_NEAREST` so it can be reviewed.

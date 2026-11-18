@@ -1052,13 +1052,8 @@ class BakeryGUI(tk.Tk):
                 f"Geometry GPKG not found:\n{gpkg}\n\nRun Geometry first.",
             )
             return
-        if not messagebox.askyesno(
-            "Export from edited GPKG",
-            "Rebuild the Circuit and Caydence deliverables from:\n"
-            f"{gpkg}\n\nClose the GPKG in QGIS (or save your edits) first.\n"
-            "The current Circuit/Caydence folders are copied to QA before they are replaced.\n"
-            "Tile Index, Management Units and LAS are not touched.\n\nContinue?",
-        ):
+        rows = self._ask_export_rows(gpkg)
+        if not rows:
             return
         self.cancel_requested = False
         self.started_at = time.monotonic()
@@ -1076,6 +1071,7 @@ class BakeryGUI(tk.Tk):
                     "RE-PACKING",
                     ROOT / "scripts" / "04_export_geometry_from_gpkg.py",
                     "--output-root", str(out),
+                    "--rows", ",".join(rows),
                 )
                 if rc != 0:
                     raise RuntimeError("Export from GPKG failed.")
@@ -1087,6 +1083,69 @@ class BakeryGUI(tk.Tk):
 
         self.worker_thread = threading.Thread(target=work, daemon=True)
         self.worker_thread.start()
+
+    def _ask_export_rows(self, gpkg: Path):
+        """Choose the RoWs to re-export. Default: the RoWs selected for the run."""
+        try:
+            kw = {}
+            if os.name == "nt":
+                kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            res = subprocess.run(
+                [PY, str(ROOT / "scripts" / "04_export_geometry_from_gpkg.py"),
+                 "--gpkg", str(gpkg), "--list-rows"],
+                capture_output=True, text=True, timeout=300, **kw,
+            )
+            vals = dict(
+                line.split("=", 1) for line in res.stdout.splitlines() if "=" in line
+            )
+            selected = [r for r in vals.get("SELECTED_ROWS", "").split(";") if r]
+            found = [r for r in vals.get("FOUND_ROWS", "").split(";") if r]
+        except Exception as exc:
+            messagebox.showerror("Re-export from GPKG", f"Could not read RoWs from the GPKG:\n{exc}")
+            return None
+        rows = sorted(set(selected) | set(found))
+        if not rows:
+            messagebox.showerror("Re-export from GPKG", "No RoWs found in the GPKG.")
+            return None
+        default = set(selected) or set(found)
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Re-export from GPKG")
+        dlg.configure(bg=BG)
+        dlg.transient(self)
+        dlg.grab_set()
+        frm = ttk.Frame(dlg, style="Bakery.TFrame", padding=16)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(
+            frm,
+            text=("Rebuild Circuit and Caydence deliverables for the RoWs ticked below.\n"
+                  "Save and close the GPKG in QGIS first. Current folders are copied to QA.\n"
+                  "Tile Index, Management Units and LAS are not touched."),
+            style="Side.TLabel", justify="left",
+        ).pack(anchor="w", pady=(0, 10))
+        ttk.Style(self).configure("Dlg.TCheckbutton", background=BG, foreground=TEXT)
+        vars_ = {}
+        for r in rows:
+            note = "" if r in selected else "   (not selected for this Geometry run)"
+            v = tk.BooleanVar(value=r in default)
+            vars_[r] = v
+            ttk.Checkbutton(frm, text=r + note, variable=v, style="Dlg.TCheckbutton").pack(anchor="w", pady=1)
+        result = {"rows": None}
+
+        def ok():
+            chosen = [r for r, v in vars_.items() if v.get()]
+            if not chosen:
+                messagebox.showwarning("Re-export from GPKG", "Tick at least one RoW.", parent=dlg)
+                return
+            result["rows"] = chosen
+            dlg.destroy()
+
+        btns = ttk.Frame(frm, style="Bakery.TFrame")
+        btns.pack(fill="x", pady=(12, 0))
+        ttk.Button(btns, text="Re-export", style="Accent.TButton", command=ok).pack(side="right")
+        ttk.Button(btns, text="Cancel", style="Small.TButton", command=dlg.destroy).pack(side="right", padx=6)
+        dlg.wait_window()
+        return result["rows"]
 
     def _read_preflight_rows(self, output_root: Path):
         """Read the preflight coverage table for the GUI RoW selection dialog."""

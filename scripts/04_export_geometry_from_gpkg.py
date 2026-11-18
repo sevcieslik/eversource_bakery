@@ -24,6 +24,7 @@ from pathlib import Path
 from eversource_pipeline_core import (
     check_gpkg_export_consistency,  # noqa: F401  (re-exported for tests)
     export_geometry_from_gpkg,
+    gpkg_export_rows,
     info,
     package_root,
 )
@@ -39,6 +40,11 @@ def main() -> int:
                    help="Edited GPKG. Default: <output-root>/01_geometry/01_eversource_geometry.gpkg")
     p.add_argument("--year", type=int, default=None,
                    help="Delivery year. Default: the year stored in the GPKG.")
+    p.add_argument("--rows", default=None,
+                   help="RoWs to publish, e.g. NH_02,NH_27. Default: the RoWs selected for "
+                        "the Geometry run (stored in the GPKG).")
+    p.add_argument("--list-rows", action="store_true",
+                   help="Print the stored and found RoWs and exit.")
     p.add_argument("--no-backup", action="store_true",
                    help="Do not copy the current Circuit/Caydence folders to QA first.")
     # Accepted for launcher compatibility; not used.
@@ -52,6 +58,12 @@ def main() -> int:
     if not gpkg.is_file():
         print(f"ERROR: GPKG not found: {gpkg}")
         return 2
+    if args.list_rows:
+        selected, found = gpkg_export_rows(gpkg)
+        print("SELECTED_ROWS=" + ";".join(selected))
+        print("FOUND_ROWS=" + ";".join(found))
+        return 0
+    rows = [r.strip() for r in args.rows.replace(";", ",").split(",") if r.strip()] if args.rows else None
     deliverables = output_root / "deliverables"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ")
     qa_dir = output_root / "QA" / f"{stamp}_01_geometry_export_from_gpkg"
@@ -66,7 +78,9 @@ def main() -> int:
         info(f"Backup:       {backup}")
     info("=" * 70)
 
-    inv, checks = export_geometry_from_gpkg(gpkg, deliverables, year=args.year, backup_dir=backup)
+    inv, checks = export_geometry_from_gpkg(gpkg, deliverables, year=args.year,
+                                            backup_dir=backup, rows=rows)
+    info("RoWs exported: " + ", ".join(inv.attrs.get("rows", [])))
     inv.to_csv(qa_dir / "01_geometry_delivery_inventory.csv", index=False)
     checks.to_csv(qa_dir / "01_gpkg_export_checks.csv", index=False)
 
