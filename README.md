@@ -1,10 +1,28 @@
-# Eversource Tester R01.04
+# Eversource Tester R01.05-test
 
-R01.04 is the current tester release. The initial R01.00 geometry deliverables for CT_17 and CT_33 were reviewed and accepted by the project operator.
+**R01.05-test** is the current **test build** for operator UAT. **R01.04** remains the last accepted release. The initial R01.00 geometry deliverables for CT_17 and CT_33 were reviewed and accepted by the project operator.
+
+Detailed changes and test results: [`docs/RELEASE_NOTES_R01.05-test.md`](docs/RELEASE_NOTES_R01.05-test.md).
 
 ## Purpose
 
-Eversource Tester builds selected NMIP26068 Eversource geometry and point-cloud deliverables. The application version must display **R01.04** at launch and during the Geometry stage.
+Eversource Tester builds selected NMIP26068 Eversource geometry and point-cloud deliverables.
+
+## Which build am I running?
+
+Each package carries its build name and git commit, shown as a label like:
+
+```
+R01.05-test build 20261119b (commit 6807c1e)
+```
+
+The label appears in:
+- the GUI window title and header,
+- the run log (banner, and a `[BAKERY] …` line at the start of every stage),
+- every `QA_RUN_MANIFEST.json`, under `"bakery"` with the full commit hash,
+- the `export_settings` layer of the QA GeoPackage.
+
+Always quote the label when reporting results. The value comes from `scripts/BUILD_INFO.json`, which is written when the package is built. When the tool runs from a git checkout instead, the commit is read from git, with `-dirty` added if there are local changes.
 
 ## Operator manual
 
@@ -12,100 +30,153 @@ Use **Operator Manual** at the bottom of the left GUI panel to open `docs/operat
 
 ## Folder layout
 
-- `input/`: default run input; the GUI can use a different input path
-- `source/`: packaged project references, including SoW SQLite; source directory is fixed in GUI
-- `output/`: default results folder; use a separate output path per test
-- `scripts/`: implementation and installed Python environment; operators should not edit
-- `setup_eversource.bat`: first-time installation
-- `run_eversource.bat`: launch GUI
+- `input/`: default run input; the GUI can use a different input path.
+- `source/`: packaged project references, including SoW SQLite; the source directory is fixed in the GUI.
+- `output/`: default results folder. Use a **new, empty output folder for each cluster** (see below).
+- `scripts/`: implementation and installed Python environment; operators should not edit it.
+- `setup_eversource.bat`: first-time installation.
+- `run_eversource.bat`: launches the GUI.
 
 ## Run
 
 1. Run `setup_eversource.bat` once, then `run_eversource.bat`.
-2. Confirm Input Folder, Output Folder, CRS, capture year, workers and product selection.
-3. Select **Geometry** for circuit 2D wires, structures and Caydence outputs.
-4. Click **Start Batch** and wait for preflight.
-5. Select READY RoWs and click **Continue Batch**.
-6. When the run completes without error, use **Open Deliverables** and **Open QA**.
-7. Perform QGIS QA before delivery, especially circuit continuity, POA structures, DCWP location and terminal 2D coverage.
+2. Check the build label in the GUI title.
+3. Confirm Input Folder, Output Folder, CRS, capture year, workers and product selection.
+4. Select **Geometry** for circuit 2D wires, structures and Caydence outputs.
+5. Click **Start Batch** and wait for preflight. Preflight results are cached and reused while the inputs do not change. Use `--no-cache` or `BAKERY_NO_PREFLIGHT_CACHE=1` to force a fresh preflight.
+6. Select READY RoWs and click **Continue Batch**. LiDAR sampling runs on the selected number of workers and logs its progress.
+7. When the run completes without error, use **Open Deliverables** and **Open QA**.
+8. Perform QGIS QA before delivery, especially circuit continuity, POA structures, DCWP location and terminal 2D coverage.
+
+**One output folder per cluster.** The tool does not clear old results. RoW folders from a previous cluster stay in the output folder and can be delivered by mistake. If two clusters share a RoW, the second run overwrites the first one's deliverables for that RoW.
+
+## Fixing results in the QA GeoPackage
+
+1. Edit `output/01_geometry/01_eversource_geometry.gpkg` in QGIS: spans, structures, Caydence wires and their `CIRCUIT`/`ROW`.
+2. Press **Re-export from GPKG** in the GUI, choose the RoWs to write and confirm. Geometry is not run again, and the previous deliverables are backed up.
+3. Features in other RoWs are skipped and reported as `ROW_NOT_EXPORTED`.
+
+Command line equivalent:
+
+```
+python scripts/04_export_geometry_from_gpkg.py --output-root output --rows NH_02,NH_27
+python scripts/04_export_geometry_from_gpkg.py --output-root output --list-rows
+```
+
+## Naming DXF levels (MicroStation)
+
+The tool reads voltage, line tag and circuit from the 3D wire level name:
+
+| Level | Meaning |
+|---|---|
+| `Mainline_345kV` | Voltage only. This is the minimum; always keep the voltage. |
+| `Mainline_1_115kV`, `Mainline_2_115kV` | Separate lines of the same voltage that cross or share a corridor |
+| `Mainline_391_345kV` | Best option: the circuit is taken from the level for bundling, tracks, 2D and Caydence |
+
+Wires on an unnamed level (e.g. `0`) are tolerated as a small minority.
 
 ## Expected behaviour
 
-- Circuit attribution prioritises conductor continuity and available reference evidence.
-- Distinct nearby circuit POAs are not merged on distance alone.
-- Observed POA structures remain even without matching source data; such records use NULL source-mapped fields.
-- For confirmed shared structures, create circuit-specific records at a shared physical location.
-- For DCWP, use the confirmed middle member; source XY may serve as a candidate fallback requiring review.
-- 3D conductors extending into substations can form terminal 2D without an end POA or a made-up structure.
-- A substation boundary does not justify deleting a real POA/source structure.
+- **2D circuit wire.** It represents the **central phase** of the circuit, and an EARTH wire is never used. A step of about 4 m at a structure where horizontal phases change to a vertical arrangement is expected.
+- **Duplicate conductors.** Identical copies of one conductor in the DXF are ignored for 2D. In Caydence they follow the kept wire.
+- **Parallel lines.** Distinct nearby circuit POAs are not merged on distance alone. POAs of parallel lines are split into separate structures (`01_support_split_qa.csv`).
+- **RoW boundaries.** RoW boundaries fall on structures. A structure at the start or end of two RoWs is written to both RoW deliverables. This is intended, so don't delete these duplicates (`01_row_boundary_qa.csv`).
+- **Caydence Structures.** Within one RoW, a support carrying several circuits keeps one record, the one with the fullest source attribution (`01_caydence_structure_dedupe_qa.csv`). Circuit folders keep one structure per circuit.
+- **Caydence wires.** They are published in the RoW of their circuit. A wire is never attributed to a circuit of a different voltage than its DXF level.
+- **SCHF/SCSH.** These are positioned on the middle phase, as in R01.04.
+- **POA structures.** Observed POA structures remain even without matching source data; such records use NULL source-mapped fields.
+- **Shared structures.** For confirmed shared structures, circuit Structures are created at a shared physical location.
+- **DCWP.** Use the confirmed middle member; source XY may serve as a candidate fallback requiring review.
+- **Substations.** 3D conductors extending into substations, including sharp turns into a bay, can form terminal 2D without an end POA or a made-up structure. A substation boundary does not justify deleting a real POA or source structure.
 
 ## QA and support
 
-Save the console version, affected RoW/circuit, relevant DXF/SHP examples, QA outputs and last error lines. Do not assume deliverables are complete when a final Geometry/QA export error is present.
+For each issue report:
+- the **build label**,
+- the **cluster**, **RoW** and **circuit**,
+- the **span ID or nearest structure** (`STRUCT_ID` or `TOPO_ID`),
+- the run's QA folder,
+- the last error lines, if any.
+
+Do not assume deliverables are complete when a final Geometry/QA export error is present.
 
 ## Circuit and structure attribution
 
-- Explicit EARTH / PHASE DXF layers take precedence over inferred wire types, including at terminal spans.
+- Explicit EARTH/PHASE DXF layers take precedence over inferred wire types, including at terminal spans.
 - An unmatched Structure may inherit attributes from an unused source Structure on the same circuit, in longitudinal order between already matched controls. The POA-derived point never moves.
-- The corridor check uses a lateral width, not a circular source-matching radius. Ambiguous and out-of-corridor cases retain NULL source attributes and are listed in `01_structure_corridor_attribution.csv`.
-- Operator Manual is located at the bottom of the left navigation panel.
+- When a POA is the only unmatched one between two matched structures, it takes the nearest source structure. These records are marked `SRC_MATCH = CORRIDOR_AMBIGUOUS_NEAREST` for review.
+- The corridor check uses a lateral width, not a circular source-matching radius. Ambiguous and out-of-corridor cases keep NULL source attributes and are listed in `01_structure_corridor_attribution.csv`.
 
-**DXF layer caveat:** `Mainline_345kV` identifies voltage, not PHASE/EARTH. R01.04 uses source LiDAR classes 187/210 for this determination when sufficient evidence is available. Existing continuity inference is a fallback only. The independent evidence report is `01_caydence_lidar_wire_roles.csv`.
+**DXF layer caveat:** `Mainline_345kV` identifies voltage, not PHASE/EARTH. The tool uses source LiDAR classes 187/210 for PHASE/EARTH when sufficient evidence is available; continuity inference is a fallback only. The evidence report is `01_caydence_lidar_wire_roles.csv`.
 
 ## LiDAR-based Caydence wire types
 
-In Geometry the same source LAS/LAZ read used to sample structure ground height also collects Tx Conductor class **187** and Tx Shield class **210** around each original DXF 3D wire. Sufficient, consistent 3D evidence determines PHASE/EARTH. This does **not** read or depend upon the exported PLS XYZ products. Review `01_caydence_lidar_wire_roles.csv`: `INSUFFICIENT_LIDAR` means no confirmed LiDAR assignment, so the prior role is retained pending review.
+Geometry reads the source LAS/LAZ once, both for structure ground height and for the Tx Conductor class **187** and Tx Shield class **210** points around each original DXF 3D wire. Sufficient, consistent 3D evidence determines PHASE/EARTH. This does **not** read or depend on the exported PLS XYZ products.
+
+Review `01_caydence_lidar_wire_roles.csv`. `INSUFFICIENT_LIDAR` means there was no confirmed LiDAR assignment, so the prior role is kept pending review.
 
 ## SCHF representative position
 
-SCHF structures with three unambiguous parallel PHASE wires are positioned transversely on the middle wire. Their circuit station is preserved, source attributes are not modified, and ground height is resampled at the final XY. Ambiguous arrangements are left unchanged and reported in `01_schf_middle_phase_qa.csv`. Other structure types are unaffected.
+SCHF structures with three unambiguous parallel PHASE wires are positioned transversely on the middle wire. Their circuit station is preserved, source attributes are not modified, and ground height is resampled at the final XY. Ambiguous arrangements are left unchanged and reported in `01_structure_middle_phase_qa.csv`.
 
 ## SCSH single-top positioning
 
-SCSH structures are moved transversely to the middle of three same-circuit PHASE wires only when exactly one distinct raw Tower Top Attachment marker is present locally (15 m search radius). Where multiple raw POA markers occur, the point is not moved and QA reports `MULTIPLE_NEARBY_TOWER_TOPS` (possible trident). Coincident CAD duplicates within 0.75 m are treated as one top. Other fallback and SCHF rules are unchanged. See `01_structure_middle_phase_qa.csv`.
-
+SCSH structures are moved transversely to the middle of three same-circuit PHASE wires only when exactly one distinct raw Tower Top Attachment marker is present locally (15 m search radius). Where several raw POA markers occur, the point is not moved and QA reports `MULTIPLE_NEARBY_TOWER_TOPS` (possible trident). Coincident CAD duplicates within 0.75 m count as one top.
 
 ---
 
 ## Release notes
 
-This section records changes introduced after the R01.00 baseline. Most recent first.
+Changes after the R01.00 baseline, most recent first.
+
+### R01.05-test (test build)
+
+Full details, measurements and per-cluster results: [`docs/RELEASE_NOTES_R01.05-test.md`](docs/RELEASE_NOTES_R01.05-test.md).
+
+- **2D wire.** Back to the central phase; EARTH wires are excluded; duplicate DXF conductors are collapsed; when one circuit has several bundles on the same structure pair, continuity picks between them.
+- **Structures.** Parallel-line POAs are split into separate structures. A single pending POA between two matched structures takes the nearest source structure.
+- **Terminal spans.** Spans turning sharply into substations are recovered.
+- **RoW handling.** RoW boundaries are set at structures. 2D, Circuit and Caydence products are written per RoW. Caydence keeps one record per physical structure.
+- **Caydence wires.** Wires use the RoW of their circuit. Pieces split at crossings are attributed to the line they run alongside.
+- **DXF level names.** Voltage, line tag and circuit name are read from the level name and used in bundling, tracks, circuit attribution and Caydence.
+- **Re-export.** Deliverables can be rebuilt from the edited QA GeoPackage (GUI button or `04_export_geometry_from_gpkg.py`), with RoW selection.
+- **Performance.** Preflight cache; parallel, selective LiDAR sampling with progress; GUI layout fixes for high DPI.
+- **Build identity.** The build label is shown in the GUI, the log, the QA manifests and the GPKG.
+- **Tests.** `test_row_boundary_r0105.py`, `test_schf_scsh_r0104.py`, `test_schf_r0103.py`.
 
 ### R01.04
 
 - Extends the R01.03 transverse middle-PHASE positioning rule to SCSH structures.
-- SCSH requires exactly one distinct original Tower Top Attachment point of the same circuit in a 15 m neighborhood; multiple markers (potential trident) block relocation.
+- SCSH requires exactly one distinct original Tower Top Attachment point of the same circuit in a 15 m neighbourhood; multiple markers (potential trident) block relocation.
 - Original CAD point duplicates within 0.75 m count as a single top. Missing raw POA, wrong circuit, ambiguous PHASE geometry and overly distant POA are held for QA.
 - SCHF geometry logic remains unchanged. Source attribution, CIRCUIT, and all 2D/3D wires remain unchanged.
 - Ground is resampled at any moved XY.
 - QA output: `01_structure_middle_phase_qa.csv` (includes STR_TYPE and NEARBY_TOPS).
-- Run regression `python scripts/test_schf_scsh_r0104.py`. Full production LiDAR rerun not performed.
+- Regression test: `python scripts/test_schf_scsh_r0104.py`.
 
 ### R01.03
 
-- Representative structure point for `STR_TYPE=SCHF` is moved transversely to the middle of three local parallel PHASE wires, without longitudinal displacement.
+- The representative structure point for `STR_TYPE=SCHF` is moved transversely to the middle of three local parallel PHASE wires, without longitudinal displacement.
 - Uses LiDAR-classified Caydence PHASE wires (187), not unrelated output products.
-- Requires exactly three local wires with consistent tangents and spacing; otherwise leaves the structure unchanged with QA warning.
+- Requires exactly three local wires with consistent tangents and spacing; otherwise the structure is left unchanged with a QA warning.
 - Resamples ground class 2 at every moved structure before delivery.
 - Does not change the 3D wires, 2D wires, circuit attribution, source attributes or other structure types.
 - New QA: `01_schf_middle_phase_qa.csv`.
-- Validation: syntax and standalone geometry cases; full Geometry LiDAR rerun required.
 
 ### R01.02
 
 - Geometry reads classified source LiDAR class 187 (PHASE) and 210 (EARTH) **during the existing ground-elevation scan**, not from PLS XYZ products.
-- DXF explicit EARTH/PHASE levels remain authoritative; generic levels use full 3D nearest sample voting with >=12 LiDAR matches, >=4 distinct sampled locations and >=80% majority.
+- DXF explicit EARTH/PHASE levels remain authoritative. Generic levels use full 3D nearest-sample voting, which needs ≥12 LiDAR matches, ≥4 distinct sampled locations and ≥80% majority.
 - Raw source wire geometry, circuit assignment, 2D products and structure geometry are unchanged by this classification pass.
-- New `01_caydence_lidar_wire_roles.csv` records the evidence and decisions per wire; unconfirmed roles are explicitly identified.
-- This release requires UAT on source LAZ tiles: no complete pipeline run was possible in the authoring environment.
+- New `01_caydence_lidar_wire_roles.csv` records the evidence and decision for each wire; unconfirmed roles are explicitly identified.
 
 ### R01.01
 
-Patch release on top of accepted R01.00 geometry.
+Patch release on top of the accepted R01.00 geometry.
 
 - Preserve explicit DXF EARTH/PHASE throughout Caydence export and terminal recovery. For generic Mainline DXF layers, conservatively propagate a stable EARTH classification along physically continuous XYZ wire chains (QA CSV provided).
-- Second-pass source attribution by circuit corridor and order between matched source controls; supports disconnected reference lines and preserves POA XY. Real EMA 3361 regression recovers 13~111 with unchanged geometry.
-- Unmatched or ambiguous candidates remain dummy with QA warnings.
-- Operator Manual moved to bottom-left of GUI; unnecessary final manual section removed.
+- Second-pass source attribution by circuit corridor and order between matched source controls; supports disconnected reference lines and preserves POA XY.
+- Unmatched or ambiguous candidates remain dummy, with QA warnings.
+- Operator Manual moved to the bottom left of the GUI.
 
-QA report: `01_structure_corridor_attribution.csv`. Full production run is required before release acceptance.
+QA report: `01_structure_corridor_attribution.csv`.
