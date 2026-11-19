@@ -42,6 +42,11 @@ def main():
         help="Explicit Stage 01 output. Overrides --output-root.",
     )
     args = p.parse_args()
+    try:
+        from bakery_version import bakery_build_label
+        print(f"[BAKERY] {bakery_build_label()}", flush=True)
+    except Exception:
+        pass
 
     tool_root = package_root()
     input_dir = Path(args.input_dir) if args.input_dir else tool_root / "input"

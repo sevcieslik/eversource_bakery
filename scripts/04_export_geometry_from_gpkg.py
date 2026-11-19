@@ -52,6 +52,11 @@ def main() -> int:
     p.add_argument("--source-dir", default=None)
     p.add_argument("--epsg", default=None)
     args = p.parse_args()
+    try:
+        from bakery_version import bakery_build_label
+        print(f"[BAKERY] {bakery_build_label()}", flush=True)
+    except Exception:
+        pass
 
     output_root = Path(args.output_root) if args.output_root else package_root() / "output"
     gpkg = Path(args.gpkg) if args.gpkg else output_root / "01_geometry" / "01_eversource_geometry.gpkg"

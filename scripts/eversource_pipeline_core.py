@@ -429,6 +429,7 @@ def _archive_qa_run(
     manifest = {
         "qa_archive_version": 1,
         "created_utc": datetime.now(timezone.utc).isoformat(),
+        "bakery": _bakery_build_dict(),
         "stage": stage,
         "products": product_list,
         "selected_rows": sorted({txt(x) for x in (selected_rows or []) if txt(x)}),
@@ -8712,10 +8713,18 @@ def spans_one_row_per_feature(span_edges):
 
 def _bakery_version_text():
     try:
-        from bakery_version import BAKERY_VERSION
-        return BAKERY_VERSION
+        from bakery_version import bakery_build_label
+        return bakery_build_label()
     except Exception:
         return ""
+
+
+def _bakery_build_dict():
+    try:
+        from bakery_version import bakery_build_dict
+        return bakery_build_dict()
+    except Exception:
+        return {}
 
 
 def write_export_settings(gpkg, year, selected_rows, unit_to_m, epsg=None):

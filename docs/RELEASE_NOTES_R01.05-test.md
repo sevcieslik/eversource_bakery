@@ -252,3 +252,12 @@ Synthetic C39 test (all wires renamed to their circuit, 3% left on level `0`):
 - 15/15 tracks were attributed by level.
 
 Joins over 3 m that remain (C39: 14) are mostly at horizontal ↔ vertical configuration changes, where the middle of the circuit really moves on the structure.
+
+## X. Build identity: which code did the operator run?
+Every package now carries `scripts/BUILD_INFO.json` with the build name, git commit, branch and build time. The label, e.g. `R01.05-test build 20261119b (commit 1a2b3c4)`, appears in:
+- the GUI window title and header,
+- the run log: the banner and a `[BAKERY] …` line at the start of every stage (00, 01, 02, 04),
+- every `QA_RUN_MANIFEST.json`, under `"bakery"` (full commit hash),
+- the `export_settings` layer of the QA GeoPackage.
+
+When run from a git checkout without `BUILD_INFO.json`, the commit is read from git, with `-dirty` added if there are local changes.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-from bakery_version import BAKERY_VERSION, BAKERY_RELEASE
+from bakery_version import BAKERY_VERSION, BAKERY_RELEASE, bakery_build_label
 
 import csv
 import json
@@ -224,7 +224,7 @@ def hidden_process_kwargs():
 class BakeryGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"NM Group - TX Veg Delivery Bakery {BAKERY_VERSION}")
+        self.title(f"NM Group - TX Veg Delivery Bakery {bakery_build_label()}")
         # Size the window for the display scaling and keep it on screen.
         try:
             _scale = max(1.0, float(self.tk.call("tk", "scaling")) / (96 / 72))
@@ -394,7 +394,7 @@ class BakeryGUI(tk.Tk):
         ttk.Label(left, text="TX VEG DELIVERY BAKERY", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             left,
-            text=f"NMIP26068 Eversource Tester {BAKERY_VERSION}  •  {BAKERY_RELEASE}",
+            text=f"NMIP26068 Eversource Tester {bakery_build_label()}  •  {BAKERY_RELEASE}",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(2, 0))
         self.ready_badge = tk.Label(
@@ -1004,7 +1004,7 @@ class BakeryGUI(tk.Tk):
         self.summary_badge.configure(text="BATCH IN PROGRESS", bg="#f6ddc8", fg=ACCENT_DARK)
         self._set_stage("PREHEATING", "Validating inputs, AOIs and LiDAR coverage")
         self._clear_log()
-        self._append_log(f"TX Veg Delivery Bakery {BAKERY_VERSION} batch started.")
+        self._append_log(f"TX Veg Delivery Bakery {bakery_build_label()} batch started.")
         self._append_log(f"Release: {BAKERY_RELEASE}")
         self._append_log(f"Input:  {inp}")
         self._append_log(f"Source: {SOURCE}")
@@ -1062,7 +1062,7 @@ class BakeryGUI(tk.Tk):
         self.start_btn.configure(state="disabled")
         self.gpkg_export_btn.configure(state="disabled")
         self._clear_log()
-        self._append_log(f"TX Veg Delivery Bakery {BAKERY_VERSION}: export from edited GPKG.")
+        self._append_log(f"TX Veg Delivery Bakery {bakery_build_label()}: export from edited GPKG.")
         self._append_log(f"GPKG: {gpkg}")
 
         def work():

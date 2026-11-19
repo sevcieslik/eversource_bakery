@@ -13,7 +13,7 @@ PY = sys.executable
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from workspace_paths import choose_workspace
-from bakery_version import BAKERY_VERSION, BAKERY_RELEASE
+from bakery_version import BAKERY_VERSION, BAKERY_RELEASE, bakery_build_label
 
 PRODUCTS = {
     "1": ("geometry", "Geometry - 2D Wires, Structures, Caydence"),
@@ -36,7 +36,7 @@ def banner():
     print("")
     print("=" * 80)
     print("  NM GROUP - TX VEG DELIVERY BAKERY")
-    print(f"  NMIP26068 Eversource Tester {BAKERY_VERSION}")
+    print(f"  NMIP26068 Eversource Tester {bakery_build_label()}")
     print(f"  {BAKERY_RELEASE}")
     print("=" * 80)
 

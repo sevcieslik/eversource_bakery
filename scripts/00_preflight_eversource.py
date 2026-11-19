@@ -187,6 +187,11 @@ def main():
              "instead of reusing 00_preflight/00_cache.",
     )
     args = p.parse_args()
+    try:
+        from bakery_version import bakery_build_label
+        print(f"[BAKERY] {bakery_build_label()}", flush=True)
+    except Exception:
+        pass
     if args.no_cache:
         import os
         os.environ["BAKERY_NO_PREFLIGHT_CACHE"] = "1"
