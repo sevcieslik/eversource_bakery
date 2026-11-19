@@ -2174,6 +2174,27 @@ def layer_circuit_hint(layer: str, known_labels: set[str]) -> str:
     return ""
 
 
+DUPLICATE_WIRE_M = 0.3
+
+
+def _collapse_duplicate_records(records, tol):
+    kept = []
+    for r in records:
+        a = np.asarray(r["coords"][0], dtype=float); b = np.asarray(r["coords"][-1], dtype=float)
+        dup_of = None
+        for k in kept:
+            ka = np.asarray(k["coords"][0], dtype=float); kb = np.asarray(k["coords"][-1], dtype=float)
+            if ((np.linalg.norm(a - ka) <= tol and np.linalg.norm(b - kb) <= tol) or
+                    (np.linalg.norm(a - kb) <= tol and np.linalg.norm(b - ka) <= tol)):
+                dup_of = k
+                break
+        if dup_of is None:
+            kept.append(r)
+        else:
+            dup_of["EXTRA_WIRE_ROWS"] = list(dup_of.get("EXTRA_WIRE_ROWS") or []) + [int(r["WIRE_ROW"])] + list(r.get("EXTRA_WIRE_ROWS") or [])
+    return kept
+
+
 def build_span_bundles(wire_matches, supports, unit_to_m,
                        horizontal_z_range_m, horizontal_z_ratio):
     by_sid = support_lookup(supports)
@@ -2219,13 +2240,29 @@ def build_span_bundles(wire_matches, supports, unit_to_m,
             })
         if not records:
             continue
+        # R01.05: identical copies of one conductor in the DXF (same 3D endpoints
+        # within DUPLICATE_WIRE_M) would be sliced into separate phases. Keep one
+        # for analysis; the copies follow it into Caydence attribution.
+        records = _collapse_duplicate_records(records, DUPLICATE_WIRE_M / unit_to_m)
         recs = pd.DataFrame(records).sort_values("OFF_MEAN_M", kind="stable").reset_index(drop=True)
         # R01.05: when every wire carries a layer line identity (voltage, tag or
         # circuit) and the pair holds >=2 such lines of >=3 wires each, bundle each
         # line separately instead of slicing the mixed lateral order.
         gkeys = recs["SOURCE_LAYER"].apply(lambda x: layer_group_key(txt(x)))
-        sizes = gkeys.value_counts()
-        if (gkeys != "").all() and len(sizes) >= 2 and int(sizes.min()) >= 3:
+        keyed = gkeys != ""
+        sizes = gkeys[keyed].value_counts()
+        if (keyed.mean() >= 0.8 and len(sizes) >= 2 and int(sizes.min()) >= 3
+                and not keyed.all()):
+            # Unnamed-layer wires (e.g. level 0) join the keyed line whose lateral
+            # range is nearest, so they do not block per-line bundling.
+            rng = {g: (float(recs.loc[gkeys == g, "OFF_MEAN_M"].min()),
+                       float(recs.loc[gkeys == g, "OFF_MEAN_M"].max())) for g in sizes.index}
+            for i in recs.index[~keyed]:
+                o = float(recs.at[i, "OFF_MEAN_M"])
+                gkeys.at[i] = min(rng, key=lambda g: (max(0.0, rng[g][0]-o, o-rng[g][1]), g))
+            sizes = gkeys.value_counts()
+            keyed = gkeys != ""
+        if keyed.all() and len(sizes) >= 2 and int(sizes.min()) >= 3:
             partitions = []
             for gk in sorted(sizes.index, key=lambda g: float(recs.loc[gkeys == g, "OFF_MEAN_M"].mean())):
                 pos = list(recs.index[gkeys == gk])
@@ -2301,6 +2338,11 @@ def build_span_bundles(wire_matches, supports, unit_to_m,
                 "PAIR": pair_key, "BUNDLE_LOCAL": local_idx,
                 "N_SOURCE_WIRES": int(len(part)), "N_PHASE": 3,
                 "ARRANGEMENT": arrangement,
+                # Line identity from the DXF layer of the phase wires (R01.05);
+                # blank when unnamed or mixed.
+                "LAYER_KEY": (lambda ks: ks.pop() if len(ks) == 1 else "")(
+                    {layer_group_key(txt(x)) for x in phase["SOURCE_LAYER"]} - {""}
+                ) if (phase["SOURCE_LAYER"].apply(lambda x: layer_group_key(txt(x))) != "").sum() >= 2 else "",
                 "Z_RANGE_A_M": zra, "Z_RANGE_B_M": zrb,
                 "TRANS_RANGE_A_M": tra, "TRANS_RANGE_B_M": trb,
                 "END_A_X": float(ca[0]), "END_A_Y": float(ca[1]),
@@ -2376,17 +2418,20 @@ def build_physical_tracks(
         ])
         v = B - A
         v = v / max(np.linalg.norm(v), 1e-12)
+        lk = txt(b.get("LAYER_KEY"))
         ends[b["STRUCT_A"]].append({
             "bid": b["BUNDLE_ID"],
             "other": b["STRUCT_B"],
             "pt": np.asarray([b["END_A_X"], b["END_A_Y"]]),
             "dir": v,
+            "lkey": lk,
         })
         ends[b["STRUCT_B"]].append({
             "bid": b["BUNDLE_ID"],
             "other": b["STRUCT_A"],
             "pt": np.asarray([b["END_B_X"], b["END_B_Y"]]),
             "dir": -v,
+            "lkey": lk,
         })
 
     uf = UnionFind(max([b["BUNDLE_ID"] for b in bundles], default=0) + 1)
@@ -2401,6 +2446,8 @@ def build_physical_tracks(
                 a, b = items[i], items[j]
                 if a["other"] == b["other"]:
                     continue  # parallel bundles in same physical span
+                if a["lkey"] and b["lkey"] and a["lkey"] != b["lkey"]:
+                    continue  # different named DXF lines (voltage/tag/circuit)
 
                 ang = angle_deg(a["dir"], b["dir"])
                 if ang < 90.0:
@@ -3034,10 +3081,26 @@ LANE_PENALTY_M = 15.0      # cost of leaving the chosen outer lane in one span
 LANE_TOL_M = 0.5           # conductors within this of the extreme count as extreme
 LANE_MIN_SPREAD_M = 0.5    # below this lateral spread the bundle is a vertical stack
 LANE_NEIGHBOUR_M = 40.0    # other bundles within this radius vote for the far lane
+MIXED_CENTRAL_WEIGHT = float(os.environ.get("BAKERY_MIXED_CENTRAL_W", "1.5"))
+
+
+def _lane_mode() -> str:
+    """2D representative rule.
+
+    centre (default, R01.05 after 19/11 feedback): the central phase for every
+    arrangement, continuity breaks ties -> 2D follows the middle of the circuit.
+    outer: outermost phase on one side (20261118f-i builds).
+    legacy: R01.04 (central for horizontal, weak outer preference otherwise).
+    BAKERY_2D_LANE selects the mode; BAKERY_LANE_RULE=0 still means legacy.
+    """
+    if os.environ.get("BAKERY_LANE_RULE", "").strip().lower() in {"0", "false", "no", "off"}:
+        return "legacy"
+    m = os.environ.get("BAKERY_2D_LANE", "centre").strip().lower()
+    return {"center": "centre"}.get(m, m) if m in {"centre", "center", "outer", "legacy"} else "centre"
 
 
 def _lane_rule_enabled() -> bool:
-    return os.environ.get("BAKERY_LANE_RULE", "1").strip() not in {"0", "false", "no", "off"}
+    return _lane_mode() == "outer"
 
 
 def _bundle_mid(b):
@@ -3091,11 +3154,27 @@ def select_phase_sequence(path, bundle_lookup, supports, unit_to_m, outer_on_hor
     central phase and an outer phase. None = decide from this path alone.
     """
     by_sid=support_lookup(supports)
-    lane_rule=_lane_rule_enabled()
+    lane_mode=_lane_mode()
+    lane_rule=lane_mode=="outer"
     own=set(int(x) for x in path["BUNDLES"])
     others=[b for bid,b in bundle_lookup.items() if int(bid) not in own]
     other_mid=np.asarray([_bundle_mid(b) for b in others]) if others else np.zeros((0,2))
     vote_left=0.0  # >0: neighbours sit on the left -> use right lane
+    # R01.05: parallel bundles of the SAME circuit on one support pair (e.g. 10
+    # wires of one named line) are alternatives; continuity picks between them
+    # instead of the reference-distance choice made when the path was built.
+    by_pair=defaultdict(list)
+    earth_rows=set()
+    for _bid,_b in bundle_lookup.items():
+        by_pair[txt(_b.get("PAIR"))].append(int(_bid))
+        earth_rows.update(int(x) for x in _b.get("EARTH_WIRE_ROWS", []))
+    alts=[]
+    for bid in path["BUNDLES"]:
+        b0=bundle_lookup[bid]
+        same=[x for x in by_pair.get(txt(b0.get("PAIR")),[])
+              if x!=int(bid) and txt(bundle_lookup[x].get("CKEY"))==txt(b0.get("CKEY")) and txt(b0.get("CKEY"))
+              and bundle_lookup[x]["ARRANGEMENT"]==b0["ARRANGEMENT"]]
+        alts.append([int(bid)]+same)
     if outer_on_horizontal is None:
         outer_on_horizontal=any(bundle_is_mixed(bundle_lookup[x]) for x in path["BUNDLES"])
     outer_h=bool(lane_rule and outer_on_horizontal)
@@ -3106,10 +3185,20 @@ def select_phase_sequence(path, bundle_lookup, supports, unit_to_m, outer_on_hor
         sign=1.0 if txt(b["STRUCT_A"])==txt(s0) else -1.0
         horizontal=b["ARRANGEMENT"]=="HORIZONTAL" and not outer_h
         cand=[]
-        for c in b["CANDIDATES"]:
+        pool=[dict(cc,_BID=ab) for ab in alts[i] for cc in bundle_lookup[ab]["CANDIDATES"]]
+        # Only PHASE conductors may represent the circuit in 2D: drop any wire
+        # classified as EARTH in some bundle, if phase wires remain.
+        phase_only=[cc for cc in pool if int(cc["WIRE_ROW"]) not in earth_rows]
+        if phase_only:
+            pool=phase_only
+        for c in pool:
             coords,off0,off1=oriented_candidate(c,s0,s1,b,by_sid)
             if b["ARRANGEMENT"]=="HORIZONTAL":
                 legacy=8.0*float(c["CENTRAL_SCORE"])
+            elif lane_mode=="centre":
+                # Mixed/vertical: stay near the middle, but let continuity choose
+                # between near-central conductors so 2D does not dog-leg.
+                legacy=MIXED_CENTRAL_WEIGHT*float(c["CENTRAL_SCORE"])
             else:
                 legacy=0.35*float(c["OUTER_PENALTY"])
             soff=sign*(float(c["OFF_A_M"])+float(c["OFF_B_M"]))/2.0
@@ -3160,8 +3249,11 @@ def select_phase_sequence(path, bundle_lookup, supports, unit_to_m, outer_on_hor
         else:             lane,chosen,why="L",ch_l,"LOWER_COST"
     else:
         chosen,_=_run_phase_dp(states,"LOCAL_COST",unit_to_m)
-        lane,why=None,"LEGACY"
+        lane,why=None,("CENTRE" if lane_mode=="centre" else "LEGACY")
 
+    new_bundles=[int(states[i][ci]["_BID"]) for i,ci in enumerate(chosen)]
+    if new_bundles!=[int(x) for x in path["BUNDLES"]]:
+        path["BUNDLES"]=new_bundles
     selected=[]
     for i,ci in enumerate(chosen):
         c=dict(states[i][ci])
@@ -3169,7 +3261,7 @@ def select_phase_sequence(path, bundle_lookup, supports, unit_to_m, outer_on_hor
         if b["ARRANGEMENT"]=="HORIZONTAL" and not outer_h:
             c["LANE"]="CENTRAL"; c["LANE_OK"]=1
         elif lane is None:
-            c["LANE"]="LEGACY"; c["LANE_OK"]=1
+            c["LANE"]="CENTRAL" if lane_mode=="centre" else "LEGACY"; c["LANE_OK"]=1
         else:
             ok=bool(c["IS_L"] if lane=="L" else c["IS_R"])
             c["LANE"]="OUTER_LEFT" if lane=="L" else "OUTER_RIGHT"
@@ -4563,10 +4655,29 @@ def build_caydence_wire_attribution(
 
     parallel_index = _BundledWireIndex(wires_r, by_wire, unit_to_m, voltage_of=_voltage_of)
 
+    _refs, _labels = combined_references(client, kmz)
+    label_to_key: dict[str, str] = {}
+    for key in _refs:
+        for lab in (txt(client.get(key, {}).get("line_no")), txt(_labels.get(key, key)), txt(key)):
+            if lab and lab not in label_to_key:
+                label_to_key[lab] = key
+    known_labels = set(label_to_key)
+
     result: dict[int, dict[str, Any]] = {}
     for wi, r in wires_r.iterrows():
         candidates = by_wire.get(int(wi), [])
-        if candidates:
+        layer_hint = layer_circuit_hint(txt(r.get("SOURCE_LAYER")), known_labels)
+        if layer_hint:
+            # The operator named the circuit on the MicroStation level: use it.
+            ckey = label_to_key[layer_hint]
+            circuit = txt(client.get(ckey, {}).get("line_no") or _labels.get(ckey, ckey))
+            types = Counter(txt(c["WIRE_TYPE"]) for c in candidates)
+            role = types.most_common(1)[0][0] if types else ""
+            attr_dist = None
+            method = "LAYER_CIRCUIT"
+            voltage = ""
+            company = ""
+        elif candidates:
             # Prefer the circuit seen most often for this source entity; distance
             # is the tie-break. This is stable where one source wire participates
             # in multiple adjacent span bundles.
@@ -4631,7 +4742,7 @@ def build_caydence_wire_attribution(
                 voltage = ""
                 company = ""
 
-        if candidates:
+        if candidates and not layer_hint:
             voltage = ""
             company = ""
 
@@ -8109,7 +8220,8 @@ def build_final_products(
                     "ARRANGEMENT": b["ARRANGEMENT"],
                     "ATTR_CONF": txt(b.get("CONF")),
                     "SELECT_METHOD": (
-                        "HORIZONTAL_CENTRAL" if sel.get("LANE") == "CENTRAL"
+                        ("HORIZONTAL_CENTRAL" if b["ARRANGEMENT"] == "HORIZONTAL" else "MIXED_CENTRAL")
+                        if sel.get("LANE") == "CENTRAL"
                         else ("VERTICAL_CONTINUITY" if sel.get("LANE") == "LEGACY"
                               else "OUTER_LANE")
                     ),

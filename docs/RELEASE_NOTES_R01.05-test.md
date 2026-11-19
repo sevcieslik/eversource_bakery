@@ -162,7 +162,7 @@ If a circuit has any non-horizontal span with laterally spread phases, all of it
 - C12: joins > 3 m went from 72 (rule N) to 0. The maximum join went from 10.3 m to 2.1 m.
 - C39: joins > 3 m went from 38 to 12. The remaining ones are same-side joins at multi-pole structures.
 
-**SCHF/SCSH on outer-lane circuits.** These structures are no longer moved to the middle phase. They stay on the circuit's 2D wire (Structure-on-Wire). `01_structure_middle_phase_qa.csv` gives `STATUS = UNCHANGED`, `REASON = OUTER_LANE_CIRCUIT`. In practice most circuits have at least one mixed span, so the R01.04 middle-phase rule now applies only to circuits that are horizontal end to end (C12: 152 moved, 823 kept on the outer wire). **Decision (18/11/2026): SCHF/SCSH on outer-lane circuits stay on the 2D wire.** The middle-phase rule applies only to circuits that are horizontal end to end.
+**SCHF/SCSH on outer-lane circuits.** These structures are no longer moved to the middle phase. They stay on the circuit's 2D wire (Structure-on-Wire). `01_structure_middle_phase_qa.csv` gives `STATUS = UNCHANGED`, `REASON = OUTER_LANE_CIRCUIT`. In practice most circuits have at least one mixed span, so the R01.04 middle-phase rule now applies only to circuits that are horizontal end to end (C12: 152 moved, 823 kept on the outer wire). **Decision (18/11/2026): SCHF/SCSH on outer-lane circuits stay on the 2D wire.** (Superseded 19/11 by S: the 2D wire is central again, and SCHF goes to the middle phase.) The middle-phase rule applies only to circuits that are horizontal end to end.
 
 ## P. Caydence RoW Structures: one record per physical structure
 A support that carries several circuits produced one Caydence record per circuit. Now only one record is kept per RoW, the one with the fullest attribution: the most filled source attributes, then a real (non-dummy) source match, then the smallest source distance.
@@ -218,3 +218,37 @@ Layer naming recommendation for operators:
 - Best of all, put the circuit name in the layer, e.g. `Mainline_391_345kV`.
 
 Crossings between circuits of **different** voltages are usually real. Only same-voltage crossings point to attribution problems: C12 12, C39 2, C17 0, C55 0.
+
+## S. 2D back to the centre of the circuit (19/11 feedback item 16)
+The outer-lane rule (N, O) is no longer the default. The 2D wire is again the **central phase**, for every arrangement.
+- Horizontal: strong preference for the central phase, as in R01.04.
+- Vertical or mixed: preference for the conductor nearest the bundle centre, with continuity deciding between near-central conductors.
+- SCHF/SCSH structures go to the middle phase again, consistent with the 2D wire, so the "stay on the outer wire" decision under O no longer applies.
+- `BAKERY_2D_LANE=outer` restores the 20261118f–i behaviour. `BAKERY_2D_LANE=legacy` (or `BAKERY_LANE_RULE=0`) restores R01.04.
+- C17 circuit 391, structures 8–10: with the outer rule, spans 8–9 and 9–10 ran on the outermost conductor, which on 9–10 was an earth wire, with 3.6–3.8 m dog legs at 8 and 10. Now it is the central phase with 0.0 m joins.
+
+## T. Earth wires never represent the circuit in 2D
+Any wire classified as EARTH in any bundle is removed from the 2D candidates when phase wires remain.
+
+## U. Duplicate conductors in the DXF
+Identical copies of one conductor (both 3D ends within 0.3 m) used to be sliced into different "phases". The result was a central phase offset by one phase spacing (C39 364 at ST00151–ST00153: 7.9 m dog leg).
+- Copies are collapsed for 2D analysis.
+- In Caydence they keep the same circuit and type as the kept wire.
+- Copies found: C39 13, C12 4.
+
+## V. Parallel bundles of the same circuit on one support pair
+When one support pair holds more than one bundle of the same circuit, continuity now chooses between them, rather than distance to the SoW centreline.
+
+## W. Circuit-named levels (MicroStation), end to end (item 17)
+With levels like `Mainline_1250_115kV`:
+- **Bundling** groups wires per named level. Wires on unnamed levels (e.g. `0`, up to 20%) join the nearest named group.
+- **Physical tracks** are never joined across different named levels.
+- **Track → circuit** uses the level circuit (`LAYER_RULE = LAYER_CIRCUIT`).
+- **Caydence wires** take the level circuit directly (`ATTR_METHOD = LAYER_CIRCUIT`).
+
+Synthetic C39 test (all wires renamed to their circuit, 3% left on level `0`):
+- 2731/2731 named wires got the level circuit in Caydence.
+- 1 of 606 2D spans runs on another circuit's level.
+- 15/15 tracks were attributed by level.
+
+Joins over 3 m that remain (C39: 14) are mostly at horizontal ↔ vertical configuration changes, where the middle of the circuit really moves on the structure.
