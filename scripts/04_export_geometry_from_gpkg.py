@@ -12,7 +12,7 @@ Workflow
   3. Run this script (or "Export from edited GPKG" in the GUI / launcher).
 
 Only deliverables/<RoW>/Circuit and deliverables/<RoW>/Caydence are rebuilt.
-The previous Circuit/Caydence folders are copied to QA first.
+The previous product folders (45/80 circuits, 267 RoWs) are copied to QA first.
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def main() -> int:
     p.add_argument("--list-rows", action="store_true",
                    help="Print the stored and found RoWs and exit.")
     p.add_argument("--no-backup", action="store_true",
-                   help="Do not copy the current Circuit/Caydence folders to QA first.")
+                   help="Do not copy the current 45/80/267 product folders to QA first.")
     # Accepted for launcher compatibility; not used.
     p.add_argument("--input-dir", default=None)
     p.add_argument("--source-dir", default=None)

@@ -71,11 +71,13 @@ with tempfile.TemporaryDirectory() as td:
     write_export_settings(gpkg, year=2026, selected_rows={"R1", "R2"}, unit_to_m=U2M, epsg=CRS)
     inv, checks = export_geometry_from_gpkg(gpkg, td / "deliverables")
     d = td / "deliverables"
-    assert (d / "R1/Circuit/X1/X1_Wires_2026.shp").is_file()
-    assert (d / "R2/Circuit/X1/X1_Wires_2026.shp").is_file()
-    assert len(gpd.read_file(d / "R1/Caydence/R1_3D_Wires_2026.shp")) == 2
-    assert not (d / "R2/Caydence/R2_3D_Wires_2026.shp").exists()
-    w1 = gpd.read_file(d / "R1/Circuit/X1/X1_Wires_2026.shp").geometry.iloc[0]
+    # 20/11 product layout: circuit products per circuit, area products per RoW.
+    wx = gpd.read_file(d / "80_powerline_vectors/X1/X1_Wires_2026.shp")
+    assert sorted(wx.ROW) == ["R1", "R2"], wx.ROW.tolist()   # one feature per RoW part
+    assert (d / "45_structure_shapefile/X1/X1_Structure_2026.shp").is_file()
+    assert len(gpd.read_file(d / "267_caydence_conductors/R1/R1_3D_Wires_2026.shp")) == 2
+    assert not (d / "267_caydence_conductors/R2/R2_3D_Wires_2026.shp").exists()
+    w1 = wx[wx.ROW == "R1"].geometry.iloc[0]
     assert abs(w1.length - 500) <= 0.5 / U2M + 0.01, w1.length  # ends at Structure B (0.5 m clip tolerance)
     assert "SPAN_END_WITHOUT_STRUCTURE_IN_ROW" in set(checks["CHECK"]), "deleted Structure 3 is flagged"
 

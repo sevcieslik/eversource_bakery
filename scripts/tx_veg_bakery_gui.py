@@ -1037,7 +1037,7 @@ class BakeryGUI(tk.Tk):
 
 
     def _start_gpkg_export(self):
-        """R01.05: rebuild Circuit/Caydence deliverables from the edited QA GPKG."""
+        """R01.05: rebuild 45/80 (circuit) and 267 (Caydence) deliverables from the edited QA GPKG."""
         if self.worker_thread and self.worker_thread.is_alive():
             return
         out_txt = self.output_var.get().strip()
@@ -1118,7 +1118,7 @@ class BakeryGUI(tk.Tk):
         frm.pack(fill="both", expand=True)
         ttk.Label(
             frm,
-            text=("Rebuild Circuit and Caydence deliverables for the RoWs ticked below.\n"
+            text=("Rebuild 45_structure_shapefile, 80_powerline_vectors and 267_caydence_conductors for the RoWs ticked below.\n"
                   "Save and close the GPKG in QGIS first. Current folders are copied to QA.\n"
                   "Tile Index, Management Units and LAS are not touched."),
             style="Side.TLabel", justify="left",
@@ -1895,7 +1895,7 @@ class BakeryGUI(tk.Tk):
                         "PREHEATING": "Checking source data, AOIs and LiDAR coverage",
                         "MIXING": "Building geometry and Caydence products (LiDAR sampling shows a progress bar)",
                         "BAKING / ICING / PACKING": "Building selected point-cloud products",
-                        "RE-PACKING": "Rebuilding Circuit/Caydence from the edited GPKG",
+                        "RE-PACKING": "Rebuilding 45/80/267 products from the edited GPKG",
                     }.get(st, "Processing")
                     self._set_stage(st, detail)
                 elif kind == "progress":

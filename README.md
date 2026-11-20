@@ -50,11 +50,31 @@ Use **Operator Manual** at the bottom of the left GUI panel to open `docs/operat
 
 **One output folder per cluster.** The tool does not clear old results. RoW folders from a previous cluster stay in the output folder and can be delivered by mistake. If two clusters share a RoW, the second run overwrites the first one's deliverables for that RoW.
 
+## Deliverables layout
+
+Deliverables are organised by client output product, so that after QA each product folder can be copied straight into the output products:
+
+```
+deliverables/
+  29_tile_index/<RoW>/<RoW>_Tile_Index_2026.shp                  area
+  45_structure_shapefile/<Circuit>/<Circuit>_Structure_2026.shp  circuit
+  68_standalone_gis/<RoW>/<RoW>_Management_Unit_2026.shp         area
+  80_powerline_vectors/<Circuit>/<Circuit>_Wires_2026.shp        circuit
+  267_caydence_conductors/<RoW>/<RoW>_3D_Wires_2026.shp          area
+  267_caydence_conductors/<RoW>/<RoW>_3D_Structures_2026.shp     area
+```
+
+- **Circuits in two RoWs.** A circuit that runs through two RoWs has one file, with one 2D feature per RoW (field `ROW`). A structure on the RoW boundary appears once, with `ROW = CT_06;CT_16`.
+- **Shared supports in 267.** Caydence keeps one structure per physical support, and its `CIRCUIT` lists every circuit on it, e.g. `1500;1605`.
+- **Copying several clusters.** A circuit that continues into another cluster gets a file from each cluster's run. Merge them, don't overwrite.
+- **LiDAR and PLS** stay under `deliverables/<RoW>/LiDAR` and `PLS`.
+- `BAKERY_DELIVERY_LAYOUT=row` restores the R01.04 tree (`<RoW>/Circuit/<Circuit>`, `<RoW>/Caydence`, ...).
+
 ## Fixing results in the QA GeoPackage
 
 1. Edit `output/01_geometry/01_eversource_geometry.gpkg` in QGIS: spans, structures, Caydence wires and their `CIRCUIT`/`ROW`.
 2. Press **Re-export from GPKG** in the GUI, choose the RoWs to write and confirm. Geometry is not run again, and the previous deliverables are backed up.
-3. Features in other RoWs are skipped and reported as `ROW_NOT_EXPORTED`.
+3. Features in other RoWs are skipped and reported as `ROW_NOT_EXPORTED`. The 45 and 80 folders of the affected circuits and the 267 folders of the chosen RoWs are rebuilt.
 
 Command line equivalent:
 
@@ -81,13 +101,13 @@ Wires on an unnamed level (e.g. `0`) are tolerated as a small minority.
 - **Duplicate conductors.** Identical copies of one conductor in the DXF are ignored for 2D. In Caydence they follow the kept wire.
 - **Parallel lines.** Distinct nearby circuit POAs are not merged on distance alone. POAs of parallel lines are split into separate structures (`01_support_split_qa.csv`).
 - **RoW boundaries.** RoW boundaries fall on structures. A structure at the start or end of two RoWs is written to both RoW deliverables. This is intended, so don't delete these duplicates (`01_row_boundary_qa.csv`).
-- **Caydence Structures.** One record per circuit, including on a support shared by several circuits, as in R01.04. Only duplicate records of the same circuit at the same support are removed (`01_caydence_structure_dedupe_qa.csv`).
+- **Caydence Structures (267).** One record per physical support; on a support shared by several circuits, `CIRCUIT` lists them all, e.g. `1500;1605` (`01_caydence_structure_dedupe_qa.csv`). The circuit product 45 keeps one structure per circuit.
 - **Caydence wires.** They are published in the RoW of their circuit. A wire is never attributed to a circuit of a different voltage than its DXF level.
 - **SCHF/SCSH.** These are positioned on the middle phase, as in R01.04.
 - **POA structures.** Observed POA structures remain even without matching source data; such records use NULL source-mapped fields.
 - **Shared structures.** For confirmed shared structures, circuit Structures are created at a shared physical location.
 - **DCWP.** Use the confirmed middle member; source XY may serve as a candidate fallback requiring review.
-- **Taps.** Taps (branches leaving the line part-way, e.g. into a substation) are added to the circuit 2D from the observed 3D wires (`01_tap_2d_recovery.csv`). A lone wire, or one running alongside the line, is not used. These are listed as `REJECTED_*` for review.
+- **Taps.** Taps (branches leaving the line part-way, e.g. into a substation) are added to the circuit 2D from the observed 3D wires (`01_tap_2d_recovery.csv`). A tap may start up to 30 m from its circuit's 2D (`CONNECT_M` in QA). A lone wire, or one running alongside the line, is not used. These are listed as `REJECTED_*` for review.
 - **Substations.** 3D conductors extending into substations, including sharp turns into a bay, can form terminal 2D without an end POA or a made-up structure. A substation boundary does not justify deleting a real POA or source structure.
 
 ## QA and support
@@ -137,7 +157,7 @@ Full details, measurements and per-cluster results: [`docs/RELEASE_NOTES_R01.05-
 - **2D wire.** Back to the central phase; EARTH wires are excluded; duplicate DXF conductors are collapsed; when one circuit has several bundles on the same structure pair, continuity picks between them.
 - **Structures.** Parallel-line POAs are split into separate structures. A single pending POA between two matched structures takes the nearest source structure.
 - **Terminal spans.** Spans turning sharply into substations are recovered.
-- **RoW handling.** RoW boundaries are set at structures. 2D, Circuit and Caydence products are written per RoW. Caydence keeps one structure record per circuit; taps are recovered in 2D from 3D.
+- **RoW handling.** RoW boundaries are set at structures. 2D, Circuit and Caydence products are written per RoW. Deliverables are organised by product (29/45/68/80/267). Caydence keeps one structure per physical support, with all circuits in `CIRCUIT`. Taps are recovered in 2D from 3D.
 - **Caydence wires.** Wires use the RoW of their circuit. Pieces split at crossings are attributed to the line they run alongside.
 - **DXF level names.** Voltage, line tag and circuit name are read from the level name and used in bundling, tracks, circuit attribution and Caydence.
 - **Re-export.** Deliverables can be rebuilt from the edited QA GeoPackage (GUI button or `04_export_geometry_from_gpkg.py`), with RoW selection.

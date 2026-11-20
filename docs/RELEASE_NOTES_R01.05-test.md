@@ -285,3 +285,30 @@ Recovered taps:
 | C55 | 399 | 69 m |
 
 Lone or alongside wires were rejected and listed for review.
+
+## AA. Deliverables organised by output product (20/11)
+The folder layout follows the client output products (Neil):
+
+```
+deliverables/
+  29_tile_index/<RoW>/            area
+  45_structure_shapefile/<Circuit>/  circuit
+  68_standalone_gis/<RoW>/        area (Management Units)
+  80_powerline_vectors/<Circuit>/    circuit
+  267_caydence_conductors/<RoW>/  area (3D Wires + 3D Structures)
+```
+
+File names are unchanged.
+- **Circuits in two RoWs.** A circuit in two RoWs has one 80 file, with one feature per RoW part, and one 45 file. A boundary structure appears once, with `ROW = R1;R2`.
+- **Re-export and backup.** These now cover the 45/80 folders of the affected circuits and the 267 folders of the chosen RoWs.
+- **LiDAR and PLS** stay under `<RoW>/`.
+- `BAKERY_DELIVERY_LAYOUT=row` restores the R01.04 tree.
+
+## AB. Caydence Structures: one per support, all circuits in CIRCUIT (20/11)
+This supersedes Y. Product 267 is an area product, so it keeps one record per physical support. Its `CIRCUIT` lists every circuit on the support, kept record first.
+- C39 CT_06: 72 × `1500;1605` and 13 × `1500;1617`.
+- `BAKERY_CAYD_DEDUPE=circuit` gives one record per circuit instead.
+
+## AC. Tap recovery fixes (20/11)
+- **Bug in 20261120a.** On a multi-part circuit 2D, the tap start point was taken from the wrong part. On C39 371 this added a 5 km straight connector. The start point is now the nearest point of the circuit 2D.
+- **Tap start distance.** A tap may now start up to 30 m from its own circuit's 2D, for example a tap leaving from a pole beside a parallel circuit. The connector length is `CONNECT_M` in `01_tap_2d_recovery.csv`. C39 1235 into the substation is now recovered: 81 m, connector 20 m.

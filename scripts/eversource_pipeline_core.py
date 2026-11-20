@@ -107,7 +107,7 @@ from pyproj import CRS, Transformer
 from scipy.spatial import cKDTree, Delaunay, QhullError
 import shapely
 from shapely.geometry import LineString, MultiLineString, Point, box
-from shapely.ops import linemerge, transform, unary_union
+from shapely.ops import linemerge, nearest_points, transform, unary_union
 
 try:
     import laspy
@@ -5128,9 +5128,9 @@ _CAYD_ATTR_SKIP = {
 def dedupe_caydence_structures(out: gpd.GeoDataFrame, same_xy_m: float | None = None) -> gpd.GeoDataFrame:
     """R01.05: no duplicate Caydence records within a RoW.
 
-    Default (20/11): one record per circuit and support; duplicates of the
-    SAME circuit at the same support are collapsed. With
-    BAKERY_CAYD_DEDUPE=support: one record per physical structure (18/11 rule).
+    Default (20/11, final): one record per physical structure; its CIRCUIT
+    lists every circuit on the support, kept record first ("1500;1605").
+    BAKERY_CAYD_DEDUPE=circuit: one record per circuit instead.
 
     A support carrying several circuits produces one circuit Structure per
     circuit. Caydence RoW Structures keep only the record with the fullest
@@ -5166,10 +5166,9 @@ def dedupe_caydence_structures(out: gpd.GeoDataFrame, same_xy_m: float | None = 
         if ra != rb:
             parent[rb] = ra
 
-    # 20/11: one Caydence record PER CIRCUIT (team feedback, C39 1500/1605):
-    # only records of the same circuit at the same support are collapsed.
-    # BAKERY_CAYD_DEDUPE=support restores one record per physical structure.
-    per_support = os.environ.get("BAKERY_CAYD_DEDUPE", "circuit").strip().lower() == "support"
+    # 20/11: one record per physical support, CIRCUIT = all circuits joined
+    # with ";" (team decision). BAKERY_CAYD_DEDUPE=circuit: one per circuit.
+    per_support = os.environ.get("BAKERY_CAYD_DEDUPE", "support").strip().lower() != "circuit"
     rowv = out["ROW"].astype(str) if per_support else (
         out["ROW"].astype(str) + "|" + out["CIRCUIT"].astype(str))
     for row in sorted(set(rowv)):
@@ -5238,6 +5237,18 @@ def dedupe_caydence_structures(out: gpd.GeoDataFrame, same_xy_m: float | None = 
                 "DROPPED_FILLED": -sc[0],
             })
     res = out.drop(index=drop)
+    if per_support:
+        # 20/11: the kept record lists every circuit on the support, e.g. "1500;1605".
+        for idx in dup_groups:
+            keep_i = [i for i in idx if i in res.index]
+            if not keep_i:
+                continue
+            circs = []
+            for i in [keep_i[0]] + [i for i in idx if i != keep_i[0]]:
+                for c in txt(out.at[i, "CIRCUIT"]).split(";"):
+                    if c and c not in circs:
+                        circs.append(c)
+            res.at[keep_i[0], "CIRCUIT"] = ";".join(circs)
     res.attrs["dedupe_qa"] = pd.DataFrame(qa)
     return res
 
@@ -8954,11 +8965,13 @@ def export_geometry_from_gpkg(gpkg, deliverables, year=None, backup_dir=None, ro
 
     if backup_dir is not None:
         backup_dir = Path(backup_dir)
-        for row in sorted(rows):
-            for sub in ("Circuit", "Caydence"):
-                src = deliverables / safe_filename(row) / sub
-                if src.exists():
-                    shutil.copytree(src, backup_dir / safe_filename(row) / sub, dirs_exist_ok=True)
+        _circ = set()
+        for _df in (final_wires, structures):
+            if _df is not None and not _df.empty:
+                _circ |= {txt(c) for c in _df["CIRCUIT"] if txt(c)}
+        for src in geometry_delivery_dirs(deliverables, rows, _circ):
+            if src.exists():
+                shutil.copytree(src, backup_dir / src.relative_to(deliverables), dirs_exist_ok=True)
 
     cayd_structures = build_caydence_structures_by_row(structures, rows)
     inv = write_geometry_delivery_products(
@@ -9015,6 +9028,79 @@ def check_gpkg_export_consistency(spans, structures, cayd_w, kmz_meta, unit_to_m
     return pd.DataFrame(out, columns=["CHECK", "ROW", "CIRCUIT", "ID", "N"])
 
 
+# 20/11: deliverables are organised by client output product (Neil, NMIP26068):
+#   29_tile_index/<RoW>/            area
+#   45_structure_shapefile/<Circuit>/  circuit
+#   68_standalone_gis/<RoW>/        area (Management Units)
+#   80_powerline_vectors/<Circuit>/    circuit
+#   267_caydence_conductors/<RoW>/  area (Caydence 3D wires + structures)
+# so that after QA the folders can be copied straight into the output products.
+# BAKERY_DELIVERY_LAYOUT=row restores the R01.04 <RoW>/Circuit|Caydence|... tree.
+DELIVERY_PRODUCT_DIRS = {
+    "tile_index": "29_tile_index",
+    "structures": "45_structure_shapefile",
+    "management_units": "68_standalone_gis",
+    "wires": "80_powerline_vectors",
+    "caydence": "267_caydence_conductors",
+}
+_LEGACY_ROW_DIRS = {
+    "tile_index": "Tile_Index",
+    "management_units": "Management_Units",
+    "caydence": "Caydence",
+}
+
+
+def delivery_layout() -> str:
+    v = os.environ.get("BAKERY_DELIVERY_LAYOUT", "product").strip().lower()
+    return "row" if v in {"row", "legacy", "r01.04"} else "product"
+
+
+def delivery_dir(deliverables, product, row="", circuit=""):
+    """Folder of one deliverable product for a RoW (area) or a circuit."""
+    deliverables = Path(deliverables)
+    if delivery_layout() == "row":
+        if product in ("wires", "structures"):
+            return deliverables / safe_filename(row) / "Circuit" / safe_filename(circuit)
+        return deliverables / safe_filename(row) / _LEGACY_ROW_DIRS[product]
+    if product in ("wires", "structures"):
+        return deliverables / DELIVERY_PRODUCT_DIRS[product] / safe_filename(circuit)
+    return deliverables / DELIVERY_PRODUCT_DIRS[product] / safe_filename(row)
+
+
+def geometry_delivery_dirs(deliverables, rows, circuits):
+    """Folders refreshed by a Geometry run / GPKG re-export."""
+    out = []
+    if delivery_layout() == "row":
+        for r in rows:
+            out += [Path(deliverables) / safe_filename(r) / "Circuit",
+                    Path(deliverables) / safe_filename(r) / "Caydence"]
+        return out
+    for c in circuits:
+        out += [delivery_dir(deliverables, "wires", circuit=c),
+                delivery_dir(deliverables, "structures", circuit=c)]
+    for r in rows:
+        out.append(delivery_dir(deliverables, "caydence", row=r))
+    return out
+
+
+def _merge_row_duplicate_structures(sg):
+    """One circuit Structure listed in two RoWs (RoW boundary) -> one record."""
+    if sg is None or sg.empty or "TOPO_ID" not in sg.columns:
+        return sg
+    keep, rows_of = [], {}
+    for i, r in sg.iterrows():
+        k = (txt(r.get("TOPO_ID")), round(float(r.geometry.x), 2), round(float(r.geometry.y), 2))
+        if k in rows_of:
+            rows_of[k][1].append(txt(r.get("ROW")))
+        else:
+            rows_of[k] = (i, [txt(r.get("ROW"))])
+            keep.append(i)
+    out = sg.loc[keep].copy()
+    for k, (i, rl) in rows_of.items():
+        out.at[i, "ROW"] = ";".join(sorted({x for x in rl if x}))
+    return out
+
+
 def write_geometry_delivery_products(
     final_wires: gpd.GeoDataFrame,
     structures_final: gpd.GeoDataFrame,
@@ -9053,14 +9139,14 @@ def write_geometry_delivery_products(
         }
 
     # Refresh only geometry product families.
-    for row in effective_rows:
-        row_root = deliverables / safe_filename(row)
-        croot = row_root / "Circuit"
-        cayroot = row_root / "Caydence"
-        if croot.exists():
-            shutil.rmtree(croot)
-        if cayroot.exists():
-            shutil.rmtree(cayroot)
+    _circuits = set()
+    if final_wires is not None and not final_wires.empty:
+        _circuits |= {txt(c) for c in final_wires["CIRCUIT"] if txt(c)}
+    if structures_final is not None and not structures_final.empty:
+        _circuits |= {txt(c) for c in structures_final["CIRCUIT"] if txt(c)}
+    for d in geometry_delivery_dirs(deliverables, effective_rows, _circuits):
+        if d.exists():
+            shutil.rmtree(d)
 
     # --------------------------------------------------------------
     # Formal circuit products.
@@ -9102,13 +9188,32 @@ def write_geometry_delivery_products(
         if not parents:
             continue
 
+        if delivery_layout() == "product":
+            # One file per circuit (circuit products 45 / 80): one 2D feature per
+            # RoW part, structures of all selected RoWs (boundary duplicates merged).
+            recs = []
+            for row in sorted(wire_parts):
+                rec = wr.to_dict()
+                rec["ROW"] = row
+                rec["geometry"] = wire_parts[row]
+                recs.append(rec)
+            if recs:
+                wg = gpd.GeoDataFrame(recs, geometry="geometry", crs=final_wires.crs)
+                wout = delivery_dir(deliverables, "wires", circuit=circuit) / f"{safe_filename(circuit)}_Wires_{year}.shp"
+                _write_clean_shapefile(wg, wout, ["ROW", "CIRCUIT", "VOLTAGE", "geometry"])
+                inv.append({"PRODUCT": "Wires", "ROW": ";".join(sorted(wire_parts)), "CIRCUIT": circuit,
+                            "DELIVERY_FILE": wout.name, "STATUS": "WRITTEN"})
+            srows = sg[sg["ROW"].astype(str).isin(parents)].copy() if sg is not None and not sg.empty else sg
+            srows = _merge_row_duplicate_structures(srows)
+            if srows is not None and not srows.empty:
+                sout = delivery_dir(deliverables, "structures", circuit=circuit) / f"{safe_filename(circuit)}_Structure_{year}.shp"
+                _write_clean_shapefile(srows, sout, structure_delivery_columns(srows, structure_source_fields))
+                inv.append({"PRODUCT": "Structures", "ROW": ";".join(sorted(parents)), "CIRCUIT": circuit,
+                            "DELIVERY_FILE": sout.name, "STATUS": "WRITTEN"})
+            continue
+
         for row in sorted(parents):
-            cdir = (
-                deliverables
-                / safe_filename(row)
-                / "Circuit"
-                / safe_filename(circuit)
-            )
+            cdir = delivery_dir(deliverables, "wires", row=row, circuit=circuit)
 
             if row in wire_parts:
                 rec = wr.to_dict()
@@ -9159,7 +9264,7 @@ def write_geometry_delivery_products(
     # Caydence RoW products - no circuit filtering.
     # --------------------------------------------------------------
     for row in sorted(effective_rows):
-        caydir = deliverables / safe_filename(row) / "Caydence"
+        caydir = delivery_dir(deliverables, "caydence", row=row)
 
         if cayd_w is not None and not cayd_w.empty:
             cw = cayd_w[cayd_w["ROW"].astype(str) == row].copy()
@@ -9338,6 +9443,7 @@ def recover_tap_2d_from_3d(
     join_m: float = 15.0,
     min_tap_wires: int = 2,
     min_reach_m: float = 25.0,
+    connect_max_m: float = 30.0,
 ) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
     """R01.05: add 2D for taps (branches, e.g. into a substation) seen in 3D.
 
@@ -9347,9 +9453,12 @@ def recover_tap_2d_from_3d(
     (wires sharing both ends within join_m). Each span is represented by its
     central conductor (highest wire dropped when 4+, as a likely earth). Spans
     are chained outward from the circuit 2D; only chains that start at the 2D
-    are added, as an extra part of the circuit geometry. QA: 01_tap_2d_recovery.csv.
+    are added, as an extra part of the circuit geometry. A tap may start up to
+    connect_max_m from the circuit 2D (e.g. a tap leaving from a pole next to a
+    parallel circuit); the straight connector length is CONNECT_M in QA.
+    QA: 01_tap_2d_recovery.csv.
     """
-    cols = ["CIRCUIT", "ROW", "TAP", "SPAN", "WIRE_ID", "N_WIRES", "ACTION", "LENGTH_M"]
+    cols = ["CIRCUIT", "ROW", "TAP", "SPAN", "WIRE_ID", "N_WIRES", "ACTION", "LENGTH_M", "CONNECT_M"]
     if formal_2d is None or formal_2d.empty or source_3d is None or source_3d.empty:
         return formal_2d, pd.DataFrame(columns=cols)
     out = formal_2d.copy()
@@ -9418,10 +9527,13 @@ def recover_tap_2d_from_3d(
                 continue
             d_ends = [float(base.distance(Point(*e))) for e in sp["ends"]]
             k = int(np.argmin(d_ends))
-            if d_ends[k] > jn:
+            if d_ends[k] > connect_max_m / unit_to_m:
                 continue
             tap_no += 1
-            start_pt = base.interpolate(base.project(Point(*sp["ends"][k])))
+            # nearest point of the circuit 2D (interpolate/project is unreliable
+            # on a multi-part 2D and produced a 5 km connector on C39 371)
+            start_pt = nearest_points(base, Point(*sp["ends"][k]))[0]
+            connect_m = float(d_ends[k]) * unit_to_m
             coords = [(start_pt.x, start_pt.y)]
             cur, cur_k = si, k
             seq = []
@@ -9473,7 +9585,8 @@ def recover_tap_2d_from_3d(
                 qa.append({"CIRCUIT": circ, "ROW": txt(out.at[ridx, "ROW"]) if "ROW" in out.columns else "",
                            "TAP": tap_no, "SPAN": n_span, "WIRE_ID": spans[s_i]["rep"]["WIRE_ID"],
                            "N_WIRES": spans[s_i]["n"], "ACTION": "RECOVERED_3D_TAP",
-                           "LENGTH_M": round(float(spans[s_i]["rep"]["g"].length) * unit_to_m, 1)})
+                           "LENGTH_M": round(float(spans[s_i]["rep"]["g"].length) * unit_to_m, 1),
+                           "CONNECT_M": round(connect_m, 1) if n_span == 1 else 0.0})
         for si, sp in enumerate(spans):
             if si not in used:
                 qa.append({"CIRCUIT": circ, "ROW": "", "TAP": 0, "SPAN": 0, "WIRE_ID": sp["rep"]["WIRE_ID"],
@@ -12095,7 +12208,7 @@ def run_points_stage(
             for row in selected_rows:
                 tg=tile_index[tile_index['ROW']==row].copy()
                 if tg.empty: continue
-                out=deliverables/safe_filename(row)/'Tile_Index'/f"{safe_filename(row)}_Tile_Index_{year}.shp"
+                out=delivery_dir(deliverables,'tile_index',row=row)/f"{safe_filename(row)}_Tile_Index_{year}.shp"
                 _write_clean_shapefile(tg,out,['ROW','TILE_NAME','CAP_YEAR','geometry'])
                 inventory.append({'PRODUCT':'Tile Index','ROW':row,'DELIVERY_FILE':out.name,'STATUS':'WRITTEN'})
 
@@ -12103,7 +12216,7 @@ def run_points_stage(
             for row in selected_rows:
                 mg=management_units[management_units['ROW']==row].copy()
                 if mg.empty: continue
-                out=deliverables/safe_filename(row)/'Management_Units'/f"{safe_filename(row)}_Management_Unit_{year}.shp"
+                out=delivery_dir(deliverables,'management_units',row=row)/f"{safe_filename(row)}_Management_Unit_{year}.shp"
                 internal={'MU_IDX','MU_LAYER','MU_ROW_RAW'}
                 cols=[c for c in mg.columns if c not in internal and c!='geometry']+['geometry']
                 _write_clean_shapefile(mg,out,cols)
