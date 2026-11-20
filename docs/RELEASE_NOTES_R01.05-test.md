@@ -365,3 +365,12 @@ The only new same-voltage crossing is the C12 3195 tap into its substation, whic
 After a branch overlap is trimmed, the branch now rejoins the main line at the main line's nearest **vertex**, which is the fork Structure node, when one is within 5 m. Vertices still within 3 m of the junction are dropped, so the branch leaves the node straight.
 
 Before, it joined at the nearest point on a main segment. On C39 1500 at ST00048 (6037A) this made a 1.5 m hook beside the Structure.
+
+## AG. Larger steps: span drawn diagonally onto the Structure (20/11)
+Some steps are real. On C39 371/383 between 5754 and 5756, and on C17 385 at 116–118, the circuit middle moves about 8 m sideways at the Structure: the 3-wire section between them runs on different poles, and the POAs sit on it.
+- For a step of 6–15 m, the span end that lies at the Structure (support point) is kept. The neighbouring span's end is pulled onto it, so that span runs diagonally from Structure to Structure. Before, it ran parallel and stepped beside the Structure.
+- Structures stay on the 2D.
+- New `selected_span_wires` field `DIAG_NODE = 1` marks such spans.
+- Result: joins > 1 m: C39 6 → 0, C17 2 → 0, C55 2 → 1. The remaining C55 case is the 20 m multi-pole case on 122.
+
+A full shift of such sections onto the neighbouring spans' line was tested and rejected: the internal Structures would end up 8 m off the 2D.

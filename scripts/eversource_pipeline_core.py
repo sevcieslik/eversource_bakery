@@ -3331,9 +3331,10 @@ def simplify_selected_phase_sequence(selected, tolerance_source: float):
     return out, before, after
 
 JOIN_SMOOTH_M = 6.0  # joins up to this length become one shared vertex (no dog leg)
+JOIN_BRIDGE_M = 15.0  # larger steps up to this: span made diagonal onto the Structure
 
 
-def smooth_small_joins(selected, max_units):
+def smooth_small_joins(selected, max_units, node_xy=None, max_bridge_units=None):
     """R01.05 (20/11): replace a short step between consecutive spans by one vertex.
 
     When the end of span i and the start of span i+1 differ by less than
@@ -3346,6 +3347,30 @@ def smooth_small_joins(selected, max_units):
         return selected, 0
     out = [dict(c, coords_oriented=list(c["coords_oriented"])) for c in selected]
     n = 0
+    # 20/11: a larger step (max_units < gap <= max_bridge_units) is real: the
+    # circuit middle moves sideways at that structure (e.g. C39 371/383 at
+    # 5754/5756, POAs on the 3-wire section). Keep the end that lies at the
+    # Structure (support point) and pull the other span's end onto it, so that
+    # span runs diagonally Structure-to-Structure instead of a step beside it.
+    if node_xy is not None and max_bridge_units:
+        for i in range(1, len(out)):
+            nd = node_xy[i - 1] if i - 1 < len(node_xy) else None
+            if nd is None:
+                continue
+            a = out[i - 1]["coords_oriented"][-1]
+            b = out[i]["coords_oriented"][0]
+            d = math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+            if not (max_units < d <= max_bridge_units):
+                continue
+            da = math.hypot(float(a[0]) - nd[0], float(a[1]) - nd[1])
+            db = math.hypot(float(b[0]) - nd[0], float(b[1]) - nd[1])
+            if da <= db:
+                out[i]["coords_oriented"][0] = (float(a[0]), float(a[1])) + tuple(b[2:])
+                out[i]["DIAGONAL_TO_NODE"] = 1
+            else:
+                out[i - 1]["coords_oriented"][-1] = (float(b[0]), float(b[1])) + tuple(a[2:])
+                out[i - 1]["DIAGONAL_TO_NODE"] = 1
+            n += 1
     for i in range(1, len(out)):
         a = out[i - 1]["coords_oriented"][-1]
         b = out[i]["coords_oriented"][0]
@@ -8219,7 +8244,14 @@ def build_final_products(
                 )
             )
 
-            selected, _n_smoothed = smooth_small_joins(selected, JOIN_SMOOTH_M / unit_to_m)
+            _nodes = route["NODES"]
+            _node_xy = []
+            for _sid in _nodes[1:-1]:
+                _sp = by_sid.get(txt(_sid)) if hasattr(by_sid, "get") else None
+                _node_xy.append((float(_sp.geometry.x), float(_sp.geometry.y)) if _sp is not None else None)
+            selected, _n_smoothed = smooth_small_joins(
+                selected, JOIN_SMOOTH_M / unit_to_m, node_xy=_node_xy,
+                max_bridge_units=JOIN_BRIDGE_M / unit_to_m)
 
             route_geom = concatenate_selected(selected)
             if route_geom is None:
@@ -8290,6 +8322,7 @@ def build_final_products(
                     "LANE_OK": int(sel.get("LANE_OK", 1)),
                     "LANE_WHY": txt(sel.get("LANE_WHY")),
                     "SIDE_CLASS": txt(sel.get("SIDE_CLASS")),
+                    "DIAG_NODE": int(sel.get("DIAGONAL_TO_NODE", 0)),
                     "ROW_DIST_M": row_dist,
                     "LENGTH_M": float(geom2.length) * unit_to_m,
                     "geometry": geom2,
