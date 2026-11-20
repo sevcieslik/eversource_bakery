@@ -341,3 +341,22 @@ Other clusters:
 - C17 and C55: no 2D spans on EARTH.
 
 The only new same-voltage crossing is the C12 3195 tap into its substation, which crosses O149 (review).
+
+## AE. 2D features, tap connectors and re-export consistency (20/11)
+
+**One LineString per part.** Product 80 no longer writes a MultiLineString. The main line, every tap and every RoW piece are separate LineString features with the same attributes.
+
+**No fake tap connector.** A straight connector to the circuit 2D is drawn only when the tap starts within 6 m of it. A tap that starts farther away is its own feature from its observed 3D start. Example: C39 1235, whose tap starts at the 1250 line 20 m away; before, it got a vertical stub. Taps are written to the GPKG layer `recovered_tap_2d`, which is editable and used by Re-export.
+
+**RoW pieces.**
+- Clipping slivers under 2 m are dropped.
+- Pieces whose end points meet within 0.5 m are chained, joining the straightest continuation at a node; branches stay separate.
+- Result: C39 371 is one feature in CT_06 and one in CT_16. Before, it had 8 pieces of 0.7–64 m.
+
+**Fork clean-up.** The longest part is treated as the main line before branch overlaps are trimmed. The same trimming and joining now also runs in Re-export.
+
+**Re-export.** Spans in RoWs that are not exported still claim their piece of the 2D when it is split by RoW. Before, the C39 310 end span in CT_17 was attached to CT_16 on Re-export only.
+- An unedited Re-export now gives the same 2D as the run on C12, C17, C39 and C55: same lengths, no pieces under 5 m.
+- Only the split at a fork (which branch continues the main line) can differ.
+
+**C39 310 end.** The last span lies in Management Unit CT-17-1, so it belongs to CT_17 and is delivered with that RoW, not with CT_16. This is by design.

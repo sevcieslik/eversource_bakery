@@ -64,7 +64,9 @@ deliverables/
   267_caydence_conductors/<RoW>/<RoW>_3D_Structures_2026.shp     area
 ```
 
-- **Circuits in two RoWs.** A circuit that runs through two RoWs has one file, with one 2D feature per RoW (field `ROW`). A structure on the RoW boundary appears once, with `ROW = CT_06;CT_16`.
+- **One LineString per part.** In product 80, every part of a circuit is its own LineString feature with the same attributes: the main line, each tap and each RoW piece. There are no MultiLineStrings.
+- **Circuits in two RoWs.** A circuit that runs through two RoWs has one file, with its features carrying field `ROW`. A structure on the RoW boundary appears once, with `ROW = CT_06;CT_16`.
+- **Spans in a RoW outside the cluster.** A span that lies in a Management Unit of a RoW not processed in this cluster is delivered with that RoW. Example: C39 310, whose last span is in CT-17-1.
 - **Shared supports in 267.** Caydence keeps one structure per physical support, and its `CIRCUIT` lists every circuit on it, e.g. `1500;1605`.
 - **Copying several clusters.** A circuit that continues into another cluster gets a file from each cluster's run. Merge them, don't overwrite.
 - **LiDAR and PLS** stay under `deliverables/<RoW>/LiDAR` and `PLS`.
@@ -108,7 +110,7 @@ Wires on an unnamed level (e.g. `0`) are tolerated as a small minority.
 - **POA structures.** Observed POA structures remain even without matching source data; such records use NULL source-mapped fields.
 - **Shared structures.** For confirmed shared structures, circuit Structures are created at a shared physical location.
 - **DCWP.** Use the confirmed middle member; source XY may serve as a candidate fallback requiring review.
-- **Taps.** Taps (branches leaving the line part-way, e.g. into a substation) are added to the circuit 2D from the observed 3D wires (`01_tap_2d_recovery.csv`). A tap may start up to 30 m from its circuit's 2D (`CONNECT_M` in QA). A lone wire, or one running alongside the line, is not used. These are listed as `REJECTED_*` for review.
+- **Taps.** Taps (branches leaving the line part-way, e.g. into a substation) are added to the circuit 2D from the observed 3D wires (`01_tap_2d_recovery.csv`). A tap may start up to 30 m from its circuit's 2D (`CONNECT_M` in QA). A connector is drawn only for gaps up to 6 m; beyond that the tap is a separate feature from its observed 3D start. Taps are stored in the GPKG layer `recovered_tap_2d` and can be edited before Re-export. A lone wire, or one running alongside the line, is not used. These are listed as `REJECTED_*` for review.
 - **Substations.** 3D conductors extending into substations, including sharp turns into a bay, can form terminal 2D without an end POA or a made-up structure. A substation boundary does not justify deleting a real POA or source structure.
 
 ## QA and support

@@ -8718,7 +8718,7 @@ def _circuit_wire_parts_by_row(wire_geom, spans_c, unit_to_m, tol_m=0.5):
     if not by_row:
         return {}
     if len(by_row) == 1:
-        return {next(iter(by_row)): wire_geom}
+        return {next(iter(by_row)): _join_near_endpoints(wire_geom, 0.5 / unit_to_m)}
     tol = tol_m / unit_to_m
     bufs = {r: g.buffer(tol) for r, g in by_row.items()}
 
@@ -8739,17 +8739,71 @@ def _circuit_wire_parts_by_row(wire_geom, spans_c, unit_to_m, tol_m=0.5):
         r = min(by_row, key=lambda k: piece.distance(by_row[k]))
         parts[r].append(piece)
     out = {}
+    min_len = 2.0 / unit_to_m      # clipping slivers (e.g. 0.7 m at a junction)
+    join_tol = 0.5 / unit_to_m
     for r, ls in parts.items():
-        ls = [l for l in ls if l.length > 0]
+        ls = [l for l in ls if l.length > min_len]
         if not ls:
             continue
-        merged = linemerge(MultiLineString(ls)) if len(ls) > 1 else ls[0]
-        out[r] = merged
+        merged = linemerge(MultiLineString([list(x.coords) for x in ls])) if len(ls) > 1 else ls[0]
+        out[r] = _join_near_endpoints(merged, join_tol)
     return out
 
 
+def _join_near_endpoints(geom, tol, max_turn_deg=35.0):
+    """Chain line pieces whose END points meet within tol (20/11).
+
+    Pieces cut at a RoW boundary, at a fork or where a tap crosses the line
+    meet at a node. At every node the two pieces that continue most straight
+    (turn <= max_turn_deg) are joined first; a branch stays its own piece.
+    Interior vertices are never moved.
+    """
+    ls = [list(x.coords) for x in getattr(geom, "geoms", [geom]) if x.length > 0]
+    if len(ls) < 2:
+        return geom
+
+    def d(a, b):
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    def unit(a, b):
+        v = (b[0] - a[0], b[1] - a[1]); n = math.hypot(*v)
+        return (v[0] / n, v[1] / n) if n > 0 else (0.0, 0.0)
+
+    def out_dir(c):   # direction leaving the end of c
+        return unit(c[-2], c[-1])
+
+    def in_dir(c):    # direction entering c at its start
+        return unit(c[0], c[1])
+
+    while True:
+        best = None
+        for i in range(len(ls)):
+            for j in range(len(ls)):
+                if i == j:
+                    continue
+                for rev in (False, True):
+                    b = list(reversed(ls[j])) if rev else ls[j]
+                    if d(ls[i][-1], b[0]) > tol:
+                        continue
+                    u, v = out_dir(ls[i]), in_dir(b)
+                    turn = math.degrees(math.acos(max(-1.0, min(1.0, u[0] * v[0] + u[1] * v[1]))))
+                    if turn <= max_turn_deg and (best is None or turn < best[0]):
+                        best = (turn, i, j, rev)
+        if best is None:
+            break
+        _, i, j, rev = best
+        b = list(reversed(ls[j])) if rev else ls[j]
+        ls[i] = ls[i] + b[1:]
+        del ls[j]
+        if len(ls) == 1:
+            break
+    if len(ls) == 1:
+        return LineString(ls[0])
+    return MultiLineString(ls)
+
+
 EXPORT_SETTINGS_LAYER = "export_settings"
-GPKG_EDITABLE_LAYERS = ("selected_span_wires", "recovered_terminal_2d",
+GPKG_EDITABLE_LAYERS = ("selected_span_wires", "recovered_terminal_2d", "recovered_tap_2d",
                         "structures_final", "caydence_wires_3d")
 
 
@@ -8847,6 +8901,7 @@ def export_geometry_from_gpkg(gpkg, deliverables, year=None, backup_dir=None, ro
 
     Editable layers (QGIS: edit attributes, delete or copy features):
       selected_span_wires   2D spans. ROW / CIRCUIT decide where each span goes.
+      recovered_tap_2d      2D taps (branches into substations). CIRCUIT.
       recovered_terminal_2d 2D conductors into substations. CIRCUIT; the RoW
                             follows the nearest span of that circuit.
       structures_final      Circuit + Caydence Structures. ROW / CIRCUIT.
@@ -8871,6 +8926,12 @@ def export_geometry_from_gpkg(gpkg, deliverables, year=None, backup_dir=None, ro
     spans = _explode_row_field(gpd.read_file(gpkg, layer="selected_span_wires"))
     term = (gpd.read_file(gpkg, layer="recovered_terminal_2d")
             if "recovered_terminal_2d" in layers else None)
+    # 20/11: recovered taps are edited and re-exported like terminal conductors.
+    if "recovered_tap_2d" in layers:
+        taps = gpd.read_file(gpkg, layer="recovered_tap_2d")
+        if taps is not None and not taps.empty:
+            term = taps if term is None or term.empty else gpd.GeoDataFrame(
+                pd.concat([term, taps], ignore_index=True), geometry="geometry", crs=taps.crs)
     structures = _explode_row_field(gpd.read_file(gpkg, layer="structures_final"))
     cayd_w = _explode_row_field(gpd.read_file(gpkg, layer="caydence_wires_3d"))
     kref = gpd.read_file(gpkg, layer="kmz_reference") if "kmz_reference" in layers else None
@@ -8967,6 +9028,10 @@ def export_geometry_from_gpkg(gpkg, deliverables, year=None, backup_dir=None, ro
             merged = linemerge(merged)
         except Exception:
             pass
+        # 20/11: union nodes the line where a tap or branch crosses/leaves it;
+        # rejoin straight continuations so the main line stays one feature.
+        if merged is not None and not merged.is_empty and merged.geom_type in ("LineString", "MultiLineString"):
+            merged = _join_near_endpoints(merged, 0.5 / unit_to_m)
         m = kmz_meta.get(c, {})
         wires.append({
             "ROW": ";".join(sorted({txt(x) for x in g["ROW"]})),
@@ -8976,6 +9041,11 @@ def export_geometry_from_gpkg(gpkg, deliverables, year=None, backup_dir=None, ro
             "geometry": merged,
         })
     final_wires = rows_to_gdf(wires, crs)
+    # 20/11: same fork clean-up as the Geometry run (no branch on top of main).
+    final_wires, _fork_qa = trim_branch_overlaps(final_wires, unit_to_m)
+    final_wires["geometry"] = [
+        _join_near_endpoints(g, 0.5 / unit_to_m) if g is not None and not g.is_empty else g
+        for g in final_wires.geometry]
 
     # RoWs to publish: given by the operator, else the RoWs selected for the
     # run (export_settings), else every RoW in the data (GPKG older than
@@ -8997,6 +9067,10 @@ def export_geometry_from_gpkg(gpkg, deliverables, year=None, backup_dir=None, ro
             for r, n in other["ROW"].astype(str).value_counts().items():
                 skipped.append({"CHECK": "ROW_NOT_EXPORTED", "ROW": r, "CIRCUIT": "",
                                 "ID": name, "N": int(n)})
+    # 20/11: keep every span for splitting the 2D by RoW (a span in a RoW that
+    # is not exported must still claim its piece, e.g. C39 310 end in CT_17);
+    # only the written RoWs are filtered.
+    spans_all_rows = spans
     spans = spans[spans["ROW"].astype(str).isin(rows)]
     if structures is not None and not structures.empty:
         structures = structures[structures["ROW"].astype(str).isin(rows)]
@@ -9016,7 +9090,7 @@ def export_geometry_from_gpkg(gpkg, deliverables, year=None, backup_dir=None, ro
     cayd_structures = build_caydence_structures_by_row(structures, rows)
     inv = write_geometry_delivery_products(
         final_wires, structures, cayd_w, cayd_structures, rows, year, deliverables,
-        span_edges=spans, unit_to_m=unit_to_m,
+        span_edges=spans_all_rows, unit_to_m=unit_to_m,
     )
     checks = check_gpkg_export_consistency(spans, structures, cayd_w, kmz_meta, unit_to_m)
     if skipped:
@@ -9233,10 +9307,16 @@ def write_geometry_delivery_products(
             # RoW part, structures of all selected RoWs (boundary duplicates merged).
             recs = []
             for row in sorted(wire_parts):
-                rec = wr.to_dict()
-                rec["ROW"] = row
-                rec["geometry"] = wire_parts[row]
-                recs.append(rec)
+                # 20/11: one LineString feature per part (main line, each tap),
+                # never a MultiLineString.
+                g = wire_parts[row]
+                for part in (list(g.geoms) if hasattr(g, "geoms") else [g]):
+                    if part is None or part.is_empty or part.length <= 0:
+                        continue
+                    rec = wr.to_dict()
+                    rec["ROW"] = row
+                    rec["geometry"] = part
+                    recs.append(rec)
             if recs:
                 wg = gpd.GeoDataFrame(recs, geometry="geometry", crs=final_wires.crs)
                 wout = delivery_dir(deliverables, "wires", circuit=circuit) / f"{safe_filename(circuit)}_Wires_{year}.shp"
@@ -9256,10 +9336,16 @@ def write_geometry_delivery_products(
             cdir = delivery_dir(deliverables, "wires", row=row, circuit=circuit)
 
             if row in wire_parts:
-                rec = wr.to_dict()
-                rec["ROW"] = row
-                rec["geometry"] = wire_parts[row]
-                wg = gpd.GeoDataFrame([rec], geometry="geometry", crs=final_wires.crs)
+                g = wire_parts[row]
+                recs = []
+                for part in (list(g.geoms) if hasattr(g, "geoms") else [g]):
+                    if part is None or part.is_empty or part.length <= 0:
+                        continue
+                    rec = wr.to_dict()
+                    rec["ROW"] = row
+                    rec["geometry"] = part
+                    recs.append(rec)
+                wg = gpd.GeoDataFrame(recs, geometry="geometry", crs=final_wires.crs)
                 wout = cdir / f"{safe_filename(circuit)}_Wires_{year}.shp"
                 _write_clean_shapefile(
                     wg, wout,
@@ -9495,6 +9581,7 @@ def trim_branch_overlaps(formal_2d, unit_to_m, tol_m=3.0, min_overlap_m=3.0, ste
         parts = list(g.geoms) if hasattr(g, "geoms") else [g]
         if len(parts) < 2:
             continue
+        parts = sorted(parts, key=lambda x: -x.length)  # main line first
         kept = [parts[0]]
         changed = False
         for pi, part in enumerate(parts[1:], 1):
@@ -9552,6 +9639,7 @@ def recover_tap_2d_from_3d(
     min_tap_wires: int = 2,
     min_reach_m: float = 25.0,
     connect_max_m: float = 30.0,
+    connect_draw_m: float = 6.0,
 ) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
     """R01.05: add 2D for taps (branches, e.g. into a substation) seen in 3D.
 
@@ -9567,8 +9655,9 @@ def recover_tap_2d_from_3d(
     QA: 01_tap_2d_recovery.csv.
     """
     cols = ["CIRCUIT", "ROW", "TAP", "SPAN", "WIRE_ID", "N_WIRES", "ACTION", "LENGTH_M", "CONNECT_M"]
+    tap_lines = []
     if formal_2d is None or formal_2d.empty or source_3d is None or source_3d.empty:
-        return formal_2d, pd.DataFrame(columns=cols)
+        return formal_2d, pd.DataFrame(columns=cols), rows_to_gdf([], formal_2d.crs if formal_2d is not None else None)
     out = formal_2d.copy()
     qa = []
     cov = covered_m / unit_to_m
@@ -9642,7 +9731,13 @@ def recover_tap_2d_from_3d(
             # on a multi-part 2D and produced a 5 km connector on C39 371)
             start_pt = nearest_points(base, Point(*sp["ends"][k]))[0]
             connect_m = float(d_ends[k]) * unit_to_m
-            coords = [(start_pt.x, start_pt.y)]
+            # 20/11: a straight connector is drawn only for a small gap. A tap
+            # that starts farther away (C39 1235: 20 m, at the 1250 line) is kept
+            # as its own part from its observed 3D start, without a fake stub.
+            if connect_m <= connect_draw_m:
+                coords = [(start_pt.x, start_pt.y)]
+            else:
+                coords = []
             cur, cur_k = si, k
             seq = []
             while True:
@@ -9689,6 +9784,9 @@ def recover_tap_2d_from_3d(
             out.at[ridx, "geometry"] = newg
             if "LENGTH_M" in out.columns:
                 out.at[ridx, "LENGTH_M"] = float(newg.length) * unit_to_m
+            tap_lines.append({"CIRCUIT": circ, "TAP": tap_no,
+                              "WIRE_ID": ";".join(spans[x]["rep"]["WIRE_ID"] for x in seq),
+                              "CONNECT_M": round(connect_m, 1), "geometry": line})
             for n_span, s_i in enumerate(seq, 1):
                 qa.append({"CIRCUIT": circ, "ROW": txt(out.at[ridx, "ROW"]) if "ROW" in out.columns else "",
                            "TAP": tap_no, "SPAN": n_span, "WIRE_ID": spans[s_i]["rep"]["WIRE_ID"],
@@ -9700,7 +9798,7 @@ def recover_tap_2d_from_3d(
                 qa.append({"CIRCUIT": circ, "ROW": "", "TAP": 0, "SPAN": 0, "WIRE_ID": sp["rep"]["WIRE_ID"],
                            "N_WIRES": sp["n"], "ACTION": "NOT_CONNECTED_TO_2D",
                            "LENGTH_M": round(float(sp["rep"]["g"].length) * unit_to_m, 1)})
-    return out, pd.DataFrame(qa, columns=cols)
+    return out, pd.DataFrame(qa, columns=cols), rows_to_gdf(tap_lines, formal_2d.crs)
 
 
 # R01.04 - SCHF and single-top SCSH representative XY from middle PHASE conductor.
@@ -10006,7 +10104,7 @@ def run_geometry_stage(
         )
         terminal_2d_qa.to_csv(output/"01_terminal_2d_recovery.csv", index=False)
         info(f"2D terminal conductor recovery: {len(terminal_2d_parts):,} added from observed 3D")
-        final_wires, tap_2d_qa = recover_tap_2d_from_3d(final_wires, cayd_w, u2m)
+        final_wires, tap_2d_qa, tap_2d_parts = recover_tap_2d_from_3d(final_wires, cayd_w, u2m)
         final_wires, fork_qa = trim_branch_overlaps(final_wires, u2m)
         tap_2d_qa.to_csv(output/"01_tap_2d_recovery.csv", index=False)
         fork_qa.to_csv(output/"01_fork_overlap_trim.csv", index=False)
@@ -10066,7 +10164,7 @@ def run_geometry_stage(
                 fw2 = fw2[fw2["CIRCUIT"].astype(str).isin(keep_circuits)].copy()
                 se2 = se2[se2["CIRCUIT"].astype(str).isin(keep_circuits)].copy()
             fw2, terminal_2d_qa, terminal_2d_parts = recover_terminal_2d_from_3d(fw2, cayd_w, u2m)
-            fw2, tap_2d_qa = recover_tap_2d_from_3d(fw2, cayd_w, u2m)
+            fw2, tap_2d_qa, tap_2d_parts = recover_tap_2d_from_3d(fw2, cayd_w, u2m)
             fw2, fork_qa = trim_branch_overlaps(fw2, u2m)
             terminal_2d_qa.to_csv(output/"01_terminal_2d_recovery.csv", index=False)
             tap_2d_qa.to_csv(output/"01_tap_2d_recovery.csv", index=False)
@@ -10205,6 +10303,7 @@ def run_geometry_stage(
             (build_structure_source_match_lines(structures_xy),"structure_source_match"),
             (recovered_terminal_poa,"recovered_terminal_poa"),
             (terminal_2d_parts,"recovered_terminal_2d"),
+            (tap_2d_parts,"recovered_tap_2d"),
             (dropped,"discarded_branches"),(earth,"earth_wires_excluded"),
             (phase_discarded,"phase_wires_discarded"),(supports,"support_points"),
             (raw_points,"source_structure_points"),(bundle_gdf,"span_bundles"),
