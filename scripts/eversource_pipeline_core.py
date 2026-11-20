@@ -3077,6 +3077,16 @@ def oriented_candidate(candidate, start_sid, end_sid, bundle, supports_by_id):
     return out,float(off_start),float(off_end)
 
 
+# R01.05 (20/11): wire rows that source LiDAR (class 210) confirmed as EARTH.
+# Filled only for the 2D re-selection pass after LiDAR roles are known.
+_LIDAR_EARTH_ROWS: set[int] = set()
+
+
+def set_lidar_earth_rows(rows) -> None:
+    _LIDAR_EARTH_ROWS.clear()
+    _LIDAR_EARTH_ROWS.update(int(x) for x in rows)
+
+
 # R01.05: outermost-lane representative for non-horizontal bundles.
 LANE_PENALTY_M = 15.0      # cost of leaving the chosen outer lane in one span
 LANE_TOL_M = 0.5           # conductors within this of the extreme count as extreme
@@ -3165,7 +3175,7 @@ def select_phase_sequence(path, bundle_lookup, supports, unit_to_m, outer_on_hor
     # wires of one named line) are alternatives; continuity picks between them
     # instead of the reference-distance choice made when the path was built.
     by_pair=defaultdict(list)
-    earth_rows=set()
+    earth_rows=set(_LIDAR_EARTH_ROWS)
     for _bid,_b in bundle_lookup.items():
         by_pair[txt(_b.get("PAIR"))].append(int(_bid))
         earth_rows.update(int(x) for x in _b.get("EARTH_WIRE_ROWS", []))
@@ -3319,6 +3329,34 @@ def simplify_selected_phase_sequence(selected, tolerance_source: float):
         after += len(simp_coords)
         out.append(rec)
     return out, before, after
+
+JOIN_SMOOTH_M = 6.0  # joins up to this length become one shared vertex (no dog leg)
+
+
+def smooth_small_joins(selected, max_units):
+    """R01.05 (20/11): replace a short step between consecutive spans by one vertex.
+
+    When the end of span i and the start of span i+1 differ by less than
+    max_units (different conductor ends on one structure), both are moved to
+    their midpoint. The line then bends once at the structure instead of
+    drawing a small hook ("zawijka"), and the Structure placed on the node
+    stays on the wire (COMMON_ENDPOINT).
+    """
+    if not selected or max_units <= 0:
+        return selected, 0
+    out = [dict(c, coords_oriented=list(c["coords_oriented"])) for c in selected]
+    n = 0
+    for i in range(1, len(out)):
+        a = out[i - 1]["coords_oriented"][-1]
+        b = out[i]["coords_oriented"][0]
+        d = math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+        if 1e-9 < d <= max_units:
+            m = ((float(a[0]) + float(b[0])) / 2.0, (float(a[1]) + float(b[1])) / 2.0)
+            out[i - 1]["coords_oriented"][-1] = m
+            out[i]["coords_oriented"][0] = m
+            n += 1
+    return out, n
+
 
 def concatenate_selected(selected):
     if not selected:
@@ -8181,6 +8219,8 @@ def build_final_products(
                 )
             )
 
+            selected, _n_smoothed = smooth_small_joins(selected, JOIN_SMOOTH_M / unit_to_m)
+
             route_geom = concatenate_selected(selected)
             if route_geom is None:
                 continue
@@ -9434,6 +9474,74 @@ def recover_terminal_2d_from_3d(
             out.at[idx,'LENGTH_M']=float(new_geom.length)*unit_to_m
     return out, pd.DataFrame(qa,columns=['CIRCUIT','PART','SIDE','ACTION','WIRE_ID','EXTENSION_M']), rows_to_gdf(extras,formal_2d.crs)
 
+def trim_branch_overlaps(formal_2d, unit_to_m, tol_m=3.0, min_overlap_m=3.0, step_m=1.0):
+    """R01.05 (20/11): a branch part must not run on top of the main line.
+
+    At a fork the TAP part often starts with spans shared with MAIN (C39 1605:
+    151 m, 1500: 23 m), drawn twice. For every part after the first, the
+    leading/trailing stretch lying within tol_m of the earlier parts is cut,
+    and the branch is reconnected from the nearest point on them, so it starts
+    where it really diverges. A part entirely on earlier parts is dropped.
+    """
+    from shapely.ops import substring
+    qa = []
+    if formal_2d is None or formal_2d.empty:
+        return formal_2d, pd.DataFrame(columns=["CIRCUIT", "ROW", "PART", "TRIM_START_M", "TRIM_END_M", "ACTION"])
+    out = formal_2d.copy()
+    tol = tol_m / unit_to_m
+    step = step_m / unit_to_m
+    for idx, rec in out.iterrows():
+        g = rec.geometry
+        parts = list(g.geoms) if hasattr(g, "geoms") else [g]
+        if len(parts) < 2:
+            continue
+        kept = [parts[0]]
+        changed = False
+        for pi, part in enumerate(parts[1:], 1):
+            others = unary_union(kept)
+            L = float(part.length)
+            if L <= 0:
+                continue
+            ss = list(np.arange(0.0, L, step)) + [L]
+            dist = [float(others.distance(part.interpolate(t))) for t in ss]
+            k0 = 0
+            while k0 < len(ss) and dist[k0] <= tol:
+                k0 += 1
+            if k0 == len(ss):
+                qa.append({"CIRCUIT": txt(rec.get("CIRCUIT")), "ROW": txt(rec.get("ROW")), "PART": pi,
+                           "TRIM_START_M": round(L * unit_to_m, 1), "TRIM_END_M": 0.0, "ACTION": "DROPPED_ON_MAIN"})
+                changed = True
+                continue
+            k1 = len(ss) - 1
+            while k1 > k0 and dist[k1] <= tol:
+                k1 -= 1
+            s0 = ss[k0 - 1] if k0 > 0 else 0.0
+            s1 = ss[k1 + 1] if k1 < len(ss) - 1 else L
+            if s0 * unit_to_m < min_overlap_m and (L - s1) * unit_to_m < min_overlap_m:
+                kept.append(part)
+                continue
+            core = substring(part, s0, s1)
+            cs = [tuple(c[:2]) for c in core.coords]
+            if s0 > 0:
+                p0 = nearest_points(others, Point(cs[0]))[0]
+                cs = [(p0.x, p0.y)] + cs
+            if s1 < L:
+                p1 = nearest_points(others, Point(cs[-1]))[0]
+                cs = cs + [(p1.x, p1.y)]
+            kept.append(LineString(cs))
+            changed = True
+            qa.append({"CIRCUIT": txt(rec.get("CIRCUIT")), "ROW": txt(rec.get("ROW")), "PART": pi,
+                       "TRIM_START_M": round(s0 * unit_to_m, 1), "TRIM_END_M": round((L - s1) * unit_to_m, 1),
+                       "ACTION": "TRIMMED_OVERLAP"})
+        if changed:
+            newg = _multipart_circuit_geometry(kept)
+            if newg is not None:
+                out.at[idx, "geometry"] = newg
+                if "LENGTH_M" in out.columns:
+                    out.at[idx, "LENGTH_M"] = float(newg.length) * unit_to_m
+    return out, pd.DataFrame(qa, columns=["CIRCUIT", "ROW", "PART", "TRIM_START_M", "TRIM_END_M", "ACTION"])
+
+
 def recover_tap_2d_from_3d(
     formal_2d: gpd.GeoDataFrame,
     source_3d: gpd.GeoDataFrame,
@@ -9899,7 +10007,10 @@ def run_geometry_stage(
         terminal_2d_qa.to_csv(output/"01_terminal_2d_recovery.csv", index=False)
         info(f"2D terminal conductor recovery: {len(terminal_2d_parts):,} added from observed 3D")
         final_wires, tap_2d_qa = recover_tap_2d_from_3d(final_wires, cayd_w, u2m)
+        final_wires, fork_qa = trim_branch_overlaps(final_wires, u2m)
         tap_2d_qa.to_csv(output/"01_tap_2d_recovery.csv", index=False)
+        fork_qa.to_csv(output/"01_fork_overlap_trim.csv", index=False)
+        info(f"2D branch overlaps trimmed at forks: {int((fork_qa.get('ACTION', pd.Series(dtype=str)) != '').sum()) if not fork_qa.empty else 0}")
         n_taps = 0 if tap_2d_qa.empty else int(
             tap_2d_qa[tap_2d_qa["ACTION"] == "RECOVERED_3D_TAP"].groupby(["CIRCUIT", "TAP"]).ngroups)
         info(f"2D taps recovered from observed 3D: {n_taps:,}")
@@ -9934,6 +10045,66 @@ def run_geometry_stage(
         )
         cayd_w, lidar_role_qa = wire_votes.apply(cayd_w)
         lidar_role_qa.to_csv(output/"01_caydence_lidar_wire_roles.csv", index=False)
+
+        # R01.05 (20/11): the 2D wire was chosen before LiDAR roles were known.
+        # If a chosen conductor is LiDAR-confirmed EARTH, choose again without
+        # those wires, then move affected Structures onto the new 2D.
+        lidar_earth_ids = set(cayd_w.loc[
+            cayd_w["WIRE_TYPE"].astype(str).str.upper() == "EARTH", "WIRE_ID"].astype(str))
+        earth_hits = sorted(set(span_edges["WIRE_ID"].astype(str)) & lidar_earth_ids)
+        reselect_qa = []
+        if earth_hits:
+            id2row = {txt(v): i for i, v in enumerate(wires["WIRE_ID"])} if "WIRE_ID" in wires.columns else {}
+            set_lidar_earth_rows({id2row[x] for x in lidar_earth_ids if x in id2row})
+            try:
+                fw2, se2, _sx2, _pd2, jr2 = build_final_products(
+                    paths, bundles, supports, raw_points, client, kmz, csi, u2m,
+                    max_join_review_m, wire_simplify_m)
+            finally:
+                set_lidar_earth_rows(set())
+            if selected_rows:
+                fw2 = fw2[fw2["CIRCUIT"].astype(str).isin(keep_circuits)].copy()
+                se2 = se2[se2["CIRCUIT"].astype(str).isin(keep_circuits)].copy()
+            fw2, terminal_2d_qa, terminal_2d_parts = recover_terminal_2d_from_3d(fw2, cayd_w, u2m)
+            fw2, tap_2d_qa = recover_tap_2d_from_3d(fw2, cayd_w, u2m)
+            fw2, fork_qa = trim_branch_overlaps(fw2, u2m)
+            terminal_2d_qa.to_csv(output/"01_terminal_2d_recovery.csv", index=False)
+            tap_2d_qa.to_csv(output/"01_tap_2d_recovery.csv", index=False)
+            fork_qa.to_csv(output/"01_fork_overlap_trim.csv", index=False)
+            still = sorted(set(se2["WIRE_ID"].astype(str)) & lidar_earth_ids)
+            changed_c = {txt(c) for c in span_edges.loc[span_edges["WIRE_ID"].astype(str).isin(earth_hits), "CIRCUIT"]}
+            old_geom = {txt(c): g.geometry.union_all() for c, g in final_wires.groupby("CIRCUIT")}
+            new_geom = {txt(c): g.geometry.union_all() for c, g in fw2.groupby("CIRCUIT")}
+            moved_idx, positioned = [], structures_xy.copy()
+            for i, r in structures_xy.iterrows():
+                c = txt(r.get("CIRCUIT"))
+                if c not in changed_c or c not in new_geom or c not in old_geom:
+                    continue
+                pt = r.geometry
+                d_old = float(old_geom[c].distance(pt)) * u2m
+                d_new = float(new_geom[c].distance(pt)) * u2m
+                if d_old <= 0.3 and 0.3 < d_new <= 15.0:
+                    q = nearest_points(new_geom[c], pt)[0]
+                    positioned.at[i, "geometry"] = Point(q.x, q.y)
+                    moved_idx.append(i)
+            if moved_idx:
+                repl_final, repl_qa = add_ground_elevation_from_lidar(
+                    positioned.loc[moved_idx], lidar_source, crs, u2m, td,
+                    wire_votes=None, workers=lidar_workers)
+                for i, (_, new_row) in zip(moved_idx, repl_final.iterrows()):
+                    for col in repl_final.columns:
+                        structures_final.at[i, col] = new_row[col]
+                for i, (_, new_row) in zip(moved_idx, repl_qa.iterrows()):
+                    for col in repl_qa.columns:
+                        ground_qa.at[i, col] = new_row[col]
+                structures_xy = positioned
+            for w_id in earth_hits:
+                reselect_qa.append({"WIRE_ID": w_id, "ACTION": "STILL_SELECTED" if w_id in still else "REPLACED"})
+            final_wires, span_edges, join_review = fw2, se2, jr2
+            info(f"2D re-selected after LiDAR: {len(earth_hits) - len(still)} of {len(earth_hits)} "
+                 f"EARTH-on-2D spans replaced; {len(moved_idx)} Structures moved onto the new 2D")
+        pd.DataFrame(reselect_qa, columns=["WIRE_ID", "ACTION"]).to_csv(
+            output/"01_2d_lidar_earth_reselect.csv", index=False)
 
         # SCHF and single-top SCSH use three classified horizontal PHASE
         # wires. SCSH with neighboring same-circuit POA stays untouched.

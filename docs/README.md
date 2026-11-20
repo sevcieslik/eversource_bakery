@@ -97,7 +97,8 @@ Wires on an unnamed level (e.g. `0`) are tolerated as a small minority.
 
 ## Expected behaviour
 
-- **2D circuit wire.** It represents the **central phase** of the circuit, and an EARTH wire is never used. A step of about 4 m at a structure where horizontal phases change to a vertical arrangement is expected.
+- **2D circuit wire.** It represents the **central phase** of the circuit. An EARTH wire is never used: after the LiDAR wire roles are known, any span whose chosen conductor is LiDAR-confirmed EARTH is chosen again (`01_2d_lidar_earth_reselect.csv`). Short steps between spans (up to 6 m) become one bend at the structure, with no hooks. A step of about 4 m where horizontal phases change to a vertical arrangement can remain.
+- **Forks.** A branch part no longer runs on top of the main line: it starts where it really diverges (`01_fork_overlap_trim.csv`).
 - **Duplicate conductors.** Identical copies of one conductor in the DXF are ignored for 2D. In Caydence they follow the kept wire.
 - **Parallel lines.** Distinct nearby circuit POAs are not merged on distance alone. POAs of parallel lines are split into separate structures (`01_support_split_qa.csv`).
 - **RoW boundaries.** RoW boundaries fall on structures. A structure at the start or end of two RoWs is written to both RoW deliverables. This is intended, so don't delete these duplicates (`01_row_boundary_qa.csv`).

@@ -312,3 +312,32 @@ This supersedes Y. Product 267 is an area product, so it keeps one record per ph
 ## AC. Tap recovery fixes (20/11)
 - **Bug in 20261120a.** On a multi-part circuit 2D, the tap start point was taken from the wrong part. On C39 371 this added a 5 km straight connector. The start point is now the nearest point of the circuit 2D.
 - **Tap start distance.** A tap may now start up to 30 m from its own circuit's 2D, for example a tap leaving from a pole beside a parallel circuit. The connector length is `CONNECT_M` in `01_tap_2d_recovery.csv`. C39 1235 into the substation is now recovered: 81 m, connector 20 m.
+
+## AD. 2D: LiDAR EARTH re-selection, no hooks, clean forks (20/11, C39 feedback)
+
+**2D on earth wires.** The 2D conductor is chosen before LiDAR roles exist, and in mixed arrangements the height-based earth detection can miss. On the team's C39 run (20261120b, named levels, real LiDAR), 9 spans used a LiDAR-confirmed EARTH wire.
+- After the LiDAR roles are applied, any span on a LiDAR EARTH wire triggers a second 2D selection with those wires excluded.
+- Terminal and tap recovery and fork trimming are redone after the second selection.
+- Structures on the old 2D are moved onto the new one, with ground Z resampled.
+- QA: `01_2d_lidar_earth_reselect.csv`.
+
+**Hooks ("zawijki").** Consecutive spans whose ends differ by up to 6 m now share one vertex at the midpoint. The line bends once at the structure, and the node Structure stays on the wire.
+
+**Forks.** A branch part that starts or ends on top of earlier parts of the same circuit (within 3 m) is cut back to where it diverges, and reconnected from the nearest point on the main line. Examples: C39 1605 (151 m), 1500 (23 m and 244 m), C12 Z119 (160 m). QA: `01_fork_overlap_trim.csv`.
+
+Results on the team's C39 DXF (named levels) with LiDAR classes reproduced from their run:
+
+| Metric | 20261120b | 20261120c |
+|---|---|---|
+| 2D spans on LiDAR EARTH | 9 | 0 |
+| Joins > 1 m | 32 | 6 |
+| Hooks | 26 | 2 |
+| Fork overlaps (circuits) | 4 | 2 |
+
+The remaining fork overlaps are under 5 m: tap connectors that touch the main line.
+
+Other clusters:
+- C12: joins > 1 m 0, fork overlaps only K165 (4 m).
+- C17 and C55: no 2D spans on EARTH.
+
+The only new same-voltage crossing is the C12 3195 tap into its substation, which crosses O149 (review).
