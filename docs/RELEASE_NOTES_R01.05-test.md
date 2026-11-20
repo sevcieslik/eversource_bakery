@@ -261,3 +261,27 @@ Every package now carries `scripts/BUILD_INFO.json` with the build name, git com
 - the `export_settings` layer of the QA GeoPackage.
 
 When run from a git checkout without `BUILD_INFO.json`, the commit is read from git, with `-dirty` added if there are local changes.
+
+## Y. Caydence Structures: one record per circuit again (20/11)
+Team feedback on C39 CT_06: on supports shared by 1500 and 1605, the per-structure rule (P) kept only the 1500 record, so 1605 dropped from 88 to 14 Caydence structures. Turning 1500 off in QGIS then showed no structures along that line.
+- Caydence keeps one record **per circuit** again, as in R01.04. Only duplicates of the same circuit at the same support are removed.
+- C39 CT_06 Caydence Structures now match the 13/11 R01.04 run: 1500 103, 1605 88. Records of other RoWs (310/348/383) no longer leak into CT_06.
+- `BAKERY_CAYD_DEDUPE=support` restores rule P.
+
+## Z. Taps recovered in 2D from 3D (20/11)
+Terminal recovery (K) only extends the ends of a circuit path. A tap that leaves the line part-way, e.g. into a substation, had no 2D.
+- How it works: the circuit's 3D wires (not EARTH) that lie away from its 2D are grouped into spans, and each span is represented by its central conductor. Spans are chained outward from the 2D.
+- A chain is added as an extra part of the circuit 2D only if its first span has at least 2 wires and it reaches at least 25 m away from the line.
+- QA: `01_tap_2d_recovery.csv`, with actions `RECOVERED_3D_TAP`, `REJECTED_FEW_WIRES`, `REJECTED_RUNS_ALONGSIDE` and `NOT_CONNECTED_TO_2D`.
+
+Recovered taps:
+
+| Cluster | Circuit | Tap |
+|---|---|---|
+| C12 | 3195 | 2 spans, 168 m + 65 m |
+| C12 | R187 | 47 m |
+| C39 | 1250 | 84 m |
+| C55 | 107 | 76 m |
+| C55 | 399 | 69 m |
+
+Lone or alongside wires were rejected and listed for review.

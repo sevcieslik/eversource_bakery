@@ -5126,7 +5126,11 @@ _CAYD_ATTR_SKIP = {
 
 
 def dedupe_caydence_structures(out: gpd.GeoDataFrame, same_xy_m: float | None = None) -> gpd.GeoDataFrame:
-    """R01.05: one Caydence record per physical structure within a RoW.
+    """R01.05: no duplicate Caydence records within a RoW.
+
+    Default (20/11): one record per circuit and support; duplicates of the
+    SAME circuit at the same support are collapsed. With
+    BAKERY_CAYD_DEDUPE=support: one record per physical structure (18/11 rule).
 
     A support carrying several circuits produces one circuit Structure per
     circuit. Caydence RoW Structures keep only the record with the fullest
@@ -5162,7 +5166,12 @@ def dedupe_caydence_structures(out: gpd.GeoDataFrame, same_xy_m: float | None = 
         if ra != rb:
             parent[rb] = ra
 
-    rowv = out["ROW"].astype(str)
+    # 20/11: one Caydence record PER CIRCUIT (team feedback, C39 1500/1605):
+    # only records of the same circuit at the same support are collapsed.
+    # BAKERY_CAYD_DEDUPE=support restores one record per physical structure.
+    per_support = os.environ.get("BAKERY_CAYD_DEDUPE", "circuit").strip().lower() == "support"
+    rowv = out["ROW"].astype(str) if per_support else (
+        out["ROW"].astype(str) + "|" + out["CIRCUIT"].astype(str))
     for row in sorted(set(rowv)):
         idx = list(out.index[rowv == row])
         first = {}
@@ -9320,6 +9329,159 @@ def recover_terminal_2d_from_3d(
             out.at[idx,'LENGTH_M']=float(new_geom.length)*unit_to_m
     return out, pd.DataFrame(qa,columns=['CIRCUIT','PART','SIDE','ACTION','WIRE_ID','EXTENSION_M']), rows_to_gdf(extras,formal_2d.crs)
 
+def recover_tap_2d_from_3d(
+    formal_2d: gpd.GeoDataFrame,
+    source_3d: gpd.GeoDataFrame,
+    unit_to_m: float,
+    covered_m: float = 15.0,
+    min_uncovered_m: float = 30.0,
+    join_m: float = 15.0,
+    min_tap_wires: int = 2,
+    min_reach_m: float = 25.0,
+) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
+    """R01.05: add 2D for taps (branches, e.g. into a substation) seen in 3D.
+
+    Terminal recovery only extends the ends of a circuit path. A branch that
+    leaves the line part-way (tap to a substation) had no 2D. Here, 3D wires of
+    the circuit (not EARTH) that lie away from its 2D are grouped into spans
+    (wires sharing both ends within join_m). Each span is represented by its
+    central conductor (highest wire dropped when 4+, as a likely earth). Spans
+    are chained outward from the circuit 2D; only chains that start at the 2D
+    are added, as an extra part of the circuit geometry. QA: 01_tap_2d_recovery.csv.
+    """
+    cols = ["CIRCUIT", "ROW", "TAP", "SPAN", "WIRE_ID", "N_WIRES", "ACTION", "LENGTH_M"]
+    if formal_2d is None or formal_2d.empty or source_3d is None or source_3d.empty:
+        return formal_2d, pd.DataFrame(columns=cols)
+    out = formal_2d.copy()
+    qa = []
+    cov = covered_m / unit_to_m
+    jn = join_m / unit_to_m
+    src = source_3d[source_3d["WIRE_TYPE"].astype(str).str.upper() != "EARTH"] if "WIRE_TYPE" in source_3d else source_3d
+    src = src.drop_duplicates("WIRE_ID") if "WIRE_ID" in src else src
+    for circ, rows in out.groupby(out["CIRCUIT"].astype(str)):
+        if not circ:
+            continue
+        base = shapely.force_2d(rows.geometry.union_all())
+        if base is None or base.is_empty:
+            continue
+        cand = src[src["CIRCUIT"].astype(str) == circ]
+        if cand.empty:
+            continue
+        zone = base.buffer(cov)
+        items = []
+        for _, wr in cand.iterrows():
+            g = wr.geometry
+            if g is None or g.is_empty or not hasattr(g, "coords"):
+                continue
+            g2 = shapely.force_2d(g)
+            if g2.difference(zone).length * unit_to_m < min_uncovered_m:
+                continue
+            xyz = list(g.coords)
+            z = float(np.mean([c[2] for c in xyz])) if len(xyz[0]) > 2 else 0.0
+            items.append({"WIRE_ID": txt(wr.get("WIRE_ID")), "g": g2, "z": z,
+                          "a": np.asarray(xyz[0][:2], float), "b": np.asarray(xyz[-1][:2], float)})
+        if not items:
+            continue
+        # spans: union wires whose two ends coincide (either orientation)
+        parent = list(range(len(items)))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                A, B = items[i], items[j]
+                same = (np.linalg.norm(A["a"] - B["a"]) <= jn and np.linalg.norm(A["b"] - B["b"]) <= jn) or \
+                       (np.linalg.norm(A["a"] - B["b"]) <= jn and np.linalg.norm(A["b"] - B["a"]) <= jn)
+                if same:
+                    parent[find(j)] = find(i)
+        groups = defaultdict(list)
+        for i in range(len(items)):
+            groups[find(i)].append(items[i])
+        spans = []
+        for g in groups.values():
+            pool = sorted(g, key=lambda x: x["z"])
+            if len(pool) >= 4:
+                pool = pool[:-1]  # highest wire: likely an earth
+            mids = np.asarray([[x["g"].interpolate(0.5, normalized=True).x,
+                                x["g"].interpolate(0.5, normalized=True).y] for x in pool])
+            c = mids.mean(axis=0)
+            rep = pool[int(np.argmin(np.linalg.norm(mids - c, axis=1)))]
+            spans.append({"rep": rep, "n": len(g), "ends": [rep["a"], rep["b"]]})
+        # chain spans outward from the circuit 2D
+        used = set()
+        tap_no = 0
+        for si, sp in enumerate(spans):
+            if si in used:
+                continue
+            d_ends = [float(base.distance(Point(*e))) for e in sp["ends"]]
+            k = int(np.argmin(d_ends))
+            if d_ends[k] > jn:
+                continue
+            tap_no += 1
+            start_pt = base.interpolate(base.project(Point(*sp["ends"][k])))
+            coords = [(start_pt.x, start_pt.y)]
+            cur, cur_k = si, k
+            seq = []
+            while True:
+                used.add(cur)
+                rep = spans[cur]["rep"]
+                cs = [tuple(c) for c in rep["g"].coords]
+                if cur_k == 1:
+                    cs.reverse()
+                coords.extend(cs)
+                seq.append(cur)
+                tip = np.asarray(cs[-1], float)
+                nxt = None
+                for sj, sp2 in enumerate(spans):
+                    if sj in used:
+                        continue
+                    for kk, e in enumerate(sp2["ends"]):
+                        if np.linalg.norm(e - tip) <= jn:
+                            nxt = (sj, kk)
+                            break
+                    if nxt:
+                        break
+                if nxt is None:
+                    break
+                cur, cur_k = nxt
+            line = LineString(coords)
+            # A real tap has several conductors and leaves the line; a lone wire
+            # running alongside (e.g. a stray or parallel conductor) is not one.
+            reach_m = max(float(base.distance(Point(c))) for c in coords) * unit_to_m
+            if spans[seq[0]]["n"] < min_tap_wires or reach_m < min_reach_m:
+                for s_i in seq:
+                    qa.append({"CIRCUIT": circ, "ROW": "", "TAP": 0, "SPAN": 0,
+                               "WIRE_ID": spans[s_i]["rep"]["WIRE_ID"], "N_WIRES": spans[s_i]["n"],
+                               "ACTION": "REJECTED_FEW_WIRES" if spans[seq[0]]["n"] < min_tap_wires else "REJECTED_RUNS_ALONGSIDE",
+                               "LENGTH_M": round(float(spans[s_i]["rep"]["g"].length) * unit_to_m, 1)})
+                tap_no -= 1
+                continue
+            # attach to the RoW row of this circuit that is nearest the tap start
+            ridx = min(rows.index, key=lambda i: float(shapely.force_2d(out.at[i, "geometry"]).distance(start_pt)))
+            g0 = out.at[ridx, "geometry"]
+            parts = (list(g0.geoms) if hasattr(g0, "geoms") else [g0]) + [line]
+            newg = _multipart_circuit_geometry(parts)
+            if newg is None:
+                continue
+            out.at[ridx, "geometry"] = newg
+            if "LENGTH_M" in out.columns:
+                out.at[ridx, "LENGTH_M"] = float(newg.length) * unit_to_m
+            for n_span, s_i in enumerate(seq, 1):
+                qa.append({"CIRCUIT": circ, "ROW": txt(out.at[ridx, "ROW"]) if "ROW" in out.columns else "",
+                           "TAP": tap_no, "SPAN": n_span, "WIRE_ID": spans[s_i]["rep"]["WIRE_ID"],
+                           "N_WIRES": spans[s_i]["n"], "ACTION": "RECOVERED_3D_TAP",
+                           "LENGTH_M": round(float(spans[s_i]["rep"]["g"].length) * unit_to_m, 1)})
+        for si, sp in enumerate(spans):
+            if si not in used:
+                qa.append({"CIRCUIT": circ, "ROW": "", "TAP": 0, "SPAN": 0, "WIRE_ID": sp["rep"]["WIRE_ID"],
+                           "N_WIRES": sp["n"], "ACTION": "NOT_CONNECTED_TO_2D",
+                           "LENGTH_M": round(float(sp["rep"]["g"].length) * unit_to_m, 1)})
+    return out, pd.DataFrame(qa, columns=cols)
+
+
 # R01.04 - SCHF and single-top SCSH representative XY from middle PHASE conductor.
 # Deliberately no Source XY substitution and no edits to 2D/Caydence wires.
 def relocate_schf_to_middle_phase(structures, cayd_w, unit_to_m,
@@ -9623,6 +9785,11 @@ def run_geometry_stage(
         )
         terminal_2d_qa.to_csv(output/"01_terminal_2d_recovery.csv", index=False)
         info(f"2D terminal conductor recovery: {len(terminal_2d_parts):,} added from observed 3D")
+        final_wires, tap_2d_qa = recover_tap_2d_from_3d(final_wires, cayd_w, u2m)
+        tap_2d_qa.to_csv(output/"01_tap_2d_recovery.csv", index=False)
+        n_taps = 0 if tap_2d_qa.empty else int(
+            tap_2d_qa[tap_2d_qa["ACTION"] == "RECOVERED_3D_TAP"].groupby(["CIRCUIT", "TAP"]).ngroups)
+        info(f"2D taps recovered from observed 3D: {n_taps:,}")
 
         # A retained 2D circuit path is not a complete inventory of real POA
         # structures. Reinstate its observed terminals before LiDAR sampling.
@@ -9704,7 +9871,7 @@ def run_geometry_stage(
         cayd_dedupe_qa = cayd_structures.attrs.get("dedupe_qa", pd.DataFrame())
         cayd_dedupe_qa.to_csv(output/"01_caydence_structure_dedupe_qa.csv", index=False)
         if not cayd_dedupe_qa.empty:
-            info(f"Caydence Structures: {len(cayd_dedupe_qa)} duplicate records of shared supports removed")
+            info(f"Caydence Structures: {len(cayd_dedupe_qa)} duplicate records removed")
 
         deliverables=output.parent/"deliverables"
         structure_source_fields=list(
