@@ -9560,7 +9560,8 @@ def recover_terminal_2d_from_3d(
             out.at[idx,'LENGTH_M']=float(new_geom.length)*unit_to_m
     return out, pd.DataFrame(qa,columns=['CIRCUIT','PART','SIDE','ACTION','WIRE_ID','EXTENSION_M']), rows_to_gdf(extras,formal_2d.crs)
 
-def trim_branch_overlaps(formal_2d, unit_to_m, tol_m=3.0, min_overlap_m=3.0, step_m=1.0):
+def trim_branch_overlaps(formal_2d, unit_to_m, tol_m=3.0, min_overlap_m=3.0, step_m=1.0,
+                         node_snap_m=5.0):
     """R01.05 (20/11): a branch part must not run on top of the main line.
 
     At a fork the TAP part often starts with spans shared with MAIN (C39 1605:
@@ -9609,12 +9610,30 @@ def trim_branch_overlaps(formal_2d, unit_to_m, tol_m=3.0, min_overlap_m=3.0, ste
                 continue
             core = substring(part, s0, s1)
             cs = [tuple(c[:2]) for c in core.coords]
+            node_r = node_snap_m / unit_to_m
+            other_vertices = [tuple(c[:2]) for ln in getattr(others, "geoms", [others])
+                              for c in ln.coords]
+
+            def junction(pt):
+                # 20/11: join at the main line's vertex (the fork Structure node)
+                # when one is close, not at an arbitrary point on its segment.
+                q = nearest_points(others, Point(pt))[0]
+                if other_vertices:
+                    v = min(other_vertices, key=lambda c: math.hypot(c[0] - q.x, c[1] - q.y))
+                    if math.hypot(v[0] - q.x, v[1] - q.y) <= node_r:
+                        return v
+                return (q.x, q.y)
+
+            def clean(head, seq):
+                # drop vertices still hugging the junction so the branch leaves it straight
+                out = list(seq)
+                while len(out) > 1 and math.hypot(out[0][0] - head[0], out[0][1] - head[1]) <= tol:
+                    out.pop(0)
+                return [head] + out
             if s0 > 0:
-                p0 = nearest_points(others, Point(cs[0]))[0]
-                cs = [(p0.x, p0.y)] + cs
+                cs = clean(junction(cs[0]), cs)
             if s1 < L:
-                p1 = nearest_points(others, Point(cs[-1]))[0]
-                cs = cs + [(p1.x, p1.y)]
+                cs = list(reversed(clean(junction(cs[-1]), list(reversed(cs)))))
             kept.append(LineString(cs))
             changed = True
             qa.append({"CIRCUIT": txt(rec.get("CIRCUIT")), "ROW": txt(rec.get("ROW")), "PART": pi,

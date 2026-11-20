@@ -360,3 +360,8 @@ The only new same-voltage crossing is the C12 3195 tap into its substation, whic
 - Only the split at a fork (which branch continues the main line) can differ.
 
 **C39 310 end.** The last span lies in Management Unit CT-17-1, so it belongs to CT_17 and is delivered with that RoW, not with CT_16. This is by design.
+
+## AF. Fork junction on the Structure node (20/11)
+After a branch overlap is trimmed, the branch now rejoins the main line at the main line's nearest **vertex**, which is the fork Structure node, when one is within 5 m. Vertices still within 3 m of the junction are dropped, so the branch leaves the node straight.
+
+Before, it joined at the nearest point on a main segment. On C39 1500 at ST00048 (6037A) this made a 1.5 m hook beside the Structure.
