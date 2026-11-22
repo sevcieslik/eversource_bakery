@@ -45,7 +45,7 @@ Geometry deliverables: ...\deliverables
 <tr><td>Substation terminal</td><td>Endpoint within/on source SQLite substation polygon is valid without a Tower Top POA.</td></tr>
 <tr><td>Product 267 omissions</td><td>DXF→GPKG→actual delivered SHP discrepancy. Inspect boundaries and RoW ownership.</td></tr>
 </table>
-<p><strong>Installation:</strong> the Bakery distribution must include <code>scripts/05_run_geometry_qa.py</code>, <code>scripts/qa_inspector.py</code> (v0.3) and its dependencies from <code>scripts/requirements_geometry_qa.txt</code>. If the engine is missing, the GUI displays an actionable error instead of silently reporting success.</p>
+<p><strong>Installation:</strong> QA Inspector v0.3 is bundled at <code>scripts/qa_inspector.py</code>, alongside <code>scripts/05_run_geometry_qa.py</code>. Run the standard <code>setup_eversource.bat</code> to install all Geometry and QA dependencies together in the shared <code>scripts/.venv</code>. When upgrading an existing installation, rerun setup once. No separate QA ZIP, pip command or venv is needed.</p>
 <p class="note">Current QA findings are suggestions for review; correcting missing structures or replacing geometry requires operator action and approved Bakery re-export. For repeated runs check the report's run metadata before accepting results.</p>
 </section>
 <section id="regpkg" class="section"><h2>08 / Fix in the QA GeoPackage and re-export</h2>
