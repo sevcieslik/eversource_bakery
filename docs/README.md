@@ -4,7 +4,7 @@
 
 After completing Geometry, choose **Run Geometry QA** in the GUI. Bakery automatically provides the current project's original wires and POA DXFs, source Structures (SHP or ZIP), SoW SQLite, one Geometry GPKG and the actual deliverables 45/80/267. The independent QA engine is read-only: no Geometry rerun and no modification of source or delivered data.
 
-The GUI uses `scripts/05_run_geometry_qa.py` and bundles the separately distributed **QA Inspector v0.3** engine at `scripts/qa_inspector.py`. **Install/overlay the engine** from `Eversource_QA_Inspector_v0_3_Package.zip` into Bakery's `scripts/` folder; this new branch does not itself embed the large engine source. Before running QA install `python -m pip install -r scripts/requirements_geometry_qa.txt` in Bakery's runtime.
+The GUI runs `scripts/05_run_geometry_qa.py` with the **bundled QA Inspector v0.3** at `scripts/qa_inspector.py`. The normal `setup_eversource.bat` installs Geometry and QA dependencies into the same `scripts/.venv`, using `scripts/requirements_eversource.txt`. No separate QA overlay or pip command is required. After updating an existing installation, rerun `setup_eversource.bat` once to install newly introduced QA packages.
 
 The runner validates prerequisites, requires an unambiguous DXF and matching source/SQLite, and stages output. On success, the report lives at `output/QA/geometry_validation/QA_Report.html` with `QA_Issues.gpkg`, CSVs, scorecards, maps and run manifest. Previous successful QA is archived; failed runs retain previous results. **QA Results** reopens the current report. A successful validator run means **QA COMPLETE – REVIEW REQUIRED** and does not auto-authorize client delivery.
 
