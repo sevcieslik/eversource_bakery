@@ -1,5 +1,18 @@
 # Eversource Tester R01.05-test
 
+## Geometry QA integration (v0.3)
+
+After completing Geometry, choose **Run Geometry QA** in the GUI. Bakery automatically provides the current project's original wires and POA DXFs, source Structures (SHP or ZIP), SoW SQLite, one Geometry GPKG and the actual deliverables 45/80/267. The independent QA engine is read-only: no Geometry rerun and no modification of source or delivered data.
+
+The GUI uses `scripts/05_run_geometry_qa.py` and bundles the separately distributed **QA Inspector v0.3** engine at `scripts/qa_inspector.py`. **Install/overlay the engine** from `Eversource_QA_Inspector_v0_3_Package.zip` into Bakery's `scripts/` folder; this new branch does not itself embed the large engine source. Before running QA install `python -m pip install -r scripts/requirements_geometry_qa.txt` in Bakery's runtime.
+
+The runner validates prerequisites, requires an unambiguous DXF and matching source/SQLite, and stages output. On success, the report lives at `output/QA/geometry_validation/QA_Report.html` with `QA_Issues.gpkg`, CSVs, scorecards, maps and run manifest. Previous successful QA is archived; failed runs retain previous results. **QA Results** reopens the current report. A successful validator run means **QA COMPLETE – REVIEW REQUIRED** and does not auto-authorize client delivery.
+
+The terminal checks differentiate a genuinely missing structure (T01) from a real supported 2D terminal with lateral offset (T02), including SCSP/trident layouts. SQLite source substation polygons exempt valid no-POA terminals. The inspector uses only one run; no GPKG-to-GPKG comparisons. After re-export, rerun QA to check the new deliverables.
+
+See the offline [operator manual](operator_manual.html) section **Run Geometry QA after processing**, and [Geometry QA integration notes](GEOMETRY_QA_INTEGRATION.md).
+
+
 **R01.05-test** is the current **test build** for operator UAT. **R01.04** remains the last accepted release. The initial R01.00 geometry deliverables for CT_17 and CT_33 were reviewed and accepted by the project operator.
 
 Detailed changes and test results: [`docs/RELEASE_NOTES_R01.05-test.md`](RELEASE_NOTES_R01.05-test.md).
