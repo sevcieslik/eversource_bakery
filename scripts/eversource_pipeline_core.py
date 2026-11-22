@@ -90,7 +90,7 @@ import tempfile
 import time
 import zipfile
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -105,8 +105,9 @@ import pandas as pd
 import pyogrio
 from pyproj import CRS, Transformer
 from scipy.spatial import cKDTree, Delaunay, QhullError
+import shapely
 from shapely.geometry import LineString, MultiLineString, Point, box
-from shapely.ops import linemerge, transform, unary_union
+from shapely.ops import linemerge, nearest_points, transform, unary_union
 
 try:
     import laspy
@@ -320,9 +321,52 @@ def rows_to_gdf(rows, crs, geom_col="geometry"):
     return gpd.GeoDataFrame({geom_col: gpd.GeoSeries([], crs=crs)}, geometry=geom_col, crs=crs)
 
 
+def _gpkg_safe_temporal_columns(gdf, layer: str):
+    """Prevent pandas/pyogrio datetime-to-timedelta cast failures in QA GeoPackages.
+
+    Only QA GPKG copies are normalised; delivered SHP/source fields are unchanged.
+    ISO-8601 strings retain dates and timezone offsets without relying on pyogrio's
+    datetime implementation, which varies with the installed pandas version.
+    """
+    import datetime as _datetime
+
+    result = gdf
+    converted = []
+    for col in gdf.columns:
+        if col == gdf.geometry.name:
+            continue
+        series = gdf[col]
+        dtype = series.dtype
+        temporal = pd.api.types.is_datetime64_any_dtype(dtype) or pd.api.types.is_timedelta64_dtype(dtype)
+        if not temporal and pd.api.types.is_object_dtype(dtype):
+            non_null = series.dropna()
+            temporal = bool(len(non_null)) and isinstance(non_null.iloc[0], (_datetime.datetime, _datetime.date, _datetime.timedelta, pd.Timestamp, pd.Timedelta))
+        if not temporal:
+            continue
+        if result is gdf:
+            result = gdf.copy()
+        result[col] = series.map(
+            lambda v: None if pd.isna(v) else v.isoformat() if hasattr(v, "isoformat") else str(v)
+        ).astype(object)
+        converted.append(str(col))
+    if converted:
+        info(f"  QA GPKG '{layer}': serialised temporal fields as ISO text: {', '.join(converted)}")
+    return result
+
+
 def write_layer(gdf, gpkg: Path, layer: str):
-    if gdf is not None and not gdf.empty:
-        gdf.to_file(gpkg, layer=layer, driver="GPKG", engine="pyogrio", index=False)
+    if gdf is None or gdf.empty:
+        return
+    try:
+        safe = _gpkg_safe_temporal_columns(gdf, layer)
+        safe.to_file(gpkg, layer=layer, driver="GPKG", engine="pyogrio", index=False)
+    except Exception as exc:
+        field_types = {str(k): str(v) for k, v in gdf.dtypes.items()}
+        raise RuntimeError(
+            f"Failed writing QA GeoPackage layer '{layer}' ({len(gdf)} features). "
+            f"Original error: {type(exc).__name__}: {exc}. "
+            f"Field dtypes: {field_types}"
+        ) from exc
 
 
 class UnionFind:
@@ -385,6 +429,7 @@ def _archive_qa_run(
     manifest = {
         "qa_archive_version": 1,
         "created_utc": datetime.now(timezone.utc).isoformat(),
+        "bakery": _bakery_build_dict(),
         "stage": stage,
         "products": product_list,
         "selected_rows": sorted({txt(x) for x in (selected_rows or []) if txt(x)}),
@@ -565,25 +610,270 @@ def read_dxf_structure_points(path: Path, crs, unit_to_m: float,
     return gpd.GeoDataFrame(out, geometry="geometry", crs=crs)
 
 
-def build_support_sites(points: gpd.GeoDataFrame, unit_to_m: float, support_cluster_m: float):
+def _circuit_tokens(value) -> set[str]:
+    """Treat source LINE_NO='1080/1490' as two circuits, not '10801490'."""
+    return {circuit_key(part) for part in re.split(r"[/;,|]+", txt(value)) if circuit_key(part)}
+
+
+def _load_sow_circuits(source_root: Path, crs, kmz_refs=None):
+    """Prefer SoW SQLite line geometry. Fall back to projected SoW KMZ.
+
+    Users can put the SQLite in source/ or set EVERSOURCE_SOW_SQLITE.
+    No hardcoded mapped-drive dependency is required for portable tester runs.
+    """
+    env = txt(os.getenv("EVERSOURCE_SOW_SQLITE"))
+    paths = ([Path(env)] if env else []) + sorted(source_root.glob("*.sqlite"))
+    # The project-level canonical source is an optional convenience on Windows.
+    paths += [Path(r"W:\NMIP26068\products\project\project\190_sow\v3\SoW_Validation\damson_ingestion\NMIP26068-PM-SoW-KMZ-A01_DB.sqlite")]
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            g = gpd.read_file(path, layer="circuits")
+            if g.crs is None:
+                raise ValueError("SoW circuits missing CRS")
+            g = g.to_crs(crs)
+            columns = {str(c).lower(): c for c in g.columns}
+            key_col = next((columns[k] for k in ("nm entity reference", "circuit", "line_no", "name") if k in columns), None)
+            if key_col is None:
+                # Find a column whose values contain recurring circuit identifiers.
+                key_col = next((c for c in g.columns if any(t in str(c).lower() for t in ("reference", "circuit"))), None)
+            if key_col is None:
+                raise ValueError("No SoW circuit identifier column")
+            rows = []
+            for _, r in g.iterrows():
+                for k in _circuit_tokens(r[key_col]):
+                    if r.geometry is not None and not r.geometry.is_empty:
+                        rows.append({"CIRCUIT": k, "geometry": r.geometry})
+            if rows:
+                info(f"  SoW circuit ownership: {path.name} ({len(rows):,} reference lines)")
+                return rows
+        except Exception as exc:
+            info(f"  SoW SQLite not used ({path}): {exc}")
+    rows = []
+    for r in (kmz_refs or []):
+        if r.geometry is not None and not r.geometry.is_empty:
+            rows.append({"CIRCUIT": circuit_key(r.circuit), "geometry": r.geometry})
+    info(f"  SoW circuit ownership: KMZ fallback ({len(rows):,} reference lines)")
+    return rows
+
+
+def assign_poa_circuit_ownership(points: gpd.GeoDataFrame, sow_rows, unit_to_m: float, wires=None):
+    """Find nearest SoW circuit to every POA, before support clustering.
+
+    This is a topology partition, not the final circuit attribution.
+    Wire tracks are still classified downstream. Ties are reviewable, rather
+    than silently merging distinct circuit corridors.
+    """
+    import shapely
+    by_circuit = defaultdict(list)
+    for r in sow_rows:
+        if txt(r.get("CIRCUIT")) and r.get("geometry") is not None:
+            by_circuit[circuit_key(r["CIRCUIT"])].append(r["geometry"])
+    refs = {k: unary_union(geoms) for k, geoms in by_circuit.items() if geoms}
+    output = points.copy().reset_index(drop=True)
+    ownership, dists, margins = [], [], []
+    for geom in output.geometry:
+        ranking = sorted((float(geom.distance(ref)) * unit_to_m, k) for k, ref in refs.items())
+        ownership.append(ranking[0][1] if ranking else "")
+        dists.append(ranking[0][0] if ranking else np.nan)
+        margins.append(ranking[1][0]-ranking[0][0] if len(ranking)>1 else np.nan)
+    output["SOW_CIRCUIT"] = ownership
+    output["SOW_DIST_M"] = dists
+    output["SOW_MARGIN_M"] = margins
+    # Raw-wire endpoints are a stronger circuit clue than the nearest SoW
+    # line in close parallel corridors. Only override with consistent evidence.
+    output["WIRE_CIRCUIT"] = ""
+    output["WIRE_VOTES"] = 0
+    if wires is not None and not wires.empty and refs:
+        point_xy = np.column_stack([output.geometry.x, output.geometry.y])
+        marker_tree = cKDTree(point_xy)
+        vote = defaultdict(list)
+        radius = 3.0 / unit_to_m
+        # For performance consider only circuits near the wire midpoint,
+        # not all ~790 SoW segments in every wire sample.
+        ref_items = list(refs.items())
+        ref_shapes = [v for _, v in ref_items]
+        from shapely.strtree import STRtree
+        ref_tree = STRtree(ref_shapes)
+        for _, wr in wires.iterrows():
+            geom = force_2d(wr.geometry)
+            if geom is None or geom.is_empty or geom.length <= 1e-9:
+                continue
+            a = geom.interpolate(0.0)
+            b = geom.interpolate(geom.length)
+            near = []
+            for pt in (a, b):
+                dd, pi = marker_tree.query([pt.x, pt.y])
+                if float(dd) <= radius:
+                    near.append(int(pi))
+            if not near:
+                continue
+            mids = [geom.interpolate(f, normalized=True) for f in (0.2, 0.5, 0.8)]
+            matches = set()
+            for pt in mids:
+                for ri in ref_tree.query(pt.buffer(30.0/unit_to_m)):
+                    matches.add(int(ri))
+            if not matches:
+                continue
+            scored = sorted((sum(pt.distance(ref_shapes[i]) for pt in mids), ref_items[i][0]) for i in matches)
+            if len(scored) > 1 and scored[1][0] - scored[0][0] <= 1.0 / unit_to_m:
+                continue  # unresolved near-parallel source line ambiguity
+            winner = scored[0][1]
+            for pi in near:
+                vote[pi].append(winner)
+        for pi, labels in vote.items():
+            counts = Counter(labels)
+            chosen, count = counts.most_common(1)[0]
+            second = counts.most_common(2)[1][1] if len(counts)>1 else 0
+            if count >= 2 and count > second:
+                output.at[pi, "WIRE_CIRCUIT"] = chosen
+                output.at[pi, "WIRE_VOTES"] = count
+                output.at[pi, "SOW_CIRCUIT"] = chosen
+    return output
+
+
+SUPPORT_ATTACH_M = 3.0
+
+
+def _split_parallel_line_groups(groups, points, wires, unit_to_m, attach_m=SUPPORT_ATTACH_M):
+    """R01.05: undo distance-only merges of POAs that belong to separate lines.
+
+    Two POAs of separate parallel structures can lie within the support radius
+    (Cluster 17 ST00665: C129 and G128 POAs 14.3 m apart; Cluster 12 ST01172).
+    A POA is a through point of its own line when the conductors attached to it
+    (endpoint within attach_m) lead to two different neighbouring supports on
+    opposite sides. A merged group is split only when at least two such
+    through POAs lead to disjoint neighbours. POAs that lead one way only
+    (e.g. one pole per phase at an angle structure) stay together.
+    Returns (new_groups, qa_rows).
+    """
+    if wires is None or wires.empty or not groups:
+        return groups, []
+    xy = np.column_stack([points.geometry.x, points.geometry.y])
+    tree = cKDTree(xy)
+    tol = attach_m / unit_to_m
+    gid = {}
+    for g, inds in groups.items():
+        for i in inds:
+            gid[i] = g
+    multi = {g for g, inds in groups.items() if len(inds) >= 2}
+    if not multi:
+        return groups, []
+    nbr = defaultdict(lambda: defaultdict(list))  # marker -> neighbour group -> [xy]
+    for geom in wires.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        parts = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+        for part in parts:
+            c = list(part.coords)
+            if len(c) < 2:
+                continue
+            a, b = c[0][:2], c[-1][:2]
+            da, ia = tree.query(a)
+            db, ib = tree.query(b)
+            if da > tol or db > tol:
+                continue
+            ia, ib = int(ia), int(ib)
+            ga, gb = gid[ia], gid[ib]
+            if ga == gb:
+                continue
+            if ga in multi:
+                nbr[ia][gb].append(xy[ib])
+            if gb in multi:
+                nbr[ib][ga].append(xy[ia])
+    out = {}
+    qa = []
+    for g, inds in groups.items():
+        if g not in multi:
+            out[g] = inds
+            continue
+        through = []
+        for i in inds:
+            dirs = []
+            for pts in nbr[i].values():
+                v = np.mean(pts, axis=0) - xy[i]
+                n = float(np.hypot(*v))
+                if n > 0:
+                    dirs.append(v / n)
+            opposite = any(float(np.dot(dirs[a], dirs[b])) < 0.0
+                           for a in range(len(dirs)) for b in range(a + 1, len(dirs)))
+            if len(nbr[i]) >= 2 and opposite:
+                through.append(i)
+        if len(through) < 2:
+            out[g] = inds
+            continue
+        # Union through POAs that share a neighbour; disjoint ones are separate lines.
+        uf = UnionFind(len(through))
+        for a in range(len(through)):
+            for b in range(a + 1, len(through)):
+                if set(nbr[through[a]]) & set(nbr[through[b]]):
+                    uf.union(a, b)
+        seeds = defaultdict(list)
+        for k, i in enumerate(through):
+            seeds[uf.find(k)].append(i)
+        if len(seeds) < 2:
+            out[g] = inds
+            continue
+        sub = {r: list(m) for r, m in seeds.items()}
+        for i in inds:
+            if i in through:
+                continue
+            best = None
+            for r, members in sub.items():
+                shared = set(nbr[i]) & set().union(*(set(nbr[m]) for m in members))
+                d = min(float(np.hypot(*(xy[i] - xy[m]))) for m in members)
+                key = (0 if shared else 1, d)
+                if best is None or key < best[0]:
+                    best = (key, r)
+            sub[best[1]].append(i)
+        parts = sorted(sub.values(), key=lambda m: min(m))
+        out[g] = sorted(parts[0])
+        for k, m in enumerate(parts[1:], 1):
+            out[(g, "split", k)] = sorted(m)
+        span = max(float(np.hypot(*(xy[a] - xy[b]))) for a in inds for b in inds) * unit_to_m
+        qa.append({"GROUP": str(g), "N_POA": len(inds), "N_PARTS": len(parts),
+                   "SPREAD_M": round(span, 2),
+                   "X": float(xy[inds].mean(axis=0)[0]), "Y": float(xy[inds].mean(axis=0)[1])})
+    return out, qa
+
+
+def build_support_sites(points: gpd.GeoDataFrame, unit_to_m: float, support_cluster_m: float,
+                        wires: gpd.GeoDataFrame | None = None):
     """Cluster nearby contractor attachment markers into one physical support site.
 
     This intentionally only creates a support topology key. It does NOT move source
     wire geometry. The final wire is always derived from an actual source conductor.
+    With wires given (R01.05), POAs of separate parallel lines merged by distance
+    alone are split again (see _split_parallel_line_groups). Supports created by a
+    split are numbered after all others, so existing support IDs do not change.
     """
     xy = np.column_stack([points.geometry.x, points.geometry.y])
     tree = cKDTree(xy)
     uf = UnionFind(len(points))
     radius = support_cluster_m / unit_to_m
     for a, b in tree.query_pairs(r=max(radius, 1e-9)):
+        ca = txt(points.iloc[int(a)].get("SOW_CIRCUIT"))
+        cb = txt(points.iloc[int(b)].get("SOW_CIRCUIT"))
+        # Never collapse a 1210 POA and a 1220 POA purely on distance.
+        if ca and cb and ca != cb:
+            continue
         uf.union(int(a), int(b))
     groups = defaultdict(list)
     for i in range(len(points)):
         groups[uf.find(i)].append(i)
+    split_qa = []
+    if wires is not None:
+        groups, split_qa = _split_parallel_line_groups(dict(groups), points, wires, unit_to_m)
+        # Keep original numbering; split-off parts go last.
+        ordered = [v for k, v in groups.items() if not isinstance(k, tuple)] + \
+                  [v for k, v in groups.items() if isinstance(k, tuple)]
+    else:
+        ordered = list(groups.values())
 
     rows = []
     point_to_support = {}
-    for n, inds in enumerate(groups.values(), 1):
+    for n, inds in enumerate(ordered, 1):
         sg = points.iloc[inds]
         x = float(sg.geometry.x.mean())
         y = float(sg.geometry.y.mean())
@@ -599,7 +889,11 @@ def build_support_sites(points: gpd.GeoDataFrame, unit_to_m: float, support_clus
             "X": x, "Y": y, "Z": z,
             "geometry": Point(x, y, z),
         })
-    return gpd.GeoDataFrame(rows, geometry="geometry", crs=points.crs), point_to_support
+    out = gpd.GeoDataFrame(rows, geometry="geometry", crs=points.crs)
+    out.attrs["split_qa"] = split_qa
+    if split_qa:
+        info(f"Supports split into separate parallel-line structures: {len(split_qa)}")
+    return out, point_to_support
 
 
 def _wire_endpoint_tangent(geom, at_start: bool, sample_source: float) -> np.ndarray | None:
@@ -722,7 +1016,12 @@ def discover_lidar_files(source: Path, temp_dir: Path) -> list[Path]:
         root = temp_dir / "lidar_source"
         root.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(source) as zf:
-            zf.extractall(root)
+            members = [m for m in zf.infolist()
+                       if not m.is_dir() and Path(m.filename).suffix.lower() in {".las", ".laz"}]
+            info(f"Extracting {len(members):,} LiDAR file(s) from {source.name}...")
+            for k, m in enumerate(members, 1):
+                zf.extract(m, root)
+                console_progress("lidar_unzip", "LiDAR | unzip", k, len(members), Path(m.filename).name)
         files = sorted([p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {".las", ".laz"}])
         if not files:
             raise RuntimeError("No LAS/LAZ files found inside LiDAR ZIP")
@@ -819,6 +1118,227 @@ def _horizontal_crs_label(crs) -> str:
         return str(c)
 
 
+# =============================================================================
+# R01.02 - CLASSIFIED LiDAR EVIDENCE FOR CAYDENCE CONDUCTOR ROLE
+# =============================================================================
+class _WireLidarVotes:
+    """Stream class 187/210 once alongside Geometry's class-2 ground sampling.
+
+    Sample the *observed DXF 3D* conductor, not the generated 2D product or
+    subsequent PLS XYZ exports. Matching is full XYZ and each LiDAR point votes
+    for at most one conductor. Votes cannot alter source wire geometry/circuit.
+    """
+    def __init__(self, wires, unit_to_m, sample_step_m=1.5, max_dist_m=1.5):
+        self.wires = wires.reset_index(drop=True)
+        self.unit_to_m = float(unit_to_m)
+        self.threshold = float(max_dist_m / unit_to_m)
+        self.counts = np.zeros((len(self.wires), 2), dtype=np.int64)
+        self.sample_hits = [set() for _ in range(len(self.wires))]
+        self.files_seen = 0
+        samples, owners = [], []
+        for i, geom in enumerate(self.wires.geometry):
+            if geom is None or geom.is_empty: continue
+            parts = list(geom.geoms) if hasattr(geom, 'geoms') else [geom]
+            for part in parts:
+                if not hasattr(part, 'coords'): continue
+                coords = np.asarray(part.coords, dtype=float)
+                if len(coords) < 2 or coords.shape[1] < 3: continue
+                # Vectorised; same values and order as np.linspace(0, 1, n+1)
+                # per segment (step = 1/n, last value exactly 1.0).
+                starts = coords[:-1, :3]
+                ends = coords[1:, :3]
+                for start, end in zip(starts, ends):
+                    length = float(np.linalg.norm((end-start)[:3])) * unit_to_m
+                    n = max(1, int(np.ceil(length / sample_step_m)))
+                    t = np.arange(n + 1, dtype=float) * (1.0 / n)
+                    t[-1] = 1.0
+                    t = t[:, None]
+                    samples.append(start * (1 - t) + end * t)
+                    owners.append(np.full(n + 1, i, dtype=np.int32))
+        if samples:
+            self.xyz = np.ascontiguousarray(np.vstack(samples), dtype=np.float64)
+            self.owners = np.concatenate(owners).astype(np.int32)
+            self.tree = cKDTree(self.xyz)
+            self.xy_min = np.min(self.xyz[:, :2],axis=0)-self.threshold
+            self.xy_max = np.max(self.xyz[:, :2],axis=0)+self.threshold
+        else:
+            self.xyz = np.empty((0, 3))
+            self.owners = np.empty(0, dtype=np.int32)
+            self.tree = None
+            self.xy_min = self.xy_max = np.zeros(2)
+
+    def overlaps(self, mins, maxs):
+        return self.tree is not None and bool(np.all(maxs >= self.xy_min) and np.all(mins <= self.xy_max))
+
+    def add_chunk(self, chunk, classification):
+        if self.tree is None: return
+        take = (classification == 187) | (classification == 210)
+        if not np.any(take): return
+        xyz = np.column_stack((np.asarray(chunk.x)[take], np.asarray(chunk.y)[take], np.asarray(chunk.z)[take]))
+        labels = classification[take]
+        within = (xyz[:,0] >= self.xy_min[0]) & (xyz[:,0] <= self.xy_max[0]) & (xyz[:,1] >= self.xy_min[1]) & (xyz[:,1] <= self.xy_max[1])
+        if not np.any(within): return
+        xyz = xyz[within]; labels = labels[within]
+        # Search capped in full 3D. Unmatched points cannot contaminate votes.
+        distances, sid = self.tree.query(xyz, k=1, distance_upper_bound=self.threshold, workers=1)
+        valid = np.isfinite(distances) & (sid < len(self.owners))
+        if not np.any(valid): return
+        sid = sid[valid]
+        owner = self.owners[sid]
+        label = labels[valid]
+        np.add.at(self.counts, (owner, np.where(label == 187, 0, 1)), 1)
+        # Support must span several locations along the actual wire, not one clump.
+        for w, sample in np.unique(np.column_stack((owner, sid)), axis=0):
+            self.sample_hits[int(w)].add(int(sample))
+
+    def apply(self, cayd_w, min_votes=12, min_samples=4, dominance=0.80):
+        out = cayd_w.copy()
+        report = []
+        for i, r in out.iterrows():
+            source_idx = int(r.get('SOURCE_IDX', i))
+            if source_idx >= len(self.counts) or source_idx < 0: continue
+            p, e = map(int, self.counts[source_idx])
+            total = p+e
+            samples = len(self.sample_hits[source_idx])
+            previous = txt(r.get('WIRE_TYPE')).upper()
+            explicit = _infer_caydence_wire_type(txt(r.get('SRC_LAYER')), '')
+            confidence = max(p, e) / total if total else 0.
+            method = 'INSUFFICIENT_LIDAR'
+            outcome = previous
+            if explicit in ('EARTH','PHASE','GUY'):
+                method = 'EXPLICIT_DXF_LEVEL'
+                outcome = explicit
+            elif total >= min_votes and samples >= min_samples and confidence >= dominance:
+                method = 'LIDAR_CLASS_187_210'
+                outcome = 'EARTH' if e > p else 'PHASE'
+            out.at[i, 'WIRE_TYPE'] = outcome
+            report.append({'ROW':txt(r.get('ROW')), 'CIRCUIT':txt(r.get('CIRCUIT')),
+                'WIRE_ID':txt(r.get('WIRE_ID')), 'SOURCE_IDX':source_idx,
+                'PRIOR_TYPE':previous, 'FINAL_TYPE':outcome, 'METHOD':method,
+                'CLASS187_POINTS':p, 'CLASS210_POINTS':e,
+                'MATCHED_SAMPLES':samples, 'CONFIDENCE':round(float(confidence),4),
+                'LIDAR_FILES_SCANNED':self.files_seen})
+        return out, pd.DataFrame(report)
+
+
+_LIDAR_WORKER: dict[str, Any] = {}
+
+
+def _lidar_workers(requested, n_jobs) -> int:
+    """Worker processes for LiDAR sampling: --workers, BAKERY_WORKERS, or auto."""
+    try:
+        n = int(requested) if requested else int(os.environ.get("BAKERY_WORKERS", "0") or 0)
+    except ValueError:
+        n = 0
+    if n <= 0:
+        n = max(1, min(8, (os.cpu_count() or 2) - 1))
+    return max(1, min(n, max(1, n_jobs)))
+
+
+def _lidar_worker_init(wire_xyz, wire_owners, threshold, xy_min, xy_max):
+    _LIDAR_WORKER.clear()
+    if wire_xyz is not None and len(wire_xyz):
+        _LIDAR_WORKER["tree"] = cKDTree(wire_xyz)
+        _LIDAR_WORKER["owners"] = wire_owners
+        _LIDAR_WORKER["threshold"] = float(threshold)
+        _LIDAR_WORKER["xy_min"] = xy_min
+        _LIDAR_WORKER["xy_max"] = xy_max
+    else:
+        _LIDAR_WORKER["tree"] = None
+
+
+def _open_las_xyz_class(path):
+    """Open LAS/LAZ decompressing only XY, Z and classification where the
+    format allows (LAS 1.4 point formats 6-10, laspy >= 2.4). Other fields
+    are not used here; older laspy or formats fall back to a full read."""
+    try:
+        from laspy import DecompressionSelection as _D
+        sel = _D.XY_RETURNS_CHANNEL | _D.Z | _D.CLASSIFICATION
+        return laspy.open(path, decompression_selection=sel)
+    except (ImportError, AttributeError, TypeError):
+        return laspy.open(path)
+
+
+def _lidar_sample_file(job):
+    """One LiDAR tile: class-2 ground candidates near structures and class
+    187/210 votes for observed 3D conductors (same rules as _WireLidarVotes)."""
+    path, hit, local_queries, wire_overlap, max_radius_src, max_fit_points = job
+    W = _LIDAR_WORKER
+    tree_w = W.get("tree")
+    cands = []
+    vote_keys, pairs = [], []
+    try:
+        with _open_las_xyz_class(path) as fh:
+            for chunk in fh.chunk_iterator(2_000_000):
+                try:
+                    cls = np.asarray(chunk.classification)
+                except Exception:
+                    continue
+                if wire_overlap and tree_w is not None:
+                    take = (cls == 187) | (cls == 210)
+                    if np.any(take):
+                        xyz = np.column_stack((np.asarray(chunk.x)[take], np.asarray(chunk.y)[take],
+                                               np.asarray(chunk.z)[take]))
+                        labels = cls[take]
+                        lo, hi = W["xy_min"], W["xy_max"]
+                        within = ((xyz[:, 0] >= lo[0]) & (xyz[:, 0] <= hi[0]) &
+                                  (xyz[:, 1] >= lo[1]) & (xyz[:, 1] <= hi[1]))
+                        if np.any(within):
+                            xyz = xyz[within]; labels = labels[within]
+                            dist, sid = tree_w.query(xyz, k=1, distance_upper_bound=W["threshold"], workers=1)
+                            valid = np.isfinite(dist) & (sid < len(W["owners"]))
+                            if np.any(valid):
+                                sid = sid[valid]
+                                owner = W["owners"][sid].astype(np.int64)
+                                lab = np.where(labels[valid] == 187, 0, 1)
+                                vote_keys.append(owner * 2 + lab)
+                                pairs.append(np.unique(np.column_stack((owner, sid)), axis=0))
+                mask = cls == 2
+                if len(hit) == 0 or not np.any(mask):
+                    continue
+                x = np.asarray(chunk.x)[mask]
+                y = np.asarray(chunk.y)[mask]
+                z = np.asarray(chunk.z)[mask]
+                # Only ground within the search radius of a structure matters:
+                # keep points in grid cells next to a structure (cell = radius)
+                # before building the KD-tree. The kept set is a superset of
+                # every point any structure query can return.
+                if len(x):
+                    cell = float(max_radius_src)
+                    px = np.floor(x / cell).astype(np.int64)
+                    py = np.floor(y / cell).astype(np.int64)
+                    qx = np.floor(local_queries[:, 0] / cell).astype(np.int64)
+                    qy = np.floor(local_queries[:, 1] / cell).astype(np.int64)
+                    off = np.array([-1, 0, 1], dtype=np.int64)
+                    nx = (qx[:, None, None] + off[None, :, None]).repeat(3, axis=2).ravel()
+                    ny = (qy[:, None, None] + off[None, None, :]).repeat(3, axis=1).ravel()
+                    big = np.int64(1) << np.int64(32)
+                    keep = np.isin(px * big + py, np.unique(nx * big + ny))
+                    x, y, z = x[keep], y[keep], z[keep]
+                if len(x) == 0:
+                    continue
+                tree = cKDTree(np.column_stack([x, y]))
+                for local_i, global_i in enumerate(hit):
+                    ids = tree.query_ball_point(local_queries[local_i], r=max_radius_src)
+                    if not ids:
+                        continue
+                    q = local_queries[local_i]
+                    ids_arr = np.asarray(ids, dtype=int)
+                    d = np.hypot(x[ids_arr] - q[0], y[ids_arr] - q[1])
+                    for j in np.argsort(d)[:max_fit_points]:
+                        cands.append((int(global_i), float(d[j]), float(x[ids_arr[j]]),
+                                      float(y[ids_arr[j]]), float(z[ids_arr[j]])))
+    except Exception as exc:
+        raise RuntimeError(f"Failed reading LiDAR {path}: {exc}") from exc
+    if vote_keys:
+        uk, cnt = np.unique(np.concatenate(vote_keys), return_counts=True)
+        pr = np.unique(np.concatenate(pairs), axis=0)
+    else:
+        uk = np.empty(0, dtype=np.int64); cnt = np.empty(0, dtype=np.int64)
+        pr = np.empty((0, 2), dtype=np.int64)
+    return {"cands": cands, "vote_keys": uk, "vote_counts": cnt, "pairs": pr}
+
+
 def add_ground_elevation_from_lidar(
     structures: gpd.GeoDataFrame,
     lidar_source: Path,
@@ -827,6 +1347,8 @@ def add_ground_elevation_from_lidar(
     temp_dir: Path,
     search_radii_m: tuple[float, ...] = (3.0, 6.0, 12.0, 25.0),
     max_fit_points: int = 60,
+    wire_votes: _WireLidarVotes | None = None,
+    workers: int | None = None,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """Populate final circuit-structure Z from classified LiDAR ground (class 2).
 
@@ -854,7 +1376,16 @@ def add_ground_elevation_from_lidar(
     candidates: dict[int, list[tuple[float, float, float, float, str]]] = defaultdict(list)
     used_files = 0
 
-    for path in files:
+    # R01.05: read headers first, keep only tiles that hold a structure or an
+    # observed 3D conductor, then decompress those tiles in parallel worker
+    # processes with a progress bar. Results are merged in file order, so the
+    # output is identical to the former single-threaded loop.
+    wire_xy_tree = None
+    if wire_votes is not None and wire_votes.tree is not None:
+        wire_xy_tree = cKDTree(wire_votes.xyz[:, :2])
+    jobs = []
+    n_files = len(files)
+    for k, path in enumerate(files, 1):
         try:
             with laspy.open(path) as fh:
                 h = fh.header
@@ -867,50 +1398,76 @@ def add_ground_elevation_from_lidar(
                     )
                 mins = np.asarray(h.mins[:2], dtype=float)
                 maxs = np.asarray(h.maxs[:2], dtype=float)
-                hit = np.where(
-                    (qxy[:, 0] >= mins[0] - max_radius_src) &
-                    (qxy[:, 0] <= maxs[0] + max_radius_src) &
-                    (qxy[:, 1] >= mins[1] - max_radius_src) &
-                    (qxy[:, 1] <= maxs[1] + max_radius_src)
-                )[0]
-                if len(hit) == 0:
-                    continue
-                used_files += 1
-                local_queries = qxy[hit]
-                for chunk in fh.chunk_iterator(2_000_000):
-                    try:
-                        cls = np.asarray(chunk.classification)
-                    except Exception:
-                        continue
-                    mask = cls == 2
-                    if not np.any(mask):
-                        continue
-                    x = np.asarray(chunk.x)[mask]
-                    y = np.asarray(chunk.y)[mask]
-                    z = np.asarray(chunk.z)[mask]
-                    if len(x) == 0:
-                        continue
-                    pts = np.column_stack([x, y])
-                    tree = cKDTree(pts)
-                    for local_i, global_i in enumerate(hit):
-                        ids = tree.query_ball_point(local_queries[local_i], r=max_radius_src)
-                        if not ids:
-                            continue
-                        q = local_queries[local_i]
-                        ids_arr = np.asarray(ids, dtype=int)
-                        dx = x[ids_arr] - q[0]
-                        dy = y[ids_arr] - q[1]
-                        d = np.hypot(dx, dy)
-                        order = np.argsort(d)[:max_fit_points]
-                        for j in order:
-                            candidates[int(global_i)].append(
-                                (float(d[j]), float(x[ids_arr[j]]), float(y[ids_arr[j]]),
-                                 float(z[ids_arr[j]]), path.name)
-                            )
         except RuntimeError:
             raise
         except Exception as exc:
             raise RuntimeError(f"Failed reading LiDAR {path}: {exc}") from exc
+        console_progress("lidar_headers", "Mixing | LiDAR headers", k, n_files, path.name)
+        hit = np.where(
+            (qxy[:, 0] >= mins[0] - max_radius_src) &
+            (qxy[:, 0] <= maxs[0] + max_radius_src) &
+            (qxy[:, 1] >= mins[1] - max_radius_src) &
+            (qxy[:, 1] <= maxs[1] + max_radius_src)
+        )[0]
+        wire_overlap = False
+        if wire_xy_tree is not None and wire_votes.overlaps(mins, maxs):
+            th = wire_votes.threshold
+            c = (mins + maxs) / 2.0
+            rad = float(np.hypot(*(maxs - mins))) / 2.0 + th
+            for j in wire_xy_tree.query_ball_point(c, r=rad):
+                x, y = wire_votes.xyz[j, 0], wire_votes.xyz[j, 1]
+                if mins[0] - th <= x <= maxs[0] + th and mins[1] - th <= y <= maxs[1] + th:
+                    wire_overlap = True
+                    break
+        if len(hit) == 0 and not wire_overlap:
+            continue
+        if len(hit):
+            used_files += 1
+        if wire_overlap:
+            wire_votes.files_seen += 1
+        jobs.append((str(path), hit, qxy[hit], wire_overlap, max_radius_src, max_fit_points))
+
+    if wire_votes is not None and wire_votes.tree is not None:
+        init_args = (wire_votes.xyz, wire_votes.owners, wire_votes.threshold,
+                     wire_votes.xy_min, wire_votes.xy_max)
+    else:
+        init_args = (None, None, 0.0, None, None)
+    nworkers = _lidar_workers(workers, len(jobs))
+    skipped = n_files - len(jobs)
+    info(f"  LiDAR tiles to read: {len(jobs):,} of {n_files:,} "
+         f"({skipped:,} without structures or conductors skipped); workers: {nworkers}")
+    results = [None] * len(jobs)
+    label = "Mixing | LiDAR sampling"
+    if jobs:
+        console_progress("lidar_sampling", label, 0, len(jobs))
+    if nworkers <= 1 or len(jobs) <= 1:
+        _lidar_worker_init(*init_args)
+        for k, job in enumerate(jobs):
+            results[k] = _lidar_sample_file(job)
+            console_progress("lidar_sampling", label, k + 1, len(jobs), Path(job[0]).name)
+    else:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=nworkers, mp_context=ctx,
+                                 initializer=_lidar_worker_init, initargs=init_args) as pool:
+            futs = {pool.submit(_lidar_sample_file, job): k for k, job in enumerate(jobs)}
+            done = 0
+            for fut in as_completed(futs):
+                k = futs[fut]
+                results[k] = fut.result()
+                done += 1
+                console_progress("lidar_sampling", label, done, len(jobs), Path(jobs[k][0]).name)
+
+    for job, res in zip(jobs, results):
+        name = Path(job[0]).name
+        for gi, d, x, y, z in res["cands"]:
+            candidates[int(gi)].append((d, x, y, z, name))
+        if wire_votes is not None and len(res["vote_keys"]):
+            keys = res["vote_keys"]
+            np.add.at(wire_votes.counts, (keys // 2, keys % 2), res["vote_counts"])
+            for w, sample in res["pairs"]:
+                wire_votes.sample_hits[int(w)].add(int(sample))
 
     if used_files == 0:
         raise RuntimeError("No LiDAR tile overlaps the final structure locations")
@@ -1183,84 +1740,46 @@ def client_structure_all_values(row, index) -> dict[str, Any]:
 
 
 def build_client_structure_index(g: gpd.GeoDataFrame):
+    """Build circuit-specific source indices; shared LINE_NO indexes into each circuit."""
     if g is None or g.empty:
-        return {
-            "groups": {},
-            "global": None,
-            "columns": {},
-            "source_field_map": {},
-            "delivery_source_fields": [],
-        }
-
+        return {"groups": {}, "global": None, "columns": {}, "source_field_map": {}, "delivery_source_fields": []}
     x = g[g.geometry.notna() & ~g.geometry.is_empty].copy().reset_index(drop=True)
     cols = {str(c).upper(): c for c in x.columns}
-
-    original_fields = [
-        str(c) for c in x.columns
-        if str(c).lower() != "geometry" and str(c) != "_CKEY"
-    ]
+    original_fields = [str(c) for c in x.columns if str(c).lower() != "geometry" and str(c) != "_CKEY"]
     source_field_map = _build_structure_source_field_map(original_fields)
-    delivery_source_fields = [
-        source_field_map[c]
-        for c in original_fields
-        if c in source_field_map
-    ]
-
+    delivery_source_fields = [source_field_map[c] for c in original_fields if c in source_field_map]
     line_col = cols.get("LINE_NO")
-    if line_col is None:
-        return {
-            "groups": {},
-            "global": None,
-            "columns": cols,
-            "source_field_map": source_field_map,
-            "delivery_source_fields": delivery_source_fields,
-        }
-
-    x["_CKEY"] = x[line_col].apply(circuit_key)
     groups = {}
-    for key, sg in x.groupby("_CKEY", sort=False):
-        if not key or sg.empty:
-            continue
-        sg = sg.reset_index(drop=True)
-        groups[key] = (
-            sg,
-            cKDTree(np.column_stack([sg.geometry.x, sg.geometry.y])),
-        )
-
-    global_tree = (
-        x,
-        cKDTree(np.column_stack([x.geometry.x, x.geometry.y])),
-    ) if not x.empty else None
-
-    return {
-        "groups": groups,
-        "global": global_tree,
-        "columns": cols,
-        "source_field_map": source_field_map,
-        "delivery_source_fields": delivery_source_fields,
-    }
+    if line_col is not None:
+        keys = defaultdict(list)
+        for idx, row in x.iterrows():
+            for key in _circuit_tokens(row[line_col]):
+                keys[key].append(idx)
+        for key, indexes in keys.items():
+            sg = x.iloc[indexes].reset_index(drop=True)
+            groups[key] = (sg, cKDTree(np.column_stack([sg.geometry.x, sg.geometry.y])))
+    return {"groups": groups, "global": None, "columns": cols,
+            "source_field_map": source_field_map, "delivery_source_fields": delivery_source_fields}
 
 
-def match_client_structure(point: Point, circuit: str, index, unit_to_m: float):
-    key = circuit_key(circuit)
-    method = ""
-    pack = index.get("groups", {}).get(key)
-    if pack is not None:
-        method = "SAME_CIRCUIT_NEAREST"
-    else:
-        pack = index.get("global")
-        method = "GLOBAL_NEAREST" if pack is not None else "NO_SOURCE_STRUCTURE"
+def match_client_structure(point: Point, circuit: str, index, unit_to_m: float,
+                           max_source_match_m: float = 15.0):
+    """No cross-circuit or unbounded nearest match; unmatched sites become dummy."""
+    pack = index.get("groups", {}).get(circuit_key(circuit))
     if pack is None:
-        return None, None, method
+        return None, None, "DUMMY_NO_CIRCUIT_SOURCE"
     sg, tree = pack
     d, i = tree.query([float(point.x), float(point.y)], k=1)
-    return sg.iloc[int(i)], float(d) * unit_to_m, method
+    dm = float(d) * unit_to_m
+    if dm > max_source_match_m:
+        return None, dm, "DUMMY_SOURCE_TOO_FAR"
+    return sg.iloc[int(i)], dm, "CIRCUIT_SOURCE_WITHIN_15M"
 
 
 def client_structure_values(row, topo_id: str):
     if row is None:
         return {
-            "STRUCT_ID": topo_id, "GIS_NO": "", "STR_TYPE": "", "MATERIAL": "",
+            "STRUCT_ID": "", "GIS_NO": "", "STR_TYPE": "", "MATERIAL": "",
             "SRC_GID": "", "SRC_LINE": "", "SRC_STRUCT": "", "SRC_X": np.nan, "SRC_Y": np.nan,
         }
     def val(name):
@@ -1461,7 +1980,122 @@ def endpoint_assignment(wires, supports, unit_to_m, max_endpoint_m):
             "SOURCE_LAYER": txt(r["SOURCE_LAYER"]),
             "geometry": r.geometry,
         })
+    rows, review = _splice_midspan_split_wires(
+        wires.reset_index(drop=True), rows, review, tree, supports,
+        unit_to_m, max_endpoint_m,
+    )
     return rows_to_gdf(rows, wires.crs), rows_to_gdf(review, wires.crs)
+
+
+def _splice_midspan_split_wires(wires, rows, review, tree, supports, unit_to_m,
+                                max_endpoint_m, joint_tol_m=0.5,
+                                min_joint_angle_deg=150.0):
+    """R01.05: re-join conductors that the DXF splits in the middle of a span.
+
+    Pieces are only joined when their endpoints coincide in XYZ (<= 0.5 m),
+    the joint is farther than max_endpoint_m from every POA, the pieces are
+    collinear at the joint, and the joined conductor then matches two
+    different supports. Source geometry is not altered; the merged line is
+    used only for span/bundle topology. All source rows are kept for Caydence.
+    """
+    failed_ids = {txt(r["WIRE_ID"]) for r in review}
+    if len(failed_ids) < 2:
+        return rows, review
+    idx_by_id = {txt(v): i for i, v in enumerate(wires["WIRE_ID"])}
+    ends = []  # (wire_row, side, xyz, tangent_xy)
+    for wid in failed_ids:
+        wi = idx_by_id.get(wid)
+        if wi is None:
+            continue
+        c = coords3d(wires.geometry.iloc[wi])
+        if len(c) < 2:
+            continue
+        for side, p, q in (("A", c[0], c[1]), ("B", c[-1], c[-2])):
+            d, _ = tree.query([p[0], p[1]], k=1)
+            if float(d) * unit_to_m <= max_endpoint_m:
+                continue
+            t = np.asarray([p[0]-q[0], p[1]-q[1]], dtype=float)
+            n = float(np.linalg.norm(t))
+            ends.append((wi, side, np.asarray(p[:3], dtype=float), t/n if n > 0 else t))
+    if len(ends) < 2:
+        return rows, review
+    etree = cKDTree(np.asarray([e[2][:2] for e in ends]))
+    cos_lim = np.cos(np.radians(min_joint_angle_deg))
+    links = defaultdict(list)
+    for a, b in etree.query_pairs(joint_tol_m / unit_to_m):
+        ea, eb = ends[a], ends[b]
+        if ea[0] == eb[0]:
+            continue
+        if abs(ea[2][2]-eb[2][2]) * unit_to_m > joint_tol_m:
+            continue
+        # outward tangents of two collinear pieces point in opposite directions
+        if float(np.dot(ea[3], eb[3])) > cos_lim:
+            continue
+        links[ea[0]].append((ea[1], eb[0], eb[1]))
+        links[eb[0]].append((eb[1], ea[0], ea[1]))
+    used = set()
+    spliced_ids = set()
+    for start in sorted(links):
+        if start in used or len(links[start]) != 1:
+            continue  # start chains only from an open end
+        chain = [(start, links[start][0][0])]  # (wire, side joined to next)
+        seen = {start}
+        cur, cur_side = start, links[start][0][0]
+        ok_chain = True
+        while True:
+            nxt = [l for l in links[cur] if l[0] == cur_side]
+            if len(nxt) != 1:
+                break
+            _, nw, nside = nxt[0]
+            if nw in seen:
+                ok_chain = False
+                break
+            seen.add(nw)
+            other = [l for l in links[nw] if l[0] != nside]
+            if len(other) > 1:
+                ok_chain = False
+                break
+            chain.append((nw, nside))
+            if not other:
+                break
+            cur, cur_side = nw, other[0][0]
+        if not ok_chain or len(chain) < 2:
+            continue
+        coords = []
+        for k, (wi, join_side) in enumerate(chain):
+            c = [tuple(map(float, p[:3])) for p in coords3d(wires.geometry.iloc[wi])]
+            if k == 0:
+                c = c if join_side == "B" else c[::-1]
+            else:
+                c = c if join_side == "A" else c[::-1]
+                c = c[1:]
+            coords.extend(c)
+        vals = []
+        for p in (coords[0], coords[-1]):
+            d, ix = tree.query([p[0], p[1]], k=1)
+            vals.append((txt(supports.iloc[int(ix)]["STRUCTURE_ID"]), float(d)*unit_to_m, p))
+        if vals[0][0] == vals[1][0] or max(v[1] for v in vals) > max_endpoint_m:
+            continue
+        wrows = [wi for wi, _ in chain]
+        used.update(wrows)
+        ids = [txt(wires.iloc[wi]["WIRE_ID"]) for wi in wrows]
+        spliced_ids.update(ids)
+        rows.append({
+            "WIRE_ROW": int(wrows[0]), "WIRE_ID": "+".join(ids),
+            "EXTRA_WIRE_ROWS": [int(x) for x in wrows[1:]],
+            "STRUCT_A": vals[0][0], "STRUCT_B": vals[1][0],
+            "DIST_A_M": vals[0][1], "DIST_B_M": vals[1][1],
+            "A_X": vals[0][2][0], "A_Y": vals[0][2][1], "A_Z": vals[0][2][2],
+            "B_X": vals[1][2][0], "B_Y": vals[1][2][1], "B_Z": vals[1][2][2],
+            "SOURCE_LAYER": txt(wires.iloc[wrows[0]]["SOURCE_LAYER"]),
+            "geometry": LineString(coords),
+        })
+    if spliced_ids:
+        for r in review:
+            if txt(r["WIRE_ID"]) in spliced_ids:
+                r["REASON"] = "SPLICED_MIDSPAN"
+        info(f"Mid-span split conductors re-joined: {len(spliced_ids)} source pieces")
+    return rows, review
 
 
 def support_lookup(supports):
@@ -1507,6 +2141,61 @@ def partition_sorted_indices(n: int, k: int):
     return out
 
 
+# R01.05: DXF layer names as attribution evidence.
+#   Mainline_345kV          -> voltage 345
+#   Mainline_1_115kV        -> voltage 115, line tag "1" (same-voltage lines
+#                              crossing or sharing a corridor get _1, _2, ...)
+#   Mainline_391_345kV      -> circuit 391 (when 391 is a known circuit name)
+_LAYER_KV_RE = re.compile(r"(\d{2,3})\s*kv", re.I)
+
+
+def layer_voltage(layer: str) -> str:
+    m = _LAYER_KV_RE.search(layer or "")
+    return m.group(1) if m else ""
+
+
+def layer_tokens(layer: str) -> list[str]:
+    body = _LAYER_KV_RE.sub("", layer or "")
+    return [t for t in re.split(r"[^A-Za-z0-9]+", body) if t]
+
+
+def layer_group_key(layer: str) -> str:
+    """Physical line identity encoded in the layer: voltage + tag/circuit tokens."""
+    kv = layer_voltage(layer)
+    if not kv:
+        return ""
+    toks = [t for t in layer_tokens(layer) if t.lower() not in {"mainline", "main", "line", "wire", "wires", "conductor"}]
+    return kv + "|" + "_".join(toks)
+
+
+def layer_circuit_hint(layer: str, known_labels: set[str]) -> str:
+    for t in layer_tokens(layer):
+        if len(t) >= 3 and t in known_labels:
+            return t
+    return ""
+
+
+DUPLICATE_WIRE_M = 0.3
+
+
+def _collapse_duplicate_records(records, tol):
+    kept = []
+    for r in records:
+        a = np.asarray(r["coords"][0], dtype=float); b = np.asarray(r["coords"][-1], dtype=float)
+        dup_of = None
+        for k in kept:
+            ka = np.asarray(k["coords"][0], dtype=float); kb = np.asarray(k["coords"][-1], dtype=float)
+            if ((np.linalg.norm(a - ka) <= tol and np.linalg.norm(b - kb) <= tol) or
+                    (np.linalg.norm(a - kb) <= tol and np.linalg.norm(b - ka) <= tol)):
+                dup_of = k
+                break
+        if dup_of is None:
+            kept.append(r)
+        else:
+            dup_of["EXTRA_WIRE_ROWS"] = list(dup_of.get("EXTRA_WIRE_ROWS") or []) + [int(r["WIRE_ROW"])] + list(r.get("EXTRA_WIRE_ROWS") or [])
+    return kept
+
+
 def build_span_bundles(wire_matches, supports, unit_to_m,
                        horizontal_z_range_m, horizontal_z_ratio):
     by_sid = support_lookup(supports)
@@ -1539,8 +2228,10 @@ def build_span_bundles(wire_matches, supports, unit_to_m,
             off_a = float(np.dot(pa - A, normal)) * unit_to_m
             off_b = float(np.dot(pb - B, normal)) * unit_to_m
             zavg = (za + zb) / 2.0
+            extra = r.get("EXTRA_WIRE_ROWS") if "EXTRA_WIRE_ROWS" in r.index else None
             records.append({
                 "WIRE_ROW": int(r["WIRE_ROW"]), "WIRE_ID": txt(r["WIRE_ID"]),
+                "EXTRA_WIRE_ROWS": list(extra) if isinstance(extra, (list, tuple)) else [],
                 "SOURCE_LAYER": txt(r["SOURCE_LAYER"]),
                 "coords": coords, "geometry3d": r.geometry,
                 "PA": pa, "PB": pb, "ZA": za, "ZB": zb,
@@ -1550,9 +2241,37 @@ def build_span_bundles(wire_matches, supports, unit_to_m,
             })
         if not records:
             continue
+        # R01.05: identical copies of one conductor in the DXF (same 3D endpoints
+        # within DUPLICATE_WIRE_M) would be sliced into separate phases. Keep one
+        # for analysis; the copies follow it into Caydence attribution.
+        records = _collapse_duplicate_records(records, DUPLICATE_WIRE_M / unit_to_m)
         recs = pd.DataFrame(records).sort_values("OFF_MEAN_M", kind="stable").reset_index(drop=True)
-        k = choose_bundle_count(len(recs))
-        partitions = partition_sorted_indices(len(recs), k)
+        # R01.05: when every wire carries a layer line identity (voltage, tag or
+        # circuit) and the pair holds >=2 such lines of >=3 wires each, bundle each
+        # line separately instead of slicing the mixed lateral order.
+        gkeys = recs["SOURCE_LAYER"].apply(lambda x: layer_group_key(txt(x)))
+        keyed = gkeys != ""
+        sizes = gkeys[keyed].value_counts()
+        if (keyed.mean() >= 0.8 and len(sizes) >= 2 and int(sizes.min()) >= 3
+                and not keyed.all()):
+            # Unnamed-layer wires (e.g. level 0) join the keyed line whose lateral
+            # range is nearest, so they do not block per-line bundling.
+            rng = {g: (float(recs.loc[gkeys == g, "OFF_MEAN_M"].min()),
+                       float(recs.loc[gkeys == g, "OFF_MEAN_M"].max())) for g in sizes.index}
+            for i in recs.index[~keyed]:
+                o = float(recs.at[i, "OFF_MEAN_M"])
+                gkeys.at[i] = min(rng, key=lambda g: (max(0.0, rng[g][0]-o, o-rng[g][1]), g))
+            sizes = gkeys.value_counts()
+            keyed = gkeys != ""
+        if keyed.all() and len(sizes) >= 2 and int(sizes.min()) >= 3:
+            partitions = []
+            for gk in sorted(sizes.index, key=lambda g: float(recs.loc[gkeys == g, "OFF_MEAN_M"].mean())):
+                pos = list(recs.index[gkeys == gk])
+                kk = choose_bundle_count(len(pos))
+                partitions.extend([[pos[i] for i in part] for part in partition_sorted_indices(len(pos), kk)])
+        else:
+            k = choose_bundle_count(len(recs))
+            partitions = partition_sorted_indices(len(recs), k)
 
         for local_idx, positions in enumerate(partitions, 1):
             part = recs.iloc[positions].copy().reset_index(drop=True)
@@ -1561,7 +2280,9 @@ def build_span_bundles(wire_matches, supports, unit_to_m,
                 continue
 
             explicit_earth = part[part["SOURCE_LAYER"].apply(lambda x: bool(earth_words.search(txt(x))))]
-            if not explicit_earth.empty and len(part) - len(explicit_earth) >= 3:
+            if not explicit_earth.empty:
+                # Preserve the explicit source DXF classification even when the
+                # span is incomplete or has fewer than three phase conductors.
                 earth_ids = set(int(x) for x in explicit_earth["WIRE_ROW"])
             else:
                 earth_count = max(0, min(2, len(part) - 3))
@@ -1618,6 +2339,11 @@ def build_span_bundles(wire_matches, supports, unit_to_m,
                 "PAIR": pair_key, "BUNDLE_LOCAL": local_idx,
                 "N_SOURCE_WIRES": int(len(part)), "N_PHASE": 3,
                 "ARRANGEMENT": arrangement,
+                # Line identity from the DXF layer of the phase wires (R01.05);
+                # blank when unnamed or mixed.
+                "LAYER_KEY": (lambda ks: ks.pop() if len(ks) == 1 else "")(
+                    {layer_group_key(txt(x)) for x in phase["SOURCE_LAYER"]} - {""}
+                ) if (phase["SOURCE_LAYER"].apply(lambda x: layer_group_key(txt(x))) != "").sum() >= 2 else "",
                 "Z_RANGE_A_M": zra, "Z_RANGE_B_M": zrb,
                 "TRANS_RANGE_A_M": tra, "TRANS_RANGE_B_M": trb,
                 "END_A_X": float(ca[0]), "END_A_Y": float(ca[1]),
@@ -1625,8 +2351,16 @@ def build_span_bundles(wire_matches, supports, unit_to_m,
                 # Retain the original 3D source vectors belonging to this physical
                 # circuit bundle so they can be repackaged for Caydence without
                 # flattening, simplifying or otherwise changing their geometry.
-                "ALL_WIRE_ROWS": [int(x) for x in part["WIRE_ROW"].tolist()],
-                "EARTH_WIRE_ROWS": sorted(int(x) for x in earth_ids),
+                "ALL_WIRE_ROWS": [int(x) for x in part["WIRE_ROW"].tolist()] + [
+                    int(x) for ex in part["EXTRA_WIRE_ROWS"] for x in ex
+                ],
+                "EARTH_WIRE_ROWS": sorted(
+                    [int(x) for x in earth_ids] + [
+                        int(x)
+                        for wr, ex in zip(part["WIRE_ROW"], part["EXTRA_WIRE_ROWS"])
+                        if int(wr) in earth_ids for x in ex
+                    ]
+                ),
                 "CANDIDATES": candidates,
                 "geometry": LineString([tuple(A), tuple(B)]),
             })
@@ -1685,17 +2419,20 @@ def build_physical_tracks(
         ])
         v = B - A
         v = v / max(np.linalg.norm(v), 1e-12)
+        lk = txt(b.get("LAYER_KEY"))
         ends[b["STRUCT_A"]].append({
             "bid": b["BUNDLE_ID"],
             "other": b["STRUCT_B"],
             "pt": np.asarray([b["END_A_X"], b["END_A_Y"]]),
             "dir": v,
+            "lkey": lk,
         })
         ends[b["STRUCT_B"]].append({
             "bid": b["BUNDLE_ID"],
             "other": b["STRUCT_A"],
             "pt": np.asarray([b["END_B_X"], b["END_B_Y"]]),
             "dir": -v,
+            "lkey": lk,
         })
 
     uf = UnionFind(max([b["BUNDLE_ID"] for b in bundles], default=0) + 1)
@@ -1710,6 +2447,8 @@ def build_physical_tracks(
                 a, b = items[i], items[j]
                 if a["other"] == b["other"]:
                     continue  # parallel bundles in same physical span
+                if a["lkey"] and b["lkey"] and a["lkey"] != b["lkey"]:
+                    continue  # different named DXF lines (voltage/tag/circuit)
 
                 ang = angle_deg(a["dir"], b["dir"])
                 if ang < 90.0:
@@ -1832,35 +2571,92 @@ def assign_tracks_to_circuits(bundles, track_lookup, wires, client, kmz, unit_to
     for b in bundles:
         by_track[track_lookup[b["BUNDLE_ID"]]].append(b)
 
+    ref_kv = {}
+    for key in refs:
+        try:
+            v = txt(circuit_attributes(key, labels.get(key, key), client, kmz)[0])
+        except Exception:
+            v = ""
+        m = re.search(r"(\d{2,3})", v)
+        ref_kv[key] = m.group(1) if m else ""
+    label_to_keys = defaultdict(list)
+    for key in refs:
+        lab = txt(client.get(key, {}).get("line_no") or labels.get(key, key))
+        label_to_keys[lab].append(key)
+        label_to_keys[txt(key)].append(key)
+    known_labels = {k for k in label_to_keys if k}
+    layer_col = "SOURCE_LAYER" if "SOURCE_LAYER" in wires.columns else None
+
     rows, track_meta = [], {}
     for tid, bs in sorted(by_track.items()):
         samples = []
+        kv_votes = Counter(); hint_votes = Counter()
         for b in bs:
             # use all three phase candidates; circuit attribution is track-level, not phase-level
             for c in b["CANDIDATES"]:
                 g = force_2d(c["geometry3d"])
                 samples.extend([g.interpolate(f, normalized=True) for f in (0.2,0.5,0.8)])
+                if layer_col is not None:
+                    wi = int(c["WIRE_ROW"])
+                    if 0 <= wi < len(wires):
+                        lay = txt(wires.iloc[wi][layer_col])
+                        kv = layer_voltage(lay)
+                        if kv:
+                            kv_votes[kv] += 1
+                        h = layer_circuit_hint(lay, known_labels)
+                        if h:
+                            hint_votes[h] += 1
+        n_votes = sum(kv_votes.values())
+        track_kv = ""
+        if n_votes:
+            kv, cnt = kv_votes.most_common(1)[0]
+            if cnt >= 0.8 * n_votes:
+                track_kv = kv
+        hint_keys = set()
+        if hint_votes:
+            h, cnt = hint_votes.most_common(1)[0]
+            if cnt >= 0.8 * sum(hint_votes.values()):
+                hint_keys = set(label_to_keys.get(h, []))
         scores = []
         for key, ref in refs.items():
             ds = np.asarray([float(p.distance(ref))*unit_to_m for p in samples], dtype=float)
             if len(ds):
-                scores.append((float(np.median(ds)), float(np.quantile(ds,0.9)), key))
+                med = float(np.median(ds))
+                # Layer evidence: circuit named in the layer wins; a circuit whose
+                # voltage differs from the layer voltage is pushed behind every
+                # same-voltage candidate (kept as a last resort, CONF -> REVIEW).
+                if hint_keys:
+                    rank = 0 if key in hint_keys else 2
+                elif track_kv and ref_kv.get(key) and ref_kv[key] != track_kv:
+                    rank = 2
+                else:
+                    rank = 1
+                scores.append((rank, med, float(np.quantile(ds,0.9)), key))
         scores.sort()
+        layer_rule = "LAYER_CIRCUIT" if hint_keys else ("LAYER_KV" if track_kv else "")
+        if scores and scores[0][0] == 2:
+            layer_rule = "KV_MISMATCH"
+        scores = [(m, q, k) for _, m, q, k in scores]
         if not scores:
             best_key, best_d, second_d = "", None, None
         else:
             best_d, _, best_key = scores[0]
             second_d = scores[1][0] if len(scores)>1 else None
         margin = (second_d-best_d) if best_d is not None and second_d is not None else None
+        if margin is not None and margin < 0:
+            margin = None  # winner chosen by layer evidence, not by distance
         conf = "HIGH" if best_d is not None and best_d <= 15 and (margin is None or margin >= 5) else (
             "MEDIUM" if best_d is not None and best_d <= 40 and (margin is None or margin >= 2) else "REVIEW"
         )
+        if layer_rule == "KV_MISMATCH":
+            conf = "REVIEW"
         label = client.get(best_key, {}).get("line_no") or labels.get(best_key, best_key)
         track_meta[tid] = {"CKEY":best_key, "CIRCUIT":label, "DIST_M":best_d,
                            "SECOND_M":second_d, "MARGIN_M":margin, "CONF":conf}
         rows.append({
             "TRACK_ID":tid, "N_BUNDLES":len(bs), "CKEY":best_key, "CIRCUIT":label,
             "DIST_M":best_d, "SECOND_M":second_d, "MARGIN_M":margin, "CONF":conf,
+            "LAYER_KV":track_kv, "LAYER_RULE":layer_rule,
             "geometry": unary_union([b["geometry"] for b in bs]),
         })
         for b in bs:
@@ -2064,6 +2860,9 @@ def _bundle_branch_confident(bundle: dict[str, Any]) -> bool:
     return txt(bundle.get("CONF")).upper() in {"HIGH", "MEDIUM"}
 
 
+DISCONNECTED_PART_MIN_SPANS = 2
+
+
 def build_circuit_paths(bundles, supports, unit_to_m):
     """Build MAIN circuit spine plus legitimate connected TAP_BRANCH paths.
 
@@ -2155,6 +2954,32 @@ def build_circuit_paths(bundles, supports, unit_to_m):
 
             if len(anchors) == 0:
                 reason = "DISCONNECTED_CIRCUIT_COMPONENT"
+                # R01.05: a span that fails to form a bundle must not delete
+                # the remainder of the circuit. Keep multi-span components as
+                # separate MAIN parts; single isolated spans stay in QA.
+                if len(comp) >= DISCONNECTED_PART_MIN_SPANS:
+                    deg = defaultdict(int)
+                    for e in comp:
+                        deg[e["U"]] += 1
+                        deg[e["V"]] += 1
+                    leaf = sorted(n for n, k in deg.items() if k == 1) or sorted(deg)
+                    part_counter = sum(
+                        1 for b in branches if b.get("PATH_ROLE") == "MAIN_PART"
+                    )
+                    seen_part = set()
+                    for seg_index, seg in enumerate(
+                        _tree_component_segments(comp, leaf[0]), 1
+                    ):
+                        branches.append({
+                            "PATH_ROLE": "MAIN_PART",
+                            "BRANCH_ID": f"PART{part_counter + 1:02d}",
+                            "SEGMENT_ID": f"PART{part_counter + 1:02d}_{seg_index:02d}",
+                            "ANCHOR_NODE": "",
+                            "NODES": list(seg["NODES"]),
+                            "BUNDLES": list(seg["BUNDLES"]),
+                        })
+                        seen_part.update(seg["BUNDLES"])
+                    continue
             elif len(anchors) != 1:
                 reason = "MULTI_ANCHOR_ALTERNATE_ROUTE"
             else:
@@ -2218,11 +3043,20 @@ def build_circuit_paths(bundles, supports, unit_to_m):
             "BRANCHES": branches,
             "N_TAP_BRANCHES": len({
                 b["BRANCH_ID"] for b in branches
+                if b.get("PATH_ROLE", "TAP_BRANCH") == "TAP_BRANCH"
             }),
-            "N_TAP_SEGMENTS": len(branches),
+            "N_TAP_SEGMENTS": sum(
+                1 for b in branches
+                if b.get("PATH_ROLE", "TAP_BRANCH") == "TAP_BRANCH"
+            ),
             "N_TAP_SPANS": sum(
                 len(b["BUNDLES"]) for b in branches
+                if b.get("PATH_ROLE", "TAP_BRANCH") == "TAP_BRANCH"
             ),
+            "N_MAIN_PARTS": len({
+                b["BRANCH_ID"] for b in branches
+                if b.get("PATH_ROLE") == "MAIN_PART"
+            }),
         }
 
     return result, rows_to_gdf(dropped, supports.crs)
@@ -2243,50 +3077,214 @@ def oriented_candidate(candidate, start_sid, end_sid, bundle, supports_by_id):
     return out,float(off_start),float(off_end)
 
 
-def select_phase_sequence(path, bundle_lookup, supports, unit_to_m):
-    """Dynamic programming across a circuit path.
+# R01.05 (20/11): wire rows that source LiDAR (class 210) confirmed as EARTH.
+# Filled only for the 2D re-selection pass after LiDAR roles are known.
+_LIDAR_EARTH_ROWS: set[int] = set()
 
-    Horizontal bundle: central phase has a strong local preference.
-    Vertical/mixed bundle: continuity dominates; outermost is a weak tie-break.
+
+def set_lidar_earth_rows(rows) -> None:
+    _LIDAR_EARTH_ROWS.clear()
+    _LIDAR_EARTH_ROWS.update(int(x) for x in rows)
+
+
+# R01.05: outermost-lane representative for non-horizontal bundles.
+LANE_PENALTY_M = 15.0      # cost of leaving the chosen outer lane in one span
+LANE_TOL_M = 0.5           # conductors within this of the extreme count as extreme
+LANE_MIN_SPREAD_M = 0.5    # below this lateral spread the bundle is a vertical stack
+LANE_NEIGHBOUR_M = 40.0    # other bundles within this radius vote for the far lane
+MIXED_CENTRAL_WEIGHT = float(os.environ.get("BAKERY_MIXED_CENTRAL_W", "1.5"))
+
+
+def _lane_mode() -> str:
+    """2D representative rule.
+
+    centre (default, R01.05 after 19/11 feedback): the central phase for every
+    arrangement, continuity breaks ties -> 2D follows the middle of the circuit.
+    outer: outermost phase on one side (20261118f-i builds).
+    legacy: R01.04 (central for horizontal, weak outer preference otherwise).
+    BAKERY_2D_LANE selects the mode; BAKERY_LANE_RULE=0 still means legacy.
     """
-    by_sid=support_lookup(supports)
-    states=[]
-    for i,bid in enumerate(path["BUNDLES"]):
-        b=bundle_lookup[bid]
-        s0,s1=path["NODES"][i],path["NODES"][i+1]
-        cand=[]
-        for c in b["CANDIDATES"]:
-            coords,off0,off1=oriented_candidate(c,s0,s1,b,by_sid)
-            if b["ARRANGEMENT"]=="HORIZONTAL":
-                local=8.0*float(c["CENTRAL_SCORE"])
-            else:
-                local=0.35*float(c["OUTER_PENALTY"])
-            cand.append({**c,"coords_oriented":coords,"OFF_START_M":off0,"OFF_END_M":off1,"LOCAL_COST":local})
-        states.append(cand)
+    if os.environ.get("BAKERY_LANE_RULE", "").strip().lower() in {"0", "false", "no", "off"}:
+        return "legacy"
+    m = os.environ.get("BAKERY_2D_LANE", "centre").strip().lower()
+    return {"center": "centre"}.get(m, m) if m in {"centre", "center", "outer", "legacy"} else "centre"
 
-    if not states:
-        return [],[]
-    costs=[np.asarray([c["LOCAL_COST"] for c in states[0]],dtype=float)]
+
+def _lane_rule_enabled() -> bool:
+    return _lane_mode() == "outer"
+
+
+def _bundle_mid(b):
+    return np.asarray([(float(b["END_A_X"]) + float(b["END_B_X"])) / 2.0,
+                       (float(b["END_A_Y"]) + float(b["END_B_Y"])) / 2.0])
+
+
+def _run_phase_dp(states, local_key, unit_to_m):
+    costs=[np.asarray([c[local_key] for c in states[0]],dtype=float)]
     back=[]
-    join_mats=[]
     for i in range(1,len(states)):
         prev,curr=states[i-1],states[i]
         cur_cost=np.full(len(curr),np.inf); cur_back=np.full(len(curr),-1,dtype=int)
-        join_mat=np.zeros((len(prev),len(curr)),dtype=float)
         for a,p in enumerate(prev):
             pxy=np.asarray(p["coords_oriented"][-1][:2])
             for b,c in enumerate(curr):
                 cxy=np.asarray(c["coords_oriented"][0][:2])
                 j=float(np.linalg.norm(pxy-cxy))*unit_to_m
-                join_mat[a,b]=j
-                val=costs[-1][a]+j+float(c["LOCAL_COST"])
+                val=costs[-1][a]+j+float(c[local_key])
                 if val<cur_cost[b]: cur_cost[b]=val;cur_back[b]=a
-        costs.append(cur_cost);back.append(cur_back);join_mats.append(join_mat)
-    idx=int(np.argmin(costs[-1])); chosen=[idx]
+        costs.append(cur_cost);back.append(cur_back)
+    idx=int(np.argmin(costs[-1])); total=float(costs[-1][idx]); chosen=[idx]
     for b in reversed(back):
         idx=int(b[idx]);chosen.append(idx)
     chosen.reverse()
-    selected=[states[i][chosen[i]] for i in range(len(states))]
+    return chosen,total
+
+
+def bundle_is_mixed(b) -> bool:
+    """Non-horizontal bundle whose phases are laterally spread (not a vertical stack)."""
+    if b.get("ARRANGEMENT") == "HORIZONTAL":
+        return False
+    offs=[(float(c["OFF_A_M"])+float(c["OFF_B_M"]))/2.0 for c in b.get("CANDIDATES", [])]
+    return len(offs) >= 2 and (max(offs)-min(offs)) >= LANE_MIN_SPREAD_M
+
+
+def select_phase_sequence(path, bundle_lookup, supports, unit_to_m, outer_on_horizontal=None):
+    """Dynamic programming across a circuit path.
+
+    Horizontal bundle: central phase has a strong local preference.
+    Vertical/mixed bundle (R01.05): the outermost conductor on ONE side of the
+    circuit (left or right of the path direction) is kept along the whole path.
+    Offsets are re-signed by travel direction so the side is consistent across
+    corners. The side is the one away from neighbouring circuits; without
+    neighbours the cheaper side wins. Leaving the lane costs LANE_PENALTY_M, so it
+    only happens where geometry forces it (reported as LANE_OK = 0).
+    BAKERY_LANE_RULE=0 restores the R01.04 rule (weak sign-less outer preference).
+
+    outer_on_horizontal (R01.05): when the circuit has any mixed span, horizontal
+    spans also use the outer lane, so the representative never steps between the
+    central phase and an outer phase. None = decide from this path alone.
+    """
+    by_sid=support_lookup(supports)
+    lane_mode=_lane_mode()
+    lane_rule=lane_mode=="outer"
+    own=set(int(x) for x in path["BUNDLES"])
+    others=[b for bid,b in bundle_lookup.items() if int(bid) not in own]
+    other_mid=np.asarray([_bundle_mid(b) for b in others]) if others else np.zeros((0,2))
+    vote_left=0.0  # >0: neighbours sit on the left -> use right lane
+    # R01.05: parallel bundles of the SAME circuit on one support pair (e.g. 10
+    # wires of one named line) are alternatives; continuity picks between them
+    # instead of the reference-distance choice made when the path was built.
+    by_pair=defaultdict(list)
+    earth_rows=set(_LIDAR_EARTH_ROWS)
+    for _bid,_b in bundle_lookup.items():
+        by_pair[txt(_b.get("PAIR"))].append(int(_bid))
+        earth_rows.update(int(x) for x in _b.get("EARTH_WIRE_ROWS", []))
+    alts=[]
+    for bid in path["BUNDLES"]:
+        b0=bundle_lookup[bid]
+        same=[x for x in by_pair.get(txt(b0.get("PAIR")),[])
+              if x!=int(bid) and txt(bundle_lookup[x].get("CKEY"))==txt(b0.get("CKEY")) and txt(b0.get("CKEY"))
+              and bundle_lookup[x]["ARRANGEMENT"]==b0["ARRANGEMENT"]]
+        alts.append([int(bid)]+same)
+    if outer_on_horizontal is None:
+        outer_on_horizontal=any(bundle_is_mixed(bundle_lookup[x]) for x in path["BUNDLES"])
+    outer_h=bool(lane_rule and outer_on_horizontal)
+    states=[]
+    for i,bid in enumerate(path["BUNDLES"]):
+        b=bundle_lookup[bid]
+        s0,s1=path["NODES"][i],path["NODES"][i+1]
+        sign=1.0 if txt(b["STRUCT_A"])==txt(s0) else -1.0
+        horizontal=b["ARRANGEMENT"]=="HORIZONTAL" and not outer_h
+        cand=[]
+        pool=[dict(cc,_BID=ab) for ab in alts[i] for cc in bundle_lookup[ab]["CANDIDATES"]]
+        # Only PHASE conductors may represent the circuit in 2D: drop any wire
+        # classified as EARTH in some bundle, if phase wires remain.
+        phase_only=[cc for cc in pool if int(cc["WIRE_ROW"]) not in earth_rows]
+        if phase_only:
+            pool=phase_only
+        for c in pool:
+            coords,off0,off1=oriented_candidate(c,s0,s1,b,by_sid)
+            if b["ARRANGEMENT"]=="HORIZONTAL":
+                legacy=8.0*float(c["CENTRAL_SCORE"])
+            elif lane_mode=="centre":
+                # Mixed/vertical: stay near the middle, but let continuity choose
+                # between near-central conductors so 2D does not dog-leg.
+                legacy=MIXED_CENTRAL_WEIGHT*float(c["CENTRAL_SCORE"])
+            else:
+                legacy=0.35*float(c["OUTER_PENALTY"])
+            soff=sign*(float(c["OFF_A_M"])+float(c["OFF_B_M"]))/2.0
+            cand.append({**c,"coords_oriented":coords,"OFF_START_M":off0,"OFF_END_M":off1,
+                         "LOCAL_COST":legacy,"SIDE_OFF_M":soff})
+        if not cand:
+            states.append(cand); continue
+        offs=np.asarray([c["SIDE_OFF_M"] for c in cand])
+        spread=float(offs.max()-offs.min())
+        stack=spread<LANE_MIN_SPREAD_M
+        for c in cand:
+            if horizontal:
+                c["COST_L"]=c["COST_R"]=c["LOCAL_COST"]
+                c["IS_L"]=c["IS_R"]=True
+            elif stack:
+                c["COST_L"]=c["COST_R"]=0.0
+                c["IS_L"]=c["IS_R"]=True
+            else:
+                c["IS_L"]=(offs.max()-c["SIDE_OFF_M"])<=LANE_TOL_M
+                c["IS_R"]=(c["SIDE_OFF_M"]-offs.min())<=LANE_TOL_M
+                c["COST_L"]=0.0 if c["IS_L"] else LANE_PENALTY_M
+                c["COST_R"]=0.0 if c["IS_R"] else LANE_PENALTY_M
+        if lane_rule and not horizontal and not stack and len(other_mid):
+            mid=_bundle_mid(b)
+            d=np.linalg.norm(other_mid-mid,axis=1)*unit_to_m
+            near=np.where(d<=LANE_NEIGHBOUR_M)[0]
+            if len(near):
+                A=np.asarray([by_sid[s0].geometry.x,by_sid[s0].geometry.y],dtype=float)
+                B=np.asarray([by_sid[s1].geometry.x,by_sid[s1].geometry.y],dtype=float)
+                t=B-A; n=float(np.linalg.norm(t))
+                if n>1e-9:
+                    t=t/n; normal=np.asarray([-t[1],t[0]])
+                    for k in near:
+                        side=float(np.dot(other_mid[k]-mid,normal))*unit_to_m
+                        if abs(side)>1.0:
+                            vote_left+=1.0 if side>0 else -1.0
+        states.append(cand)
+
+    if not states or any(len(s)==0 for s in states):
+        return [],[]
+
+    if lane_rule:
+        ch_l,tot_l=_run_phase_dp(states,"COST_L",unit_to_m)
+        ch_r,tot_r=_run_phase_dp(states,"COST_R",unit_to_m)
+        if vote_left>0:   lane,chosen,why="R",ch_r,"AWAY_FROM_NEIGHBOUR"
+        elif vote_left<0: lane,chosen,why="L",ch_l,"AWAY_FROM_NEIGHBOUR"
+        elif tot_r<tot_l: lane,chosen,why="R",ch_r,"LOWER_COST"
+        else:             lane,chosen,why="L",ch_l,"LOWER_COST"
+    else:
+        chosen,_=_run_phase_dp(states,"LOCAL_COST",unit_to_m)
+        lane,why=None,("CENTRE" if lane_mode=="centre" else "LEGACY")
+
+    new_bundles=[int(states[i][ci]["_BID"]) for i,ci in enumerate(chosen)]
+    if new_bundles!=[int(x) for x in path["BUNDLES"]]:
+        path["BUNDLES"]=new_bundles
+    selected=[]
+    for i,ci in enumerate(chosen):
+        c=dict(states[i][ci])
+        b=bundle_lookup[path["BUNDLES"][i]]
+        if b["ARRANGEMENT"]=="HORIZONTAL" and not outer_h:
+            c["LANE"]="CENTRAL"; c["LANE_OK"]=1
+        elif lane is None:
+            c["LANE"]="CENTRAL" if lane_mode=="centre" else "LEGACY"; c["LANE_OK"]=1
+        else:
+            ok=bool(c["IS_L"] if lane=="L" else c["IS_R"])
+            c["LANE"]="OUTER_LEFT" if lane=="L" else "OUTER_RIGHT"
+            c["LANE_OK"]=int(ok)
+        c["LANE_WHY"]=why
+        if b["ARRANGEMENT"]=="HORIZONTAL" and not outer_h:
+            c["SIDE_CLASS"]="H"
+        elif c["IS_L"] and c["IS_R"]:
+            c["SIDE_CLASS"]="STACK"
+        else:
+            c["SIDE_CLASS"]="L" if c["IS_L"] else ("R" if c["IS_R"] else "INNER")
+        selected.append(c)
     joins=[]
     for i in range(1,len(selected)):
         a=np.asarray(selected[i-1]["coords_oriented"][-1][:2]);b=np.asarray(selected[i]["coords_oriented"][0][:2])
@@ -2331,6 +3329,59 @@ def simplify_selected_phase_sequence(selected, tolerance_source: float):
         after += len(simp_coords)
         out.append(rec)
     return out, before, after
+
+JOIN_SMOOTH_M = 6.0  # joins up to this length become one shared vertex (no dog leg)
+JOIN_BRIDGE_M = 15.0  # larger steps up to this: span made diagonal onto the Structure
+
+
+def smooth_small_joins(selected, max_units, node_xy=None, max_bridge_units=None):
+    """R01.05 (20/11): replace a short step between consecutive spans by one vertex.
+
+    When the end of span i and the start of span i+1 differ by less than
+    max_units (different conductor ends on one structure), both are moved to
+    their midpoint. The line then bends once at the structure instead of
+    drawing a small hook ("zawijka"), and the Structure placed on the node
+    stays on the wire (COMMON_ENDPOINT).
+    """
+    if not selected or max_units <= 0:
+        return selected, 0
+    out = [dict(c, coords_oriented=list(c["coords_oriented"])) for c in selected]
+    n = 0
+    # 20/11: a larger step (max_units < gap <= max_bridge_units) is real: the
+    # circuit middle moves sideways at that structure (e.g. C39 371/383 at
+    # 5754/5756, POAs on the 3-wire section). Keep the end that lies at the
+    # Structure (support point) and pull the other span's end onto it, so that
+    # span runs diagonally Structure-to-Structure instead of a step beside it.
+    if node_xy is not None and max_bridge_units:
+        for i in range(1, len(out)):
+            nd = node_xy[i - 1] if i - 1 < len(node_xy) else None
+            if nd is None:
+                continue
+            a = out[i - 1]["coords_oriented"][-1]
+            b = out[i]["coords_oriented"][0]
+            d = math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+            if not (max_units < d <= max_bridge_units):
+                continue
+            da = math.hypot(float(a[0]) - nd[0], float(a[1]) - nd[1])
+            db = math.hypot(float(b[0]) - nd[0], float(b[1]) - nd[1])
+            if da <= db:
+                out[i]["coords_oriented"][0] = (float(a[0]), float(a[1])) + tuple(b[2:])
+                out[i]["DIAGONAL_TO_NODE"] = 1
+            else:
+                out[i - 1]["coords_oriented"][-1] = (float(b[0]), float(b[1])) + tuple(a[2:])
+                out[i - 1]["DIAGONAL_TO_NODE"] = 1
+            n += 1
+    for i in range(1, len(out)):
+        a = out[i - 1]["coords_oriented"][-1]
+        b = out[i]["coords_oriented"][0]
+        d = math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+        if 1e-9 < d <= max_units:
+            m = ((float(a[0]) + float(b[0])) / 2.0, (float(a[1]) + float(b[1])) / 2.0)
+            out[i - 1]["coords_oriented"][-1] = m
+            out[i]["coords_oriented"][0] = m
+            n += 1
+    return out, n
+
 
 def concatenate_selected(selected):
     if not selected:
@@ -3412,17 +4463,18 @@ def _assign_source_geometry_to_row(
 
 def _infer_caydence_wire_type(source_layer: str, role_hint: str = "") -> str:
     """Return a stable Caydence wire type without filtering source geometry."""
-    role = txt(role_hint).upper()
-    if role in {"EARTH", "PHASE", "GUY"}:
-        return role
-
+    # An explicit DXF level is authoritative. Track/bundle heuristics are
+    # applied only to DXF layers that do not state a conductor role.
     layer = txt(source_layer).upper()
     if any(x in layer for x in ("EARTH", "SHIELD", "STATIC", "GROUND_WIRE", "OHGW")):
         return "EARTH"
     if "GUY" in layer:
         return "GUY"
-    if any(x in layer for x in ("PHASE", "CONDUCT", "MAINLINE")):
+    if any(x in layer for x in ("PHASE", "CONDUCT")):
         return "PHASE"
+    role = txt(role_hint).upper()
+    if role in {"EARTH", "PHASE", "GUY"}:
+        return role
     return "OTHER"
 
 
@@ -3538,6 +4590,84 @@ def _nearest_structure_anchor_for_wire(
     return best
 
 
+# R01.05: a source wire outside every analytical bundle (e.g. a conductor that the
+# DXF splits where it crosses another line) takes the circuit of the bundled
+# conductors it runs parallel to, before any Structure-anchor guess.
+PARALLEL_MAX_ANGLE_DEG = 10.0
+PARALLEL_MAX_DIST_M = 12.0
+
+
+def _wire_dir2d(geom):
+    parts = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+    cs = [c for p in parts if hasattr(p, "coords") for c in p.coords]
+    if len(cs) < 2:
+        return None
+    d = np.asarray(cs[-1][:2], dtype=float) - np.asarray(cs[0][:2], dtype=float)
+    n = float(np.linalg.norm(d))
+    return d / n if n > 1e-9 else None
+
+
+class _BundledWireIndex:
+    def __init__(self, wires_r, by_wire, unit_to_m, voltage_of=None):
+        from shapely.strtree import STRtree
+        self.u2m = float(unit_to_m)
+        self.voltage_of = voltage_of
+        self.items = []
+        for wi, cands in by_wire.items():
+            if wi < 0 or wi >= len(wires_r) or not cands:
+                continue
+            best = sorted(cands, key=lambda c: (float(c["DIST_M"]), txt(c["CIRCUIT"])))[0]
+            if not txt(best["CIRCUIT"]):
+                continue
+            g = wires_r.geometry.iloc[wi]
+            d = _wire_dir2d(g)
+            if g is None or d is None:
+                continue
+            g2 = shapely.force_2d(g)
+            self.items.append((g2, d, best))
+        self.tree = STRtree([it[0] for it in self.items]) if self.items else None
+
+    def match(self, geom, layer=""):
+        if self.tree is None or geom is None:
+            return None
+        d = _wire_dir2d(geom)
+        if d is None:
+            return None
+        g2 = shapely.force_2d(geom)
+        reach = PARALLEL_MAX_DIST_M / self.u2m
+        cos_max = np.cos(np.radians(PARALLEL_MAX_ANGLE_DEG))
+        samples = [g2.interpolate(f, normalized=True) for f in (0.1, 0.3, 0.5, 0.7, 0.9)]
+        per_circuit = {}
+        for k in self.tree.query(g2.buffer(reach)):
+            og, od, rec = self.items[int(k)]
+            if abs(float(np.dot(d, od))) < cos_max:
+                continue
+            dists = [float(og.distance(pt)) * self.u2m for pt in samples]
+            # The candidate must run alongside the whole wire, not just touch it.
+            if max(dists) > PARALLEL_MAX_DIST_M:
+                continue
+            m = float(np.median(dists))
+            key = (txt(rec["CKEY"]), txt(rec["CIRCUIT"]))
+            if self.voltage_of is not None and not _layer_voltage_compatible(
+                    layer, self.voltage_of(*key)):
+                continue
+            if key not in per_circuit or m < per_circuit[key]["DIST_M"]:
+                per_circuit[key] = {"CKEY": key[0], "CIRCUIT": key[1], "DIST_M": m}
+        if not per_circuit:
+            return None
+        ranked = sorted(per_circuit.values(), key=lambda x: (x["DIST_M"], x["CIRCUIT"]))
+        return ranked[0]
+
+
+def _layer_voltage_compatible(layer: str, voltage: str) -> bool:
+    """False only when the DXF layer names a kV that differs from the circuit kV."""
+    m = re.search(r"(\d{2,3})\s*kv", layer or "", re.I)
+    v = re.search(r"(\d{2,3})", voltage or "")
+    if not m or not v:
+        return True
+    return int(m.group(1)) == int(v.group(1))
+
+
 def build_caydence_wire_attribution(
     wires: gpd.GeoDataFrame,
     bundles: list[dict[str, Any]],
@@ -3578,10 +4708,40 @@ def build_caydence_wire_attribution(
                 "METHOD": "TRACK_BUNDLE",
             })
 
+    wires_r = wires.reset_index(drop=True)
+    _volt_cache = {}
+
+    def _voltage_of(ckey, circuit):
+        k = (ckey, circuit)
+        if k not in _volt_cache:
+            _volt_cache[k] = txt(circuit_attributes(ckey, circuit, client, kmz)[0])
+        return _volt_cache[k]
+
+    parallel_index = _BundledWireIndex(wires_r, by_wire, unit_to_m, voltage_of=_voltage_of)
+
+    _refs, _labels = combined_references(client, kmz)
+    label_to_key: dict[str, str] = {}
+    for key in _refs:
+        for lab in (txt(client.get(key, {}).get("line_no")), txt(_labels.get(key, key)), txt(key)):
+            if lab and lab not in label_to_key:
+                label_to_key[lab] = key
+    known_labels = set(label_to_key)
+
     result: dict[int, dict[str, Any]] = {}
-    for wi, r in wires.reset_index(drop=True).iterrows():
+    for wi, r in wires_r.iterrows():
         candidates = by_wire.get(int(wi), [])
-        if candidates:
+        layer_hint = layer_circuit_hint(txt(r.get("SOURCE_LAYER")), known_labels)
+        if layer_hint:
+            # The operator named the circuit on the MicroStation level: use it.
+            ckey = label_to_key[layer_hint]
+            circuit = txt(client.get(ckey, {}).get("line_no") or _labels.get(ckey, ckey))
+            types = Counter(txt(c["WIRE_TYPE"]) for c in candidates)
+            role = types.most_common(1)[0][0] if types else ""
+            attr_dist = None
+            method = "LAYER_CIRCUIT"
+            voltage = ""
+            company = ""
+        elif candidates:
             # Prefer the circuit seen most often for this source entity; distance
             # is the tie-break. This is stable where one source wire participates
             # in multiple adjacent span bundles.
@@ -3604,13 +4764,27 @@ def build_caydence_wire_attribution(
             method = "TRACK_BUNDLE"
             role = txt(best["WIRE_TYPE"])
         else:
-            anchor = _nearest_structure_anchor_for_wire(
-                r.geometry,
-                structures,
-                unit_to_m,
-                max_anchor_m=structure_anchor_m,
-            )
-            if anchor is not None:
+            parallel = parallel_index.match(r.geometry, txt(r.get("SOURCE_LAYER")))
+            anchor = None
+            if parallel is None:
+                anchor = _nearest_structure_anchor_for_wire(
+                    r.geometry,
+                    structures,
+                    unit_to_m,
+                    max_anchor_m=structure_anchor_m,
+                )
+                if anchor is not None and not _layer_voltage_compatible(
+                        txt(r.get("SOURCE_LAYER")), txt(anchor["row"].get("VOLTAGE"))):
+                    anchor = None
+            if parallel is not None:
+                ckey = txt(parallel["CKEY"])
+                circuit = txt(parallel["CIRCUIT"])
+                attr_dist = float(parallel["DIST_M"])
+                method = "PARALLEL_BUNDLE"
+                role = ""
+                voltage = ""
+                company = ""
+            elif anchor is not None:
                 sr = anchor["row"]
                 ckey = circuit_key(sr.get("CIRCUIT"))
                 circuit = txt(sr.get("CIRCUIT"))
@@ -3632,7 +4806,7 @@ def build_caydence_wire_attribution(
                 voltage = ""
                 company = ""
 
-        if candidates:
+        if candidates and not layer_hint:
             voltage = ""
             company = ""
 
@@ -3658,6 +4832,337 @@ def build_caydence_wire_attribution(
     return result
 
 
+
+
+def recover_terminal_poa_structures(
+    raw_points: gpd.GeoDataFrame,
+    cayd_w: gpd.GeoDataFrame,
+    existing: gpd.GeoDataFrame,
+    client_structure_index: dict,
+    client: dict,
+    kmz: dict,
+    unit_to_m: float,
+    endpoint_tolerance_m: float = 1.0,
+    existing_tolerance_m: float = 15.0,
+    same_circuit_cluster_m: float = 15.0,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """Recover real terminal POA supports omitted by retained circuit paths.
+
+    A terminal is a raw 3D-wire endpoint within 1 m of a real DXF POA.
+    SoW/substation boundaries must NEVER suppress an observed physical POA.
+    Candidate markers are grouped *inside* a circuit (1/2/3 poles), and only
+    then matched with source attributes. Source absence gives blank fields.
+    The function never manufactures structures at naked circuit endpoints.
+    """
+    if raw_points is None or raw_points.empty or cayd_w is None or cayd_w.empty:
+        return existing, rows_to_gdf([], existing.crs)
+
+    by_endpoint = defaultdict(list)
+    # Endpoints from deliverable wires, whose circuits are already assigned.
+    for _, wr in cayd_w.iterrows():
+        circuit = txt(wr.get("CIRCUIT"))
+        row = txt(wr.get("ROW"))
+        if not circuit or not row:
+            continue
+        geom = wr.geometry
+        if geom is None or geom.is_empty:
+            continue
+        pieces = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+        for part in pieces:
+            if not hasattr(part, "coords") or len(part.coords) < 2:
+                continue
+            for c in (part.coords[0], part.coords[-1]):
+                by_endpoint[(row, circuit)].append((float(c[0]), float(c[1])))
+
+    valid = {k: cKDTree(np.asarray(xy)) for k, xy in by_endpoint.items() if xy}
+    # R01.05: an existing Structure of the same circuit suppresses a terminal
+    # candidate in ANY RoW. Keying by (RoW, circuit) duplicated POAs where a
+    # circuit crosses another RoW's corridor.
+    by_circuit = {}
+    if existing is not None and not existing.empty:
+        for c, sg in existing.groupby("CIRCUIT"):
+            if len(sg):
+                by_circuit[str(c)] = cKDTree(
+                    np.asarray([(g.x, g.y) for g in sg.geometry])
+                )
+    by_structure = {key: by_circuit.get(key[1]) for key in by_endpoint}
+
+    # Every point needs direct evidence of a real wire endpoint, not merely a
+    # nearby centreline or an unbounded source-structure nearest neighbour.
+    candidates = defaultdict(list)
+    seen_terminal_points = set()
+    for _, pt in raw_points.iterrows():
+        xy = (float(pt.geometry.x), float(pt.geometry.y))
+        for key, tree in valid.items():
+            dist, _ = tree.query(xy)
+            if float(dist) * unit_to_m > endpoint_tolerance_m:
+                continue
+            existing_tree = by_structure.get(key)
+            if existing_tree is not None:
+                existing_dist, _ = existing_tree.query(xy)
+                if float(existing_dist) * unit_to_m <= existing_tolerance_m:
+                    continue
+            # A point cannot be assigned to two near-parallel circuits merely
+            # because their wire endpoints happen to be within the search radius.
+            # R01.05: nor twice to the same circuit via two RoW keys.
+            seen_key = (key[1], int(pt.name))
+            if seen_key in seen_terminal_points:
+                continue
+            seen_terminal_points.add(seen_key)
+            candidates[key].append(pt)
+
+    rows = []
+    for (row, circuit), members in sorted(candidates.items()):
+        coords = np.asarray([(r.geometry.x, r.geometry.y) for r in members])
+        tree = cKDTree(coords)
+        uf = UnionFind(len(members))
+        for ia, ib in tree.query_pairs(same_circuit_cluster_m / unit_to_m):
+            uf.union(int(ia), int(ib))
+        groups = defaultdict(list)
+        for i, r in enumerate(members):
+            groups[uf.find(i)].append(r)
+        for i, group in enumerate(groups.values(), 1):
+            # In pathological long chains, do not infer a mega-structure.
+            group_xy = np.asarray([(r.geometry.x, r.geometry.y) for r in group])
+            if len(group) > 3 or (len(group) > 1 and float(np.max(
+                np.linalg.norm(group_xy[:, None, :] - group_xy[None, :, :], axis=2)
+            )) * unit_to_m > 25.0):
+                subgroups = [[r] for r in group]
+            else:
+                subgroups = [group]
+            for subgroup in subgroups:
+                xy = np.asarray([(r.geometry.x, r.geometry.y) for r in subgroup])
+                centre = Point(float(np.mean(xy[:, 0])), float(np.mean(xy[:, 1])))
+                source, d, reason = match_client_structure(
+                    centre, circuit, client_structure_index, unit_to_m
+                )
+                topo = f"TERM_{row}_{circuit}_{i:04d}"
+                support = pd.Series({"geometry": centre})
+                loc = derive_structure_xy(
+                    subgroup, support, None, source, unit_to_m,
+                    raw_points=raw_points,
+                )
+                point = loc["geometry"]
+                # Keep exact source geometry for DCWP only under existing
+                # source-distance and circuit-ownership checks in derive_structure_xy.
+                source_final, source_d, match = match_client_structure(
+                    point, circuit, client_structure_index, unit_to_m
+                )
+                if source_final is None:
+                    match = "DUMMY_TERMINAL_POA"
+                attrs = client_structure_values(source_final, topo)
+                original = {k: None for k in client_structure_index.get("delivery_source_fields", [])}
+                original.update(client_structure_all_values(source_final, client_structure_index))
+                voltage, company, _ = circuit_attributes(circuit_key(circuit), circuit, client, kmz)
+                krec = kmz.get(circuit_key(circuit))
+                row_name, row_dist = choose_row_for_point(point, krec, unit_to_m)
+                # R01.05: a Structure may only be delivered in a RoW that
+                # carries its circuit in the SoW.
+                circuit_rows = set((krec or {}).get("rows", {}) or {})
+                row_out = row if (not circuit_rows or row in circuit_rows) else (row_name or row)
+                rows.append({
+                    "ROW": row_out, "CIRCUIT": circuit, "VOLTAGE": voltage,
+                    "COMPANY": company, "STRUCT_ID": attrs["STRUCT_ID"],
+                    "TOPO_ID": topo, "PATH_ROLE": "TERMINAL_POA",
+                    **original,
+                    "SRC_GID": attrs["SRC_GID"], "SRC_LINE": attrs["SRC_LINE"],
+                    "SRC_STRUCT": attrs["SRC_STRUCT"],
+                    "SRC_X": attrs["SRC_X"], "SRC_Y": attrs["SRC_Y"],
+                    "SRC_DIST_M": source_d,
+                    "SRC_MATCH": match,
+                    "IS_DUMMY": int(source_final is None),
+                    "ROW_DIST_M": row_dist,
+                    **{k: v for k, v in loc.items() if k != "geometry"},
+                    "GROUND_Z": np.nan, "Z_SOURCE": "PENDING_LIDAR",
+                    "N_TERMINAL_POA": len(subgroup),
+                    "geometry": point,
+                })
+    recovered = rows_to_gdf(rows, existing.crs)
+    if recovered.empty:
+        return existing, recovered
+    combined = gpd.GeoDataFrame(
+        pd.concat([existing, recovered], ignore_index=True),
+        geometry="geometry", crs=existing.crs,
+    )
+    return combined, recovered
+
+
+def _source_match_identity(row):
+    """Physical source key; shared-circuit records may reuse it at one XY."""
+    gid = txt(row.get("GLOBALID"))
+    if gid:
+        return ("GLOBALID", gid)
+    p = row.geometry
+    return ("SOURCE_XY", round(float(p.x), 3), round(float(p.y), 3),
+            txt(row.get("STRUCTURE_")))
+
+
+def _corridor_axes_for_circuit(circuit, client, kmz):
+    """Connected reference components, each with its own longitudinal order.
+
+    A circuit can contain several disconnected SoW segments. Never project all
+    its structures onto only the longest segment or invent ordering across gaps.
+    """
+    from shapely.ops import linemerge
+    key = circuit_key(circuit)
+    for registry in (client, kmz):
+        rec = registry.get(key, {})
+        geom = rec.get("geometry")
+        if geom is None or geom.is_empty:
+            continue
+        if geom.geom_type == "LineString":
+            return [geom]
+        if geom.geom_type == "MultiLineString":
+            try:
+                merged = linemerge(geom)
+            except Exception:
+                merged = geom
+            if merged.geom_type == "LineString":
+                return [merged]
+            parts = [g for g in merged.geoms if g.geom_type == "LineString" and g.length > 0]
+            if parts:
+                return parts
+    return []
+
+
+def attribute_unmatched_structures_along_corridor(
+    structures, source_index, client, kmz, unit_to_m,
+    corridor_half_width_m=75.0,
+):
+    """One-to-one attribute-only recovery between existing matched anchors.
+
+    Physical POA geometry is never changed. The same circuit's source records
+    must lie in the reference corridor and preserve the ordering of known
+    Structure matches. Missing/ambiguous/outside records remain blank and
+    receive a QA warning. The 75 m criterion is *lateral corridor width*, not
+    a circular search radius or an along-circuit distance limit.
+    """
+    if structures is None or structures.empty:
+        return structures, pd.DataFrame()
+    result = structures.copy()
+    qa = []
+    source_groups = source_index.get("groups", {})
+    srcfields = source_index.get("delivery_source_fields", [])
+    for circuit, indexes in result.groupby("CIRCUIT", dropna=True).groups.items():
+        key = circuit_key(circuit)
+        pack = source_groups.get(key)
+        if pack is None:
+            continue
+        axes = _corridor_axes_for_circuit(circuit, client, kmz)
+        if not axes:
+            for i in indexes:
+                if int(result.at[i,"IS_DUMMY"]) == 1:
+                    qa.append({"OUTPUT_INDEX":int(i),"CIRCUIT":str(circuit),"STATUS":"NO_ORDERABLE_CORRIDOR"})
+            continue
+        def nearest_axis(point):
+            return min(range(len(axes)), key=lambda k: point.distance(axes[k]))
+        for part_id, axis in enumerate(axes):
+            local_indexes = [i for i in indexes if nearest_axis(result.at[i,"geometry"]) == part_id]
+            if not local_indexes:
+                continue
+            indexes_in_part = local_indexes
+            sources = pack[0]
+            # Reserve source rows already attributed with a unique source identity.
+            known = []
+            used = set()
+            source_items = []
+            for j, sr in sources.iterrows():
+                if sr.geometry is None or sr.geometry.is_empty: continue
+                if nearest_axis(sr.geometry) != part_id:
+                    continue
+                offset = float(sr.geometry.distance(axis)) * unit_to_m
+                source_items.append((int(j), sr, axis.project(sr.geometry), offset,
+                                     _source_match_identity(sr)))
+            for i in indexes_in_part:
+                r = result.loc[i]
+                if int(r.get("IS_DUMMY",0) or 0) == 1: continue
+                gid = txt(r.get("SRC_GID"))
+                src_struct = txt(r.get("SRC_STRUCT"))
+                xp, yp = r.get("SRC_X"), r.get("SRC_Y")
+                for j, sr, spos, off, ident in source_items:
+                    equal = (gid and gid == txt(sr.get("GLOBALID"))) or (
+                        src_struct and src_struct == txt(sr.get("STRUCTURE_"))
+                        and pd.notna(xp) and pd.notna(yp)
+                        and sr.geometry.distance(Point(float(xp), float(yp))) < 0.01
+                    )
+                    if equal:
+                        known.append((axis.project(r.geometry), spos, int(i)))
+                        used.add(ident)
+                        break
+            pending = []
+            for i in indexes_in_part:
+                r = result.loc[i]
+                if int(r.get("IS_DUMMY",0) or 0) == 1:
+                    pending.append((axis.project(r.geometry), int(i)))
+            pending.sort()
+            for opos, i in pending:
+                r = result.loc[i]
+                lateral = float(r.geometry.distance(axis)) * unit_to_m
+                status = "OUTSIDE_CORRIDOR" if lateral > corridor_half_width_m else "NO_CANDIDATE"
+                choices = []
+                if lateral <= corridor_half_width_m:
+                    for j, sr, spos, soff, ident in source_items:
+                        if ident in used or soff > corridor_half_width_m:
+                            continue
+                        # Existing matched control structures establish the monotonic
+                        # order. Sources outside this bracket cannot be reassigned.
+                        if any((kpos < opos and spos <= kspos) or
+                               (kpos > opos and spos >= kspos)
+                               for kpos, kspos, _ in known):
+                            continue
+                        # Do not leap across a nearby, still-unmatched POA:
+                        # maintain an ordered one-to-one mapping.
+                        d_along = abs(spos-opos)*unit_to_m
+                        d_lateral = abs(soff-lateral)
+                        choices.append((d_along + 0.25*d_lateral, j, sr, spos, ident, d_along))
+                    choices.sort(key=lambda v: (v[0],v[1]))
+                    ambiguous = len(choices)>1 and choices[1][0] <= choices[0][0]*1.5 + 5.0
+                    alone_in_bracket = False
+                    if ambiguous:
+                        # R01.05: when this is the only unmatched POA between
+                        # its two known anchors, the order cannot be broken by
+                        # choosing: take the nearest source and flag it, instead
+                        # of leaving STRUCT_ID blank (Cluster 21: one POA between
+                        # 242 and 239.5 with source 240 at 38 m, 241 at 59 m).
+                        lo = max([k for k, _, _ in known if k < opos], default=None)
+                        hi = min([k for k, _, _ in known if k > opos], default=None)
+                        if lo is not None and hi is not None:
+                            n_pending = sum(1 for pos_, idx_ in pending if lo < pos_ < hi and
+                                            int(result.at[idx_, "IS_DUMMY"] or 0) == 1)
+                            alone_in_bracket = n_pending == 1
+                    if ambiguous and not alone_in_bracket:
+                        status = "AMBIGUOUS_ORDER"
+                    elif choices:
+                        score, j, src, srcpos, ident, along_m = choices[0]
+                        # Reject assignments crossing existing control anchors or
+                        # another already accepted output (known is updated below).
+                        vals = client_structure_values(src, txt(r.get("TOPO_ID")))
+                        source_attrs = client_structure_all_values(src, source_index)
+                        for fld in srcfields:
+                            if fld in result.columns:
+                                result.at[i, fld] = source_attrs.get(fld)
+                        for fld in ("STRUCT_ID", "SRC_GID", "SRC_LINE", "SRC_STRUCT", "SRC_X", "SRC_Y"):
+                            if fld in result.columns:
+                                result.at[i,fld] = vals.get(fld)
+                        # Formal delivery fields are not always identical to the
+                        # mapped internal source-field names. Populate both.
+                        for fld in ("MATERIAL", "STR_TYPE", "YEAR_CONST", "GLOBALID"):
+                            if fld in result.columns:
+                                result.at[i,fld] = src.get(fld)
+                        result.at[i,"SRC_DIST_M"] = float(r.geometry.distance(src.geometry))*unit_to_m
+                        result.at[i,"SRC_MATCH"] = ("CORRIDOR_AMBIGUOUS_NEAREST" if ambiguous
+                                                    else "CORRIDOR_ORDERED")
+                        result.at[i,"IS_DUMMY"] = 0
+                        used.add(ident)
+                        known.append((opos,srcpos,i))
+                        status = "MATCHED_AMBIGUOUS_NEAREST" if ambiguous else "MATCHED"
+                qa.append({"OUTPUT_INDEX":i,"CIRCUIT":str(circuit),"STATUS":status,
+                           "CROSS_OFFSET_M":round(lateral,2),
+                           "SOURCE_STRUCT":txt(choices[0][2].get("STRUCTURE_")) if choices else "",
+                           "ALONG_OFFSET_M":round(choices[0][5],2) if choices else None})
+    return result, pd.DataFrame(qa)
+
+
 def build_caydence_structures_by_row(
     structures_final: gpd.GeoDataFrame,
     selected_rows: set[str],
@@ -3674,8 +5179,328 @@ def build_caydence_structures_by_row(
     selected = {txt(x) for x in (selected_rows or set()) if txt(x)}
     if selected and "ROW" in out.columns:
         out = out[out["ROW"].astype(str).isin(selected)].copy()
-    return out
+    return dedupe_caydence_structures(out)
 
+
+# Fields that describe the structure itself, not how the tool positioned it.
+_CAYD_ATTR_SKIP = {
+    "ROW", "CIRCUIT", "VOLTAGE", "COMPANY", "TOPO_ID", "PATH_ROLE", "geometry",
+}
+
+
+def dedupe_caydence_structures(out: gpd.GeoDataFrame, same_xy_m: float | None = None) -> gpd.GeoDataFrame:
+    """R01.05: no duplicate Caydence records within a RoW.
+
+    Default (20/11, final): one record per physical structure; its CIRCUIT
+    lists every circuit on the support, kept record first ("1500;1605").
+    BAKERY_CAYD_DEDUPE=circuit: one record per circuit instead.
+
+    A support carrying several circuits produces one circuit Structure per
+    circuit. Caydence RoW Structures keep only the record with the fullest
+    source attribution: most filled attributes, then a real (non-dummy) source
+    match, then the smallest source distance, then circuit name. Duplicates of
+    the same support in two different RoWs (RoW boundary rule) are kept.
+    Same support = same TOPO_ID, or markers within 0.5 m in the same RoW.
+    The dropped records are listed in out.attrs["dedupe_qa"].
+    """
+    out.attrs["dedupe_qa"] = pd.DataFrame()
+    if same_xy_m is None and out.crs is not None:
+        try:
+            same_xy_m = 0.5 / float(out.crs.axis_info[0].unit_conversion_factor)
+        except Exception:
+            same_xy_m = None
+    if out.empty or "TOPO_ID" not in out.columns or "ROW" not in out.columns:
+        return out
+    topo = out["TOPO_ID"].astype(str).str.strip()
+    has_topo = topo.ne("") & topo.str.lower().ne("nan") & topo.str.lower().ne("none")
+    # Union-find per RoW: same support TOPO_ID, or a different marker at the
+    # same position (<= same_xy_m, e.g. a terminal POA on another circuit's pole).
+    pos = list(out.index)
+    parent = {i: i for i in pos}
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # 20/11: one record per physical support, CIRCUIT = all circuits joined
+    # with ";" (team decision). BAKERY_CAYD_DEDUPE=circuit: one per circuit.
+    per_support = os.environ.get("BAKERY_CAYD_DEDUPE", "support").strip().lower() != "circuit"
+    rowv = out["ROW"].astype(str) if per_support else (
+        out["ROW"].astype(str) + "|" + out["CIRCUIT"].astype(str))
+    for row in sorted(set(rowv)):
+        idx = list(out.index[rowv == row])
+        first = {}
+        for i in idx:
+            if has_topo.loc[i]:
+                t = topo.loc[i]
+                if t in first:
+                    union(first[t], i)
+                else:
+                    first[t] = i
+        if len(idx) > 1 and same_xy_m is not None and same_xy_m > 0:
+            xy = np.asarray([[float(out.at[i, "geometry"].x), float(out.at[i, "geometry"].y)] for i in idx])
+            from scipy.spatial import cKDTree
+            for a, b in cKDTree(xy).query_pairs(float(same_xy_m)):
+                union(idx[a], idx[b])
+    groups = defaultdict(list)
+    for i in pos:
+        groups[find(i)].append(i)
+    dup_groups = [g for g in groups.values() if len(g) > 1]
+    if not dup_groups:
+        return out
+    attr_cols = [c for c in out.columns if c not in _CAYD_ATTR_SKIP]
+
+    def filled(r):
+        n = 0
+        for c in attr_cols:
+            v = r.get(c)
+            if v is None:
+                continue
+            if isinstance(v, float) and np.isnan(v):
+                continue
+            if txt(v) == "":
+                continue
+            n += 1
+        return n
+
+    drop, qa = [], []
+    for idx in dup_groups:
+        scored = []
+        for i in idx:
+            r = out.loc[i]
+            dummy = txt(r.get("IS_DUMMY")) in {"1", "True", "true", "Y"}
+            sd = r.get("SRC_DIST_M")
+            try:
+                sd = float(sd)
+                if np.isnan(sd):
+                    sd = 1e9
+            except Exception:
+                sd = 1e9
+            scored.append((-filled(r), int(dummy), sd, txt(r.get("CIRCUIT")), i))
+        scored.sort()
+        keep = scored[0][-1]
+        for sc in scored[1:]:
+            i = sc[-1]
+            drop.append(i)
+            qa.append({
+                "ROW": txt(out.at[i, "ROW"]), "TOPO_ID": txt(out.at[i, "TOPO_ID"]),
+                "KEPT_TOPO_ID": txt(out.at[keep, "TOPO_ID"]),
+                "KEPT_CIRCUIT": txt(out.at[keep, "CIRCUIT"]),
+                "KEPT_STRUCT_ID": txt(out.at[keep, "STRUCT_ID"]) if "STRUCT_ID" in out else "",
+                "KEPT_FILLED": -scored[0][0],
+                "DROPPED_CIRCUIT": txt(out.at[i, "CIRCUIT"]),
+                "DROPPED_STRUCT_ID": txt(out.at[i, "STRUCT_ID"]) if "STRUCT_ID" in out else "",
+                "DROPPED_FILLED": -sc[0],
+            })
+    res = out.drop(index=drop)
+    if per_support:
+        # 20/11: the kept record lists every circuit on the support, e.g. "1500;1605".
+        for idx in dup_groups:
+            keep_i = [i for i in idx if i in res.index]
+            if not keep_i:
+                continue
+            circs = []
+            for i in [keep_i[0]] + [i for i in idx if i != keep_i[0]]:
+                for c in txt(out.at[i, "CIRCUIT"]).split(";"):
+                    if c and c not in circs:
+                        circs.append(c)
+            res.at[keep_i[0], "CIRCUIT"] = ";".join(circs)
+    res.attrs["dedupe_qa"] = pd.DataFrame(qa)
+    return res
+
+
+
+
+
+def repair_caydence_earth_continuity(
+    cayd_w: gpd.GeoDataFrame, unit_to_m: float,
+    endpoint_max_m: float = 2.0,
+) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
+    """Preserve a known EARTH conductor through a short unlabeled terminal run.
+
+    The supplied contractor DXF may use a generic Mainline layer rather than
+    explicit EARTH/PHASE layers. In that case continuity is only evidence when
+    a physically connected 3D chain has >=2 EARTH spans, >=80% EARTH majority,
+    and <=2 isolated non-EARTH spans. Never override an explicit DXF layer.
+    Avoid junctions when more than one conductor is a viable continuation.
+    """
+    if cayd_w is None or cayd_w.empty:
+        return cayd_w, pd.DataFrame()
+    out = cayd_w.copy().reset_index(drop=True)
+    endpoints = []
+    for i, r in out.iterrows():
+        geom = r.geometry
+        parts = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+        if len(parts) != 1 or not hasattr(parts[0], "coords"):
+            continue
+        coords = list(parts[0].coords)
+        if len(coords) < 2 or len(coords[0]) < 3:
+            continue
+        for edge in (0, -1):
+            a = np.asarray(coords[edge][:3], dtype=float)
+            b = np.asarray(coords[1 if edge == 0 else -2][:3], dtype=float)
+            v = b[:2]-a[:2]
+            norm = float(np.linalg.norm(v))
+            if norm <= 1e-8:
+                continue
+            endpoints.append((i, a, v/norm, txt(r.get("ROW"))))
+    if not endpoints:
+        return out, pd.DataFrame()
+    tree = cKDTree(np.asarray([r[1] for r in endpoints]))
+    uf = UnionFind(len(out))
+    for ei, (i, xyz, tangent, row) in enumerate(endpoints):
+        candidates=[]
+        for ej in tree.query_ball_point(xyz, endpoint_max_m/unit_to_m):
+            j, xyz2, tangent2, row2 = endpoints[int(ej)]
+            if i == j or row != row2:
+                continue
+            if float(np.dot(tangent,tangent2)) > -0.78:
+                continue
+            dist=float(np.linalg.norm(xyz-xyz2))*unit_to_m
+            if dist <= endpoint_max_m:
+                candidates.append((dist,int(j)))
+        candidates.sort()
+        if not candidates:
+            continue
+        if len(candidates)>1 and candidates[1][0] < max(0.75,candidates[0][0]*1.5):
+            continue
+        uf.union(i,candidates[0][1])
+    chains=defaultdict(list)
+    for i in range(len(out)):
+        chains[uf.find(i)].append(i)
+    qa=[]
+    for inds in chains.values():
+        if len(inds)<3:
+            continue
+        # Never use DXF-explicit types as changeable minority.
+        earth=[i for i in inds if txt(out.at[i,'WIRE_TYPE']).upper()=='EARTH']
+        minority=[i for i in inds if txt(out.at[i,'WIRE_TYPE']).upper()!='EARTH'
+                  and _infer_caydence_wire_type(txt(out.at[i,'SRC_LAYER']),'')=='OTHER']
+        known_non_earth=len(inds)-len(earth)-len(minority)
+        if (len(earth)<2 or known_non_earth>0 or not minority
+                or len(minority)>2 or len(earth)/len(inds)<0.80):
+            continue
+        # Do not correct interior segments unconditionally: keep a reviewable,
+        # narrowly bounded single/two-span minority surrounded by a stable chain.
+        for i in minority:
+            old=txt(out.at[i,'WIRE_TYPE'])
+            out.at[i,'WIRE_TYPE']='EARTH'
+            qa.append({'ROW':txt(out.at[i,'ROW']), 'WIRE_ID':txt(out.at[i,'WIRE_ID']),
+                       'CIRCUIT':txt(out.at[i,'CIRCUIT']),
+                       'OLD_TYPE':old,'NEW_TYPE':'EARTH',
+                       'ACTION':'EARTH_3D_CONTINUITY','CHAIN_SIZE':len(inds)})
+    return out,pd.DataFrame(qa)
+
+
+def repair_caydence_circuit_continuity(
+    cayd_w: gpd.GeoDataFrame,
+    client: dict,
+    kmz: dict,
+    unit_to_m: float,
+    endpoint_max_m: float = 2.0,
+    min_chain_size: int = 10,
+    min_majority_fraction: float = 0.90,
+    max_outlier_count: int = 2,
+) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
+    """Repair isolated circuit attribution spikes on a continuous 3D conductor.
+
+    Joins are based on original XYZ endpoints AND opposed XY tangents.
+    No wire vertices/geometry are modified. Circuit switches between distinct
+    physical conductor tracks are not assumed merely from an 8-wire/4+4 rule.
+    A non-dominant run of >2 pieces or a mixed/ambiguous track is left intact.
+    """
+    if cayd_w is None or cayd_w.empty:
+        return cayd_w, pd.DataFrame()
+    out = cayd_w.copy().reset_index(drop=True)
+    endpoints = []
+    for i, r in out.iterrows():
+        geom = r.geometry
+        parts = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+        if len(parts) != 1 or not hasattr(parts[0], "coords"):
+            continue
+        coords = list(parts[0].coords)
+        if len(coords) < 2 or len(coords[0]) < 3:
+            continue
+        for edge in (0, -1):
+            a = np.asarray(coords[edge][:3], dtype=float)
+            b = np.asarray(coords[1 if edge == 0 else -2][:3], dtype=float)
+            tangent = b[:2] - a[:2]
+            norm = float(np.linalg.norm(tangent))
+            if norm < 1e-8:
+                continue
+            endpoints.append((int(i), edge, a, tangent/norm, txt(r.get("ROW"))))
+    if not endpoints:
+        return out, pd.DataFrame()
+
+    points = np.asarray([e[2] for e in endpoints], dtype=float)
+    tree = cKDTree(points)
+    uf = UnionFind(len(out))
+    candidate_links = []
+    for k, (i, edge, pos, tangent, row) in enumerate(endpoints):
+        possibles = []
+        for j in tree.query_ball_point(pos, endpoint_max_m / unit_to_m):
+            other, _, xyz, direction, other_row = endpoints[int(j)]
+            if i == other or row != other_row:
+                continue
+            if float(np.dot(tangent, direction)) > -0.78:
+                continue
+            dist = float(np.linalg.norm(pos-xyz)) * unit_to_m
+            if dist <= endpoint_max_m:
+                possibles.append((dist, int(other)))
+        if not possibles:
+            continue
+        possibles.sort()
+        if len(possibles) > 1 and possibles[1][0] < max(0.75, possibles[0][0] * 1.5):
+            continue  # Cannot identify one continuous physical wire uniquely.
+        candidate_links.append((i, possibles[0][1]))
+    for i, j in candidate_links:
+        uf.union(i, j)
+
+    groups = defaultdict(list)
+    for i in range(len(out)):
+        groups[uf.find(i)].append(i)
+    qa = []
+    for inds in groups.values():
+        if len(inds) < min_chain_size:
+            continue
+        labels = Counter(txt(out.at[i, "CIRCUIT"]) for i in inds)
+        labels.pop("", None)
+        if len(labels) < 2:
+            continue
+        major, major_n = labels.most_common(1)[0]
+        minority = [(key, count) for key, count in labels.items() if key != major]
+        if (major_n / len(inds) < min_majority_fraction
+                or sum(n for _, n in minority) > max_outlier_count):
+            qa.append({"ROW": txt(out.at[inds[0], "ROW"]), "WIRE_ID": "",
+                       "OLD_CIRCUIT": ";".join(f"{k}:{v}" for k,v in labels.items()),
+                       "NEW_CIRCUIT": "", "ACTION": "REVIEW_MIXED_CHAIN", "CHAIN_SIZE": len(inds)})
+            continue
+        for i in inds:
+            old = txt(out.at[i, "CIRCUIT"])
+            if old == major or not old:
+                continue
+            ref_voltage, ref_company, _ = circuit_attributes(
+                circuit_key(major), major, client, kmz
+            )
+            out.at[i, "CIRCUIT"] = major
+            out.at[i, "VOLTAGE"] = txt(ref_voltage)
+            out.at[i, "COMPANY"] = txt(ref_company)
+            out.at[i, "ATTR_METHOD"] = "3D_TRACK_CONTINUITY"
+            qa.append({"ROW": txt(out.at[i, "ROW"]),
+                       "WIRE_ID": txt(out.at[i, "WIRE_ID"]),
+                       "OLD_CIRCUIT": old, "NEW_CIRCUIT": major,
+                       "ACTION": "CORRECTED_ISOLATED_TRACK_SPIKE",
+                       "CHAIN_SIZE": len(inds)})
+    return out, pd.DataFrame(qa, columns=[
+        "ROW", "WIRE_ID", "OLD_CIRCUIT", "NEW_CIRCUIT", "ACTION", "CHAIN_SIZE"
+    ])
 
 def build_caydence_row_products(
     wires: gpd.GeoDataFrame,
@@ -3733,6 +5558,21 @@ def build_caydence_row_products(
         })
 
     cayd_w = rows_to_gdf(wire_rows, wires.crs)
+
+    cayd_w, continuity_qa = repair_caydence_circuit_continuity(
+        cayd_w, client, kmz, unit_to_m
+    )
+    # Circuit continuity is free to update CIRCUIT, never the explicit DXF
+    # conductor role. This also covers substation terminal wire entities.
+    for idx, r in cayd_w.iterrows():
+        explicit = _infer_caydence_wire_type(txt(r.get("SRC_LAYER")), "")
+        if explicit in {"EARTH", "PHASE", "GUY"}:
+            cayd_w.at[idx, "WIRE_TYPE"] = explicit
+    # Generic Mainline DXF levels provide no explicit type. In this case only,
+    # a stable physical EARTH conductor chain may recover missing terminal role.
+    cayd_w, earth_continuity_qa = repair_caydence_earth_continuity(cayd_w, unit_to_m)
+    cayd_w.attrs["earth_continuity_qa"] = earth_continuity_qa
+    cayd_w.attrs["continuity_qa"] = continuity_qa
 
     n_wire_input = int(len(wires))
     n_wire_output = int(len(cayd_w))
@@ -5356,6 +7196,74 @@ def print_preflight_table(table: pd.DataFrame) -> None:
             f"{mu_s:>8}   {aoi_s:>8}   {inside_s:>12}   {aoi:<9} {action}"
         )
 
+PREFLIGHT_CACHE_VERSION = 1
+
+
+def _path_fingerprint(path) -> dict:
+    """Cheap fingerprint of a file or folder: names, sizes and mtimes only."""
+    if path is None:
+        return {"path": None}
+    p = Path(path)
+    if not p.exists():
+        return {"path": str(p), "missing": True}
+    items = []
+    if p.is_file():
+        st = p.stat()
+        items.append((p.name, int(st.st_size), int(st.st_mtime_ns)))
+    else:
+        for q in sorted(x for x in p.rglob("*") if x.is_file()):
+            st = q.stat()
+            items.append((q.relative_to(p).as_posix(), int(st.st_size), int(st.st_mtime_ns)))
+    enc = json.dumps(items, separators=(",", ":")).encode("utf-8")
+    return {"name": p.name, "n": len(items), "sha256": hashlib.sha256(enc).hexdigest()}
+
+
+def _code_fingerprint(*funcs) -> str:
+    import inspect
+    h = hashlib.sha256()
+    for f in funcs:
+        try:
+            h.update(inspect.getsource(f).encode("utf-8"))
+        except Exception:
+            h.update(getattr(f, "__name__", repr(f)).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _preflight_cached(cache_dir, name, key: dict, compute, label: str):
+    """Return compute() through a pickle cache keyed by key (inputs + code)."""
+    import pickle
+    import platform
+    key = dict(key)
+    key["_cache_version"] = PREFLIGHT_CACHE_VERSION
+    key["_python"] = platform.python_version()
+    key["_pandas"] = pd.__version__
+    key["_geopandas"] = gpd.__version__
+    digest = hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    cache_dir = Path(cache_dir)
+    data = cache_dir / f"{name}.pkl"
+    meta = cache_dir / f"{name}.json"
+    if os.environ.get("BAKERY_NO_PREFLIGHT_CACHE") != "1" and data.is_file() and meta.is_file():
+        try:
+            if json.loads(meta.read_text(encoding="utf-8")).get("digest") == digest:
+                with data.open("rb") as fh:
+                    value = pickle.load(fh)
+                info(f"  Reusing cached {label} (inputs unchanged).")
+                return value, digest
+        except Exception as exc:
+            info(f"  Cache for {label} not usable ({exc}); recalculating.")
+    value = compute()
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp = data.with_suffix(".pkl.tmp")
+        with tmp.open("wb") as fh:
+            pickle.dump(value, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(data)
+        meta.write_text(json.dumps({"digest": digest, "key": key}, indent=2, default=str), encoding="utf-8")
+    except Exception as exc:
+        info(f"  WARNING: could not write preflight cache {name}: {exc}")
+    return value, digest
+
+
 def run_preflight(
     lidar_source: Path,
     client_source: Path,
@@ -5377,16 +7285,44 @@ def run_preflight(
     crs = CRS.from_epsg(epsg)
     with tempfile.TemporaryDirectory(prefix="eversource_preflight_") as td_raw:
         td = Path(td_raw)
+        # R01.05: the LiDAR tile index, SoW/MU reading and the coverage table
+        # are cached under 00_preflight/00_cache. Each cache is keyed by a
+        # cheap fingerprint of its inputs (names, sizes, mtimes; ZIP directory)
+        # and by the code that builds it, so any change recalculates it.
+        # Set BAKERY_NO_PREFLIGHT_CACHE=1 or delete 00_cache to force a rebuild.
+        cache_dir = output / "00_cache"
         info("Indexing LiDAR input...")
-        physical_tiles, inferred = build_lidar_tile_footprints(lidar_source, crs, td, year, None)
+        lidar_fp = _lidar_source_fingerprint(lidar_source)["sha256"]
+        (physical_tiles, inferred), tiles_key = _preflight_cached(
+            cache_dir, "lidar_tiles",
+            {"lidar": lidar_fp, "epsg": int(epsg), "year": int(year),
+             "code": _code_fingerprint(build_lidar_tile_footprints, discover_lidar_files)},
+            lambda: build_lidar_tile_footprints(lidar_source, crs, td, year, None),
+            "LiDAR tile index",
+        )
         info(f"  tiles: {len(physical_tiles):,}")
         if inferred:
             info(f"  nominal tile size: {inferred:g} CRS units")
 
         info("Reading Project SoW + Management Units...")
-        kmz_refs = project_kmz(parse_sow_kmz(kmz_path), crs)
-        gdb = resolve_management_units_gdb(management_units_source, client_source, td)
-        mus, mu_review = load_management_units(gdb, crs, kmz_refs, "Eversource")
+
+        def _read_sow_mu():
+            refs = project_kmz(parse_sow_kmz(kmz_path), crs)
+            gdb_path = resolve_management_units_gdb(management_units_source, client_source, td)
+            m, mr = load_management_units(gdb_path, crs, refs, "Eversource")
+            return refs, m, mr
+
+        (kmz_refs, mus, mu_review), mus_key = _preflight_cached(
+            cache_dir, "sow_management_units",
+            {"kmz": _path_fingerprint(kmz_path),
+             "mu_source": _path_fingerprint(management_units_source),
+             "client_source": _path_fingerprint(client_source),
+             "epsg": int(epsg),
+             "code": _code_fingerprint(parse_sow_kmz, project_kmz,
+                                       resolve_management_units_gdb, load_management_units)},
+            _read_sow_mu,
+            "SoW + Management Units",
+        )
         known_rows = sorted({txt(r.row) for r in kmz_refs if txt(r.row)} | set(mus["ROW"].astype(str)))
 
         info(f"Checking AOIs under: {aoi_dir}")
@@ -5410,11 +7346,25 @@ def run_preflight(
             except Exception as exc:
                 info(f"  WARNING: could not read per-tile boundary QA for candidate coverage: {exc}")
 
-        table = build_preflight_table(
-            mus, physical_tiles, aois, lidar_boundary=lidar_boundary,
-            lidar_boundary_tiles=boundary_tiles
+        def _coverage_table():
+            t = build_preflight_table(
+                mus, physical_tiles, aois, lidar_boundary=lidar_boundary,
+                lidar_boundary_tiles=boundary_tiles
+            )
+            return add_point_processing_summary(t, physical_tiles, aois)
+
+        info("Calculating RoW / AOI / LiDAR coverage...")
+        table, _ = _preflight_cached(
+            cache_dir, "coverage_table",
+            {"tiles": tiles_key, "mus": mus_key,
+             "aoi": _path_fingerprint(aoi_dir),
+             "boundary": _path_fingerprint(output / "00_lidar_boundary_cache.json"),
+             "boundary_tiles": _path_fingerprint(boundary_tiles_gpkg),
+             "code": _code_fingerprint(build_preflight_table, add_point_processing_summary,
+                                       discover_aoi_polygons)},
+            _coverage_table,
+            "coverage table",
         )
-        table = add_point_processing_summary(table, physical_tiles, aois)
 
         spatial_gpkg = output / "00_preflight_spatial.gpkg"
         if spatial_gpkg.exists():
@@ -6070,6 +8020,19 @@ def derive_structure_xy(
             conf = "REVIEW"
             geom_type = "AMBIGUOUS_MULTI_MARKER"
 
+    # DCWP has a physical middle pole. Where the contractor provides fewer
+    # than three distinguishable legs, a nearby circuit-matched source location
+    # is a better candidate than the single attachment POA. Never extrapolate
+    # across an unbounded source distance.
+    if (_normalise_structure_type(client_row.get("STR_TYPE") if client_row is not None else "") == "DCWP"
+            and client_pt is not None and n < 3
+            and float(p.distance(client_pt)) * unit_to_m <= 15.0):
+        p = client_pt
+        rule = "DCWP_SOURCE_MIDDLE_CANDIDATE"
+        source = "CLIENT_DCWP"
+        conf = "MEDIUM"
+        geom_type = "DCWP_SOURCE_MIDDLE"
+
     # ------------------------------------------------------------------
     # Source-vs-geometry QA only. Never drives the chosen point.
     # ------------------------------------------------------------------
@@ -6166,7 +8129,7 @@ def _route_records_for_circuit(path: dict[str, Any]) -> list[dict[str, Any]]:
     }]
     for branch in path.get("BRANCHES", []) or []:
         routes.append({
-            "PATH_ROLE": "TAP_BRANCH",
+            "PATH_ROLE": txt(branch.get("PATH_ROLE")) or "TAP_BRANCH",
             "BRANCH_ID": txt(branch.get("BRANCH_ID")),
             "SEGMENT_ID": txt(branch.get("SEGMENT_ID")),
             "ANCHOR_NODE": txt(branch.get("ANCHOR_NODE")),
@@ -6262,12 +8225,14 @@ def build_final_products(
         total_spans = 0
         tap_spans = 0
 
-        for route in _route_records_for_circuit(path):
-            if not route["BUNDLES"]:
-                continue
-
+        circuit_routes = [r for r in _route_records_for_circuit(path) if r["BUNDLES"]]
+        circuit_mixed = any(
+            bundle_is_mixed(blookup[x]) for r in circuit_routes for x in r["BUNDLES"]
+        )
+        for route in circuit_routes:
             selected, joins = select_phase_sequence(
-                route, blookup, supports, unit_to_m
+                route, blookup, supports, unit_to_m,
+                outer_on_horizontal=circuit_mixed,
             )
             if not selected:
                 continue
@@ -6278,6 +8243,15 @@ def build_final_products(
                     float(wire_simplify_m) / unit_to_m,
                 )
             )
+
+            _nodes = route["NODES"]
+            _node_xy = []
+            for _sid in _nodes[1:-1]:
+                _sp = by_sid.get(txt(_sid)) if hasattr(by_sid, "get") else None
+                _node_xy.append((float(_sp.geometry.x), float(_sp.geometry.y)) if _sp is not None else None)
+            selected, _n_smoothed = smooth_small_joins(
+                selected, JOIN_SMOOTH_M / unit_to_m, node_xy=_node_xy,
+                max_bridge_units=JOIN_BRIDGE_M / unit_to_m)
 
             route_geom = concatenate_selected(selected)
             if route_geom is None:
@@ -6339,10 +8313,16 @@ def build_final_products(
                     "ARRANGEMENT": b["ARRANGEMENT"],
                     "ATTR_CONF": txt(b.get("CONF")),
                     "SELECT_METHOD": (
-                        "HORIZONTAL_CENTRAL"
-                        if b["ARRANGEMENT"] == "HORIZONTAL"
-                        else "VERTICAL_CONTINUITY"
+                        ("HORIZONTAL_CENTRAL" if b["ARRANGEMENT"] == "HORIZONTAL" else "MIXED_CENTRAL")
+                        if sel.get("LANE") == "CENTRAL"
+                        else ("VERTICAL_CONTINUITY" if sel.get("LANE") == "LEGACY"
+                              else "OUTER_LANE")
                     ),
+                    "LANE": txt(sel.get("LANE")),
+                    "LANE_OK": int(sel.get("LANE_OK", 1)),
+                    "LANE_WHY": txt(sel.get("LANE_WHY")),
+                    "SIDE_CLASS": txt(sel.get("SIDE_CLASS")),
+                    "DIAG_NODE": int(sel.get("DIAGONAL_TO_NODE", 0)),
                     "ROW_DIST_M": row_dist,
                     "LENGTH_M": float(geom2.length) * unit_to_m,
                     "geometry": geom2,
@@ -6472,14 +8452,16 @@ def build_final_products(
             if src_row_final is not None:
                 src_row = src_row_final
                 src_method = src_method_final
+            else:
+                src_row = None
+                src_method = src_method_final
 
             row_name, row_dist = choose_row_for_point(
                 p2, krec, unit_to_m
             )
             sval = client_structure_values(src_row, sid)
-            source_attrs = client_structure_all_values(
-                src_row, client_structure_index
-            )
+            source_attrs = {fld: None for fld in client_structure_index.get("delivery_source_fields", [])}
+            source_attrs.update(client_structure_all_values(src_row, client_structure_index))
 
             roles = node_roles.get(sid, set())
             if "MAIN" in roles and "TAP_BRANCH" in roles:
@@ -6504,7 +8486,8 @@ def build_final_products(
                 "SRC_X": sval["SRC_X"],
                 "SRC_Y": sval["SRC_Y"],
                 "SRC_DIST_M": src_dist,
-                "SRC_MATCH": src_method,
+                "SRC_MATCH": (src_method if src_row is not None else "DUMMY_NO_SOURCE"),
+                "IS_DUMMY": int(src_row is None),
                 "ROW_DIST_M": row_dist,
                 **{
                     k: v
@@ -6574,6 +8557,697 @@ def structure_delivery_columns(
     return ordered
 
 
+def reassign_caydence_row_to_circuit_rows(cayd_w, kmz, selected_rows, unit_to_m):
+    """R01.05: a Caydence wire attributed to a circuit belongs to a RoW that
+    carries that circuit in the SoW. Wires whose nearest-RoW choice disagrees
+    are moved to the nearest of the circuit's own (selected) RoWs.
+    Unattributed wires and circuits without SoW RoWs are left unchanged."""
+    if cayd_w is None or cayd_w.empty or "CIRCUIT" not in cayd_w.columns:
+        return cayd_w, pd.DataFrame()
+    out = cayd_w.copy()
+    qa = []
+    sel = set(selected_rows or [])
+    for i, r in out.iterrows():
+        circuit = txt(r.get("CIRCUIT"))
+        if not circuit:
+            continue
+        krec = kmz.get(circuit_key(circuit))
+        rows = dict((krec or {}).get("rows", {}) or {})
+        if sel:
+            rows = {k: v for k, v in rows.items() if k in sel}
+        cur = txt(r.get("ROW"))
+        if not rows or cur in rows:
+            continue
+        p = midpoint(r.geometry)
+        best = min(rows.items(), key=lambda kv: float(p.distance(kv[1])))
+        out.at[i, "ROW"] = best[0]
+        qa.append({"WIRE_ID": txt(r.get("WIRE_ID")), "CIRCUIT": circuit,
+                   "OLD_ROW": cur, "NEW_ROW": best[0],
+                   "NEW_ROW_DIST_M": float(p.distance(best[1])) * unit_to_m})
+    return out, pd.DataFrame(qa)
+
+
+ROW_OVERLAP_TOL_M = 15.0
+ROW_STRUCTURE_ANCHOR_M = 15.0
+
+
+def _split_rows(value) -> list[str]:
+    return [t.strip() for t in str(value or "").replace(",", ";").split(";")
+            if t.strip() and t.strip().lower() not in {"nan", "none"}]
+
+
+def apply_row_boundaries_at_structures(
+    span_edges, structures_final, cayd_w, bundles, kmz, selected_rows,
+    unit_to_m, overlap_tol_m=ROW_OVERLAP_TOL_M,
+    structure_anchor_m=ROW_STRUCTURE_ANCHOR_M,
+):
+    """R01.05: RoW boundaries fall on Structures, never inside a span.
+
+    1. Each delivered span keeps its RoW. It is also given every other RoW of
+       its circuit whose SoW circuit line runs along the same span (mean
+       distance <= overlap_tol_m): spans in the start/end overlap of two RoWs
+       are delivered in both.
+    2. A Structure is delivered in every RoW of the spans that end on it, so
+       the last Structure of one RoW is also the first of the next.
+    3. A Caydence 3D wire takes the RoW(s) of the span it belongs to, so all
+       conductors of a span sit in the same RoW and end on the same
+       Structures. Wires outside delivered spans take the RoWs of the nearest
+       same-circuit Structure (<= structure_anchor_m); others are unchanged.
+    """
+    sel = {txt(x) for x in (selected_rows or []) if txt(x)}
+    qa = []
+    if span_edges is None or span_edges.empty:
+        return span_edges, structures_final, cayd_w, pd.DataFrame()
+    se = span_edges.copy()
+    tol = overlap_tol_m / unit_to_m
+
+    def circuit_rows(c):
+        rows = dict((kmz.get(circuit_key(c)) or {}).get("rows", {}) or {})
+        return {k: v for k, v in rows.items() if (not sel or k in sel) and v is not None}
+
+    span_rows = []
+    for i, r in se.iterrows():
+        prim = txt(r.get("ROW"))
+        rows = {prim} if prim else set()
+        g = r.geometry
+        if g is not None and not g.is_empty:
+            pts = [g.interpolate(t, normalized=True) for t in np.linspace(0, 1, 11)]
+            for rn, rg in circuit_rows(txt(r.get("CIRCUIT"))).items():
+                if rn in rows:
+                    continue
+                if float(np.mean([p.distance(rg) for p in pts])) <= tol:
+                    rows.add(rn)
+                    qa.append({"KIND": "SPAN_OVERLAP_DUPLICATE", "CIRCUIT": txt(r.get("CIRCUIT")),
+                               "ID": f"{txt(r.get('STRUCT_A'))}-{txt(r.get('STRUCT_B'))}",
+                               "ROW": prim, "ADDED_ROW": rn})
+        span_rows.append(";".join(sorted(rows)))
+    se["ROWS"] = span_rows
+
+    node_rows = defaultdict(set)
+    bundle_rows = {}
+    for _, r in se.iterrows():
+        c = txt(r.get("CIRCUIT"))
+        rows = set(_split_rows(r["ROWS"]))
+        for n in (txt(r.get("STRUCT_A")), txt(r.get("STRUCT_B"))):
+            if n:
+                node_rows[(c, n)].update(rows)
+        try:
+            bundle_rows[(c, int(r.get("BUNDLE_ID")))] = rows
+        except (TypeError, ValueError):
+            pass
+
+    # Structures: one record per RoW of the spans meeting at it.
+    sf = structures_final
+    if sf is not None and not sf.empty and "TOPO_ID" in sf.columns:
+        extra = []
+        sf = sf.copy()
+        sf["ROW_RULE"] = "OWN"
+        for i, r in sf.iterrows():
+            c, own = txt(r.get("CIRCUIT")), txt(r.get("ROW"))
+            want = node_rows.get((c, txt(r.get("TOPO_ID"))), set())
+            for rn in sorted(want - {own}):
+                if sel and rn not in sel:
+                    continue
+                d = r.copy()
+                d["ROW"] = rn
+                d["ROW_RULE"] = "BOUNDARY_SPAN_END"
+                extra.append(d)
+                qa.append({"KIND": "STRUCTURE_BOUNDARY_DUPLICATE", "CIRCUIT": c,
+                           "ID": f"{txt(r.get('TOPO_ID'))}/{txt(r.get('STRUCT_ID'))}",
+                           "ROW": own, "ADDED_ROW": rn})
+        if extra:
+            sf = gpd.GeoDataFrame(pd.concat([sf, gpd.GeoDataFrame(extra, crs=sf.crs)],
+                                            ignore_index=True), geometry="geometry", crs=sf.crs)
+
+    # Caydence: RoW of the wire's span.
+    cw = cayd_w
+    if cw is not None and not cw.empty:
+        wire_bundle = {}
+        for b in bundles or []:
+            for wi in b.get("ALL_WIRE_ROWS", []) or []:
+                wire_bundle.setdefault(int(wi), []).append(int(b["BUNDLE_ID"]))
+        st_idx = defaultdict(list)
+        if sf is not None and not sf.empty:
+            for c, g in sf.groupby(sf["CIRCUIT"].astype(str)):
+                st_idx[c] = list(zip(g.geometry, g["ROW"].astype(str)))
+        anchor = structure_anchor_m / unit_to_m
+        out_rows = []
+        for _, r in cw.iterrows():
+            c = txt(r.get("CIRCUIT"))
+            cur = txt(r.get("ROW"))
+            rows, rule = None, "NEAREST_ROW"
+            src = r.get("SOURCE_IDX")
+            if c and pd.notna(src):
+                for bid in wire_bundle.get(int(src), []):
+                    if (c, bid) in bundle_rows:
+                        rows, rule = set(bundle_rows[(c, bid)]), "SPAN"
+                        break
+            if rows is None and c and st_idx.get(c) and r.geometry is not None:
+                co = list(r.geometry.coords)
+                ends = [Point(co[0][:2]), Point(co[-1][:2])]
+                near = {rn for gpt, rn in st_idx[c]
+                        if min(gpt.distance(e) for e in ends) <= anchor}
+                if near:
+                    rows, rule = near, "STRUCTURE"
+            if not rows:
+                rows = {cur}
+            rows = sorted(x for x in rows if x)
+            if cur in rows:
+                rows.remove(cur)
+                rows.insert(0, cur)
+            for k, rn in enumerate(rows):
+                d = r.copy()
+                d["ROW"] = rn
+                d["ROW_RULE"] = rule if k == 0 else rule + "_DUPLICATE"
+                out_rows.append(d)
+                if rn != cur:
+                    qa.append({"KIND": "CAYDENCE_" + ("MOVED" if k == 0 else "DUPLICATE"),
+                               "CIRCUIT": c, "ID": txt(r.get("WIRE_ID")), "ROW": cur,
+                               "ADDED_ROW": rn, "RULE": rule})
+        cw = gpd.GeoDataFrame(out_rows, geometry="geometry", crs=cayd_w.crs).reset_index(drop=True)
+        for k in ("continuity_qa", "earth_continuity_qa"):
+            if k in getattr(cayd_w, "attrs", {}):
+                cw.attrs[k] = cayd_w.attrs[k]
+    return se, sf, cw, pd.DataFrame(qa)
+
+
+def _circuit_wire_parts_by_row(wire_geom, spans_c, unit_to_m, tol_m=0.5):
+    """Split one circuit's delivered 2D wire into RoW parts using span RoWs.
+
+    Pieces covered by a span take that span's RoW. Pieces not covered by any
+    span (recovered terminal conductors) take the RoW of the nearest span.
+    """
+    from shapely.ops import linemerge, unary_union
+    if wire_geom is None or wire_geom.is_empty:
+        return {}
+    if spans_c is None or spans_c.empty:
+        return {}
+    if "ROWS" in spans_c.columns:
+        spans_c = spans_c.assign(ROW=spans_c["ROWS"].map(_split_rows)).explode("ROW")
+    by_row = {}
+    for row, g in spans_c.groupby(spans_c["ROW"].astype(str)):
+        if txt(row):
+            by_row[txt(row)] = unary_union([x for x in g.geometry if x is not None])
+    if not by_row:
+        return {}
+    if len(by_row) == 1:
+        return {next(iter(by_row)): _join_near_endpoints(wire_geom, 0.5 / unit_to_m)}
+    tol = tol_m / unit_to_m
+    bufs = {r: g.buffer(tol) for r, g in by_row.items()}
+
+    def _lines(g):
+        if g is None or g.is_empty:
+            return []
+        if g.geom_type == "LineString":
+            return [g]
+        if hasattr(g, "geoms"):
+            return [x for gg in g.geoms for x in _lines(gg)]
+        return []
+
+    parts = defaultdict(list)
+    for r, b in bufs.items():
+        parts[r].extend(_lines(wire_geom.intersection(b)))
+    rest = wire_geom.difference(unary_union(list(bufs.values())))
+    for piece in _lines(rest):
+        r = min(by_row, key=lambda k: piece.distance(by_row[k]))
+        parts[r].append(piece)
+    out = {}
+    min_len = 2.0 / unit_to_m      # clipping slivers (e.g. 0.7 m at a junction)
+    join_tol = 0.5 / unit_to_m
+    for r, ls in parts.items():
+        ls = [l for l in ls if l.length > min_len]
+        if not ls:
+            continue
+        merged = linemerge(MultiLineString([list(x.coords) for x in ls])) if len(ls) > 1 else ls[0]
+        out[r] = _join_near_endpoints(merged, join_tol)
+    return out
+
+
+def _join_near_endpoints(geom, tol, max_turn_deg=35.0):
+    """Chain line pieces whose END points meet within tol (20/11).
+
+    Pieces cut at a RoW boundary, at a fork or where a tap crosses the line
+    meet at a node. At every node the two pieces that continue most straight
+    (turn <= max_turn_deg) are joined first; a branch stays its own piece.
+    Interior vertices are never moved.
+    """
+    ls = [list(x.coords) for x in getattr(geom, "geoms", [geom]) if x.length > 0]
+    if len(ls) < 2:
+        return geom
+
+    def d(a, b):
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    def unit(a, b):
+        v = (b[0] - a[0], b[1] - a[1]); n = math.hypot(*v)
+        return (v[0] / n, v[1] / n) if n > 0 else (0.0, 0.0)
+
+    def out_dir(c):   # direction leaving the end of c
+        return unit(c[-2], c[-1])
+
+    def in_dir(c):    # direction entering c at its start
+        return unit(c[0], c[1])
+
+    while True:
+        best = None
+        for i in range(len(ls)):
+            for j in range(len(ls)):
+                if i == j:
+                    continue
+                for rev in (False, True):
+                    b = list(reversed(ls[j])) if rev else ls[j]
+                    if d(ls[i][-1], b[0]) > tol:
+                        continue
+                    u, v = out_dir(ls[i]), in_dir(b)
+                    turn = math.degrees(math.acos(max(-1.0, min(1.0, u[0] * v[0] + u[1] * v[1]))))
+                    if turn <= max_turn_deg and (best is None or turn < best[0]):
+                        best = (turn, i, j, rev)
+        if best is None:
+            break
+        _, i, j, rev = best
+        b = list(reversed(ls[j])) if rev else ls[j]
+        ls[i] = ls[i] + b[1:]
+        del ls[j]
+        if len(ls) == 1:
+            break
+    if len(ls) == 1:
+        return LineString(ls[0])
+    return MultiLineString(ls)
+
+
+EXPORT_SETTINGS_LAYER = "export_settings"
+GPKG_EDITABLE_LAYERS = ("selected_span_wires", "recovered_terminal_2d", "recovered_tap_2d",
+                        "structures_final", "caydence_wires_3d")
+
+
+def spans_one_row_per_feature(span_edges):
+    """QA/edit view of delivered spans: one feature per (span, RoW).
+
+    A span delivered in two RoWs (start/end overlap) appears twice, so the
+    operator can delete or re-assign each copy on its own.
+    """
+    if span_edges is None or span_edges.empty or "ROWS" not in span_edges.columns:
+        return span_edges
+    out = span_edges.copy()
+    out["ROW_RULE"] = [
+        ["OWN" if r == txt(prim) else "OVERLAP_DUPLICATE" for r in _split_rows(rows)]
+        for rows, prim in zip(out["ROWS"], out["ROW"])
+    ]
+    out["ROW"] = out["ROWS"].map(_split_rows)
+    out = out.explode(["ROW", "ROW_RULE"]).drop(columns=["ROWS"])
+    return gpd.GeoDataFrame(out.reset_index(drop=True), geometry="geometry", crs=span_edges.crs)
+
+
+def _bakery_version_text():
+    try:
+        from bakery_version import bakery_build_label
+        return bakery_build_label()
+    except Exception:
+        return ""
+
+
+def _bakery_build_dict():
+    try:
+        from bakery_version import bakery_build_dict
+        return bakery_build_dict()
+    except Exception:
+        return {}
+
+
+def write_export_settings(gpkg, year, selected_rows, unit_to_m, epsg=None):
+    """Store what a later re-export from this GPKG needs to reproduce the run."""
+    import pyogrio
+    try:
+        epsg_txt = txt(epsg.to_epsg()) if hasattr(epsg, "to_epsg") else txt(epsg)
+    except Exception:
+        epsg_txt = ""
+    vals = {
+        "BAKERY_VERSION": _bakery_version_text(),
+        "YEAR": str(int(year)),
+        "SELECTED_ROWS": ";".join(sorted(txt(r) for r in (selected_rows or []) if txt(r))),
+        "UNIT_TO_M": repr(float(unit_to_m)),
+        "EPSG": epsg_txt,
+        "EDITABLE_LAYERS": ";".join(GPKG_EDITABLE_LAYERS),
+    }
+    df = pd.DataFrame({"KEY": list(vals), "VALUE": list(vals.values())})
+    pyogrio.write_dataframe(gpd.GeoDataFrame(df), str(gpkg), layer=EXPORT_SETTINGS_LAYER)
+
+
+def _read_export_settings(gpkg):
+    import pyogrio
+    names = {n for n, _ in pyogrio.list_layers(str(gpkg))}
+    if EXPORT_SETTINGS_LAYER not in names:
+        return {}
+    df = gpd.read_file(gpkg, layer=EXPORT_SETTINGS_LAYER)
+    return {txt(k): txt(v) for k, v in zip(df["KEY"], df["VALUE"])}
+
+
+def _explode_row_field(gdf):
+    """ROW may hold several RoWs separated by ';' -> one feature per RoW."""
+    if gdf is None or gdf.empty or "ROW" not in gdf.columns:
+        return gdf
+    out = gdf.copy()
+    out["ROW"] = out["ROW"].map(_split_rows)
+    out = out.explode("ROW")
+    out = out[out["ROW"].notna() & (out["ROW"].astype(str).str.len() > 0)]
+    return gpd.GeoDataFrame(out.reset_index(drop=True), geometry="geometry", crs=gdf.crs)
+
+
+def gpkg_export_rows(gpkg):
+    """(selected RoWs stored by the run, every RoW found in the editable layers)."""
+    import pyogrio
+    gpkg = Path(gpkg)
+    settings = _read_export_settings(gpkg)
+    selected = sorted(set(_split_rows(settings.get("SELECTED_ROWS", ""))))
+    found = set()
+    names = {n for n, _ in pyogrio.list_layers(str(gpkg))}
+    for layer in ("selected_span_wires", "structures_final", "caydence_wires_3d"):
+        if layer in names:
+            df = pyogrio.read_dataframe(str(gpkg), layer=layer, columns=["ROW"], read_geometry=False)
+            for v in df["ROW"]:
+                found.update(_split_rows(v))
+    return selected, sorted(found)
+
+
+def export_geometry_from_gpkg(gpkg, deliverables, year=None, backup_dir=None, rows=None):
+    """R01.05: rebuild the geometry deliverables from an operator-edited QA GPKG.
+
+    Editable layers (QGIS: edit attributes, delete or copy features):
+      selected_span_wires   2D spans. ROW / CIRCUIT decide where each span goes.
+      recovered_tap_2d      2D taps (branches into substations). CIRCUIT.
+      recovered_terminal_2d 2D conductors into substations. CIRCUIT; the RoW
+                            follows the nearest span of that circuit.
+      structures_final      Circuit + Caydence Structures. ROW / CIRCUIT.
+      caydence_wires_3d     Caydence 3D wires. ROW / CIRCUIT / WIRE_TYPE.
+    ROW may list several RoWs as 'NH_05;NH_25' to deliver a feature in both.
+    Caydence 3D Structures are always regenerated from structures_final.
+    Only the Circuit and Caydence folders of the affected RoWs are replaced;
+    Tile Index, Management Units and LAS products are left untouched.
+    """
+    import pyogrio
+    from shapely.ops import linemerge, unary_union
+    gpkg = Path(gpkg)
+    deliverables = Path(deliverables)
+    layers = {n for n, _ in pyogrio.list_layers(str(gpkg))}
+    need = {"selected_span_wires", "structures_final", "caydence_wires_3d"}
+    missing = need - layers
+    if missing:
+        raise RuntimeError(f"GPKG is missing layer(s): {', '.join(sorted(missing))}")
+    settings = _read_export_settings(gpkg)
+    year = int(year or settings.get("YEAR") or 2026)
+
+    spans = _explode_row_field(gpd.read_file(gpkg, layer="selected_span_wires"))
+    term = (gpd.read_file(gpkg, layer="recovered_terminal_2d")
+            if "recovered_terminal_2d" in layers else None)
+    # 20/11: recovered taps are edited and re-exported like terminal conductors.
+    if "recovered_tap_2d" in layers:
+        taps = gpd.read_file(gpkg, layer="recovered_tap_2d")
+        if taps is not None and not taps.empty:
+            term = taps if term is None or term.empty else gpd.GeoDataFrame(
+                pd.concat([term, taps], ignore_index=True), geometry="geometry", crs=taps.crs)
+    structures = _explode_row_field(gpd.read_file(gpkg, layer="structures_final"))
+    cayd_w = _explode_row_field(gpd.read_file(gpkg, layer="caydence_wires_3d"))
+    kref = gpd.read_file(gpkg, layer="kmz_reference") if "kmz_reference" in layers else None
+    crs = spans.crs
+    try:
+        unit_to_m = float(settings.get("UNIT_TO_M") or crs.axis_info[0].unit_conversion_factor)
+    except Exception:
+        unit_to_m = 1.0
+
+    spans = spans[spans["CIRCUIT"].astype(str).str.strip().str.len() > 0].copy()
+    spans = spans[spans.geometry.notna() & ~spans.geometry.is_empty]
+    spans = gpd.GeoDataFrame(spans, geometry="geometry", crs=crs)
+
+    def first_val(series):
+        for v in series:
+            if txt(v):
+                return txt(v)
+        return ""
+
+    kmz_meta = {}
+    if kref is not None and not kref.empty:
+        for c, g in kref.groupby(kref["CIRCUIT"].astype(str)):
+            kmz_meta[c] = {"VOLTAGE": first_val(g.get("VOLTAGE", [])),
+                           "COMPANY": first_val(g.get("COMPANY", [])),
+                           "ROWS": {txt(x) for x in g["ROW"]}}
+
+    # Short connectors that join consecutive spans at a Structure exist only
+    # in wires_2d. Keep a connector for a circuit while both of its ends still
+    # touch that circuit's (edited) spans, so the 2D wire stays continuous.
+    orig = gpd.read_file(gpkg, layer="wires_2d") if "wires_2d" in layers else None
+    all_lines = list(spans.geometry)
+    if term is not None and not term.empty:
+        all_lines += [x for x in term.geometry if x is not None and not x.is_empty]
+    covered = unary_union(all_lines).buffer(0.3 / unit_to_m) if all_lines else None
+    max_conn = 10.0 / unit_to_m
+    touch = 1.0 / unit_to_m
+
+    def connectors(c, own):
+        if orig is None or covered is None:
+            return []
+        g0 = orig[orig["CIRCUIT"].astype(str) == c]
+        if g0.empty:
+            return []
+        own_u = unary_union(own)
+        out = []
+        for geom in g0.geometry:
+            rest = geom.difference(covered)
+            for piece in getattr(rest, "geoms", [rest]):
+                if piece.is_empty or piece.geom_type != "LineString" or piece.length > max_conn:
+                    continue
+                a, b = Point(piece.coords[0]), Point(piece.coords[-1])
+                if a.distance(own_u) <= touch and b.distance(own_u) <= touch:
+                    out.append(piece)
+        return out
+
+    def lines_of(g):
+        if g is None or g.is_empty:
+            return []
+        if g.geom_type == "LineString":
+            return [g]
+        return [x for gg in getattr(g, "geoms", []) for x in lines_of(gg)]
+
+    wires = []
+    for c, g in spans.groupby(spans["CIRCUIT"].astype(str)):
+        own = list(g.geometry)
+        if term is not None and not term.empty and "CIRCUIT" in term.columns:
+            own += [x for x in term[term["CIRCUIT"].astype(str) == c].geometry
+                    if x is not None and not x.is_empty]
+        own_buf = unary_union(own).buffer(0.5 / unit_to_m)
+        base = None
+        if orig is not None:
+            g0 = orig[orig["CIRCUIT"].astype(str) == c]
+            if not g0.empty:
+                base = unary_union(list(g0.geometry))
+        if base is not None:
+            # Original (simplified, joined) 2D where the circuit's spans remain,
+            # plus spans that were moved to this circuit in the GPKG.
+            kept = lines_of(base.intersection(own_buf))
+            base_buf = base.buffer(1.0 / unit_to_m)
+            added = [x for x in own
+                     if x.length > 0 and x.intersection(base_buf).length < 0.9 * x.length]
+            own_u = unary_union(own)
+            conn = [
+                piece for piece in lines_of(base.difference(own_buf))
+                if piece.length <= max_conn
+                and Point(piece.coords[0]).distance(own_u) <= touch
+                and Point(piece.coords[-1]).distance(own_u) <= touch
+            ]
+            parts = kept + conn + added
+        else:
+            parts = own + connectors(c, own)
+        merged = unary_union(parts)
+        try:
+            merged = linemerge(merged)
+        except Exception:
+            pass
+        # 20/11: union nodes the line where a tap or branch crosses/leaves it;
+        # rejoin straight continuations so the main line stays one feature.
+        if merged is not None and not merged.is_empty and merged.geom_type in ("LineString", "MultiLineString"):
+            merged = _join_near_endpoints(merged, 0.5 / unit_to_m)
+        m = kmz_meta.get(c, {})
+        wires.append({
+            "ROW": ";".join(sorted({txt(x) for x in g["ROW"]})),
+            "CIRCUIT": c,
+            "VOLTAGE": m.get("VOLTAGE") or first_val(g.get("VOLTAGE", [])),
+            "COMPANY": m.get("COMPANY") or first_val(g.get("COMPANY", [])),
+            "geometry": merged,
+        })
+    final_wires = rows_to_gdf(wires, crs)
+    # 20/11: same fork clean-up as the Geometry run (no branch on top of main).
+    final_wires, _fork_qa = trim_branch_overlaps(final_wires, unit_to_m)
+    final_wires["geometry"] = [
+        _join_near_endpoints(g, 0.5 / unit_to_m) if g is not None and not g.is_empty else g
+        for g in final_wires.geometry]
+
+    # RoWs to publish: given by the operator, else the RoWs selected for the
+    # run (export_settings), else every RoW in the data (GPKG older than
+    # R01.05). Features in any other RoW are not published and are reported.
+    if rows:
+        rows = {txt(r) for r in rows if txt(r)}
+    else:
+        rows = set(_split_rows(settings.get("SELECTED_ROWS", "")))
+    if not rows:
+        rows = set()
+        for df in (spans, structures, cayd_w):
+            if df is not None and not df.empty:
+                rows |= {txt(x) for x in df["ROW"] if txt(x)}
+    skipped = []
+    for name, df in (("selected_span_wires", spans), ("structures_final", structures),
+                     ("caydence_wires_3d", cayd_w)):
+        if df is not None and not df.empty:
+            other = df[~df["ROW"].astype(str).isin(rows)]
+            for r, n in other["ROW"].astype(str).value_counts().items():
+                skipped.append({"CHECK": "ROW_NOT_EXPORTED", "ROW": r, "CIRCUIT": "",
+                                "ID": name, "N": int(n)})
+    # 20/11: keep every span for splitting the 2D by RoW (a span in a RoW that
+    # is not exported must still claim its piece, e.g. C39 310 end in CT_17);
+    # only the written RoWs are filtered.
+    spans_all_rows = spans
+    spans = spans[spans["ROW"].astype(str).isin(rows)]
+    if structures is not None and not structures.empty:
+        structures = structures[structures["ROW"].astype(str).isin(rows)]
+    if cayd_w is not None and not cayd_w.empty:
+        cayd_w = cayd_w[cayd_w["ROW"].astype(str).isin(rows)]
+
+    if backup_dir is not None:
+        backup_dir = Path(backup_dir)
+        _circ = set()
+        for _df in (final_wires, structures):
+            if _df is not None and not _df.empty:
+                _circ |= {txt(c) for c in _df["CIRCUIT"] if txt(c)}
+        for src in geometry_delivery_dirs(deliverables, rows, _circ):
+            if src.exists():
+                shutil.copytree(src, backup_dir / src.relative_to(deliverables), dirs_exist_ok=True)
+
+    cayd_structures = build_caydence_structures_by_row(structures, rows)
+    inv = write_geometry_delivery_products(
+        final_wires, structures, cayd_w, cayd_structures, rows, year, deliverables,
+        span_edges=spans_all_rows, unit_to_m=unit_to_m,
+    )
+    checks = check_gpkg_export_consistency(spans, structures, cayd_w, kmz_meta, unit_to_m)
+    if skipped:
+        checks = pd.concat([checks, pd.DataFrame(skipped)], ignore_index=True)
+    inv.attrs["rows"] = sorted(rows)
+    return inv, checks
+
+
+def check_gpkg_export_consistency(spans, structures, cayd_w, kmz_meta, unit_to_m,
+                                  end_tol_m=ROW_STRUCTURE_ANCHOR_M):
+    """Flag edits that leave the products inconsistent (reported, not fixed)."""
+    out = []
+    tol = end_tol_m / unit_to_m
+    st = defaultdict(list)
+    if structures is not None and not structures.empty:
+        for (row, c), g in structures.groupby(
+            [structures["ROW"].astype(str), structures["CIRCUIT"].astype(str)]
+        ):
+            st[(row, c)] = list(g.geometry)
+    for (row, c), g in spans.groupby([spans["ROW"].astype(str), spans["CIRCUIT"].astype(str)]):
+        allowed = kmz_meta.get(c, {}).get("ROWS")
+        if allowed and row not in allowed:
+            out.append({"CHECK": "SPAN_ROW_NOT_IN_SOW", "ROW": row, "CIRCUIT": c, "ID": "", "N": len(g)})
+        pts = st.get((row, c), [])
+        for _, r in g.iterrows():
+            geom = r.geometry
+            if geom is None or geom.geom_type != "LineString":
+                continue
+            co = list(geom.coords)
+            for e in (co[0], co[-1]):
+                p = Point(e[:2])
+                if not pts or min(q.distance(p) for q in pts) > tol:
+                    out.append({"CHECK": "SPAN_END_WITHOUT_STRUCTURE_IN_ROW", "ROW": row,
+                                "CIRCUIT": c,
+                                "ID": f"{txt(r.get('STRUCT_A'))}-{txt(r.get('STRUCT_B'))}", "N": 1})
+    if structures is not None and not structures.empty:
+        for _, r in structures.iterrows():
+            allowed = kmz_meta.get(txt(r.get("CIRCUIT")), {}).get("ROWS")
+            if allowed and txt(r.get("ROW")) not in allowed:
+                out.append({"CHECK": "STRUCTURE_ROW_NOT_IN_SOW", "ROW": txt(r.get("ROW")),
+                            "CIRCUIT": txt(r.get("CIRCUIT")), "ID": txt(r.get("STRUCT_ID")), "N": 1})
+    if cayd_w is not None and not cayd_w.empty:
+        for _, r in cayd_w.iterrows():
+            c = txt(r.get("CIRCUIT"))
+            allowed = kmz_meta.get(c, {}).get("ROWS")
+            if c and allowed and txt(r.get("ROW")) not in allowed:
+                out.append({"CHECK": "CAYDENCE_ROW_NOT_IN_SOW", "ROW": txt(r.get("ROW")),
+                            "CIRCUIT": c, "ID": txt(r.get("WIRE_ID")), "N": 1})
+    return pd.DataFrame(out, columns=["CHECK", "ROW", "CIRCUIT", "ID", "N"])
+
+
+# 20/11: deliverables are organised by client output product (Neil, NMIP26068):
+#   29_tile_index/<RoW>/            area
+#   45_structure_shapefile/<Circuit>/  circuit
+#   68_standalone_gis/<RoW>/        area (Management Units)
+#   80_powerline_vectors/<Circuit>/    circuit
+#   267_caydence_conductors/<RoW>/  area (Caydence 3D wires + structures)
+# so that after QA the folders can be copied straight into the output products.
+# BAKERY_DELIVERY_LAYOUT=row restores the R01.04 <RoW>/Circuit|Caydence|... tree.
+DELIVERY_PRODUCT_DIRS = {
+    "tile_index": "29_tile_index",
+    "structures": "45_structure_shapefile",
+    "management_units": "68_standalone_gis",
+    "wires": "80_powerline_vectors",
+    "caydence": "267_caydence_conductors",
+}
+_LEGACY_ROW_DIRS = {
+    "tile_index": "Tile_Index",
+    "management_units": "Management_Units",
+    "caydence": "Caydence",
+}
+
+
+def delivery_layout() -> str:
+    v = os.environ.get("BAKERY_DELIVERY_LAYOUT", "product").strip().lower()
+    return "row" if v in {"row", "legacy", "r01.04"} else "product"
+
+
+def delivery_dir(deliverables, product, row="", circuit=""):
+    """Folder of one deliverable product for a RoW (area) or a circuit."""
+    deliverables = Path(deliverables)
+    if delivery_layout() == "row":
+        if product in ("wires", "structures"):
+            return deliverables / safe_filename(row) / "Circuit" / safe_filename(circuit)
+        return deliverables / safe_filename(row) / _LEGACY_ROW_DIRS[product]
+    if product in ("wires", "structures"):
+        return deliverables / DELIVERY_PRODUCT_DIRS[product] / safe_filename(circuit)
+    return deliverables / DELIVERY_PRODUCT_DIRS[product] / safe_filename(row)
+
+
+def geometry_delivery_dirs(deliverables, rows, circuits):
+    """Folders refreshed by a Geometry run / GPKG re-export."""
+    out = []
+    if delivery_layout() == "row":
+        for r in rows:
+            out += [Path(deliverables) / safe_filename(r) / "Circuit",
+                    Path(deliverables) / safe_filename(r) / "Caydence"]
+        return out
+    for c in circuits:
+        out += [delivery_dir(deliverables, "wires", circuit=c),
+                delivery_dir(deliverables, "structures", circuit=c)]
+    for r in rows:
+        out.append(delivery_dir(deliverables, "caydence", row=r))
+    return out
+
+
+def _merge_row_duplicate_structures(sg):
+    """One circuit Structure listed in two RoWs (RoW boundary) -> one record."""
+    if sg is None or sg.empty or "TOPO_ID" not in sg.columns:
+        return sg
+    keep, rows_of = [], {}
+    for i, r in sg.iterrows():
+        k = (txt(r.get("TOPO_ID")), round(float(r.geometry.x), 2), round(float(r.geometry.y), 2))
+        if k in rows_of:
+            rows_of[k][1].append(txt(r.get("ROW")))
+        else:
+            rows_of[k] = (i, [txt(r.get("ROW"))])
+            keep.append(i)
+    out = sg.loc[keep].copy()
+    for k, (i, rl) in rows_of.items():
+        out.at[i, "ROW"] = ";".join(sorted({x for x in rl if x}))
+    return out
+
+
 def write_geometry_delivery_products(
     final_wires: gpd.GeoDataFrame,
     structures_final: gpd.GeoDataFrame,
@@ -6583,6 +9257,8 @@ def write_geometry_delivery_products(
     year: int,
     deliverables: Path,
     structure_source_fields: list[str] | None = None,
+    span_edges: gpd.GeoDataFrame | None = None,
+    unit_to_m: float = 1.0,
 ) -> pd.DataFrame:
     """Publish Stage 01 geometry.
 
@@ -6610,14 +9286,14 @@ def write_geometry_delivery_products(
         }
 
     # Refresh only geometry product families.
-    for row in effective_rows:
-        row_root = deliverables / safe_filename(row)
-        croot = row_root / "Circuit"
-        cayroot = row_root / "Caydence"
-        if croot.exists():
-            shutil.rmtree(croot)
-        if cayroot.exists():
-            shutil.rmtree(cayroot)
+    _circuits = set()
+    if final_wires is not None and not final_wires.empty:
+        _circuits |= {txt(c) for c in final_wires["CIRCUIT"] if txt(c)}
+    if structures_final is not None and not structures_final.empty:
+        _circuits |= {txt(c) for c in structures_final["CIRCUIT"] if txt(c)}
+    for d in geometry_delivery_dirs(deliverables, effective_rows, _circuits):
+        if d.exists():
+            shutil.rmtree(d)
 
     # --------------------------------------------------------------
     # Formal circuit products.
@@ -6639,45 +9315,87 @@ def write_geometry_delivery_products(
             ),
         )
 
-        parents = (
-            set(
-                txt(v)
-                for v in sg.get("ROW", pd.Series(dtype=object))
-                if txt(v)
-            )
-            & effective_rows
+        # R01.05: the 2D wire is published per RoW from the RoW of each
+        # delivered span; a circuit is no longer copied whole into every RoW
+        # where one of its Structures happens to lie.
+        wire_parts = _circuit_wire_parts_by_row(
+            wr.geometry,
+            span_edges[span_edges["CIRCUIT"].astype(str) == circuit]
+            if span_edges is not None and not span_edges.empty else None,
+            unit_to_m,
         )
-        if not parents:
-            parents = set(_row_list(wr.get("ROW"))) & effective_rows
+        wire_parts = {k: v for k, v in wire_parts.items() if k in effective_rows}
+        if not wire_parts:
+            fallback = set(_row_list(wr.get("ROW"))) & effective_rows
+            wire_parts = {r: wr.geometry for r in fallback}
+        struct_rows = set(
+            txt(v) for v in sg.get("ROW", pd.Series(dtype=object)) if txt(v)
+        ) & effective_rows
+        parents = set(wire_parts) | struct_rows
         if not parents:
             continue
 
-        wg = gpd.GeoDataFrame(
-            [wr.to_dict()],
-            geometry="geometry",
-            crs=final_wires.crs,
-        )
+        if delivery_layout() == "product":
+            # One file per circuit (circuit products 45 / 80): one 2D feature per
+            # RoW part, structures of all selected RoWs (boundary duplicates merged).
+            recs = []
+            for row in sorted(wire_parts):
+                # 20/11: one LineString feature per part (main line, each tap),
+                # never a MultiLineString.
+                g = wire_parts[row]
+                for part in (list(g.geoms) if hasattr(g, "geoms") else [g]):
+                    if part is None or part.is_empty or part.length <= 0:
+                        continue
+                    rec = wr.to_dict()
+                    rec["ROW"] = row
+                    rec["geometry"] = part
+                    recs.append(rec)
+            if recs:
+                wg = gpd.GeoDataFrame(recs, geometry="geometry", crs=final_wires.crs)
+                wout = delivery_dir(deliverables, "wires", circuit=circuit) / f"{safe_filename(circuit)}_Wires_{year}.shp"
+                _write_clean_shapefile(wg, wout, ["ROW", "CIRCUIT", "VOLTAGE", "geometry"])
+                inv.append({"PRODUCT": "Wires", "ROW": ";".join(sorted(wire_parts)), "CIRCUIT": circuit,
+                            "DELIVERY_FILE": wout.name, "STATUS": "WRITTEN"})
+            srows = sg[sg["ROW"].astype(str).isin(parents)].copy() if sg is not None and not sg.empty else sg
+            srows = _merge_row_duplicate_structures(srows)
+            if srows is not None and not srows.empty:
+                sout = delivery_dir(deliverables, "structures", circuit=circuit) / f"{safe_filename(circuit)}_Structure_{year}.shp"
+                _write_clean_shapefile(srows, sout, structure_delivery_columns(srows, structure_source_fields))
+                inv.append({"PRODUCT": "Structures", "ROW": ";".join(sorted(parents)), "CIRCUIT": circuit,
+                            "DELIVERY_FILE": sout.name, "STATUS": "WRITTEN"})
+            continue
 
         for row in sorted(parents):
-            cdir = (
-                deliverables
-                / safe_filename(row)
-                / "Circuit"
-                / safe_filename(circuit)
-            )
+            cdir = delivery_dir(deliverables, "wires", row=row, circuit=circuit)
 
-            wout = cdir / f"{safe_filename(circuit)}_Wires_{year}.shp"
-            _write_clean_shapefile(
-                wg, wout,
-                ["ROW", "CIRCUIT", "VOLTAGE", "geometry"],
-            )
-            inv.append({
-                "PRODUCT": "Wires",
-                "ROW": row,
-                "CIRCUIT": circuit,
-                "DELIVERY_FILE": wout.name,
-                "STATUS": "WRITTEN",
-            })
+            if row in wire_parts:
+                g = wire_parts[row]
+                recs = []
+                for part in (list(g.geoms) if hasattr(g, "geoms") else [g]):
+                    if part is None or part.is_empty or part.length <= 0:
+                        continue
+                    rec = wr.to_dict()
+                    rec["ROW"] = row
+                    rec["geometry"] = part
+                    recs.append(rec)
+                wg = gpd.GeoDataFrame(recs, geometry="geometry", crs=final_wires.crs)
+                wout = cdir / f"{safe_filename(circuit)}_Wires_{year}.shp"
+                _write_clean_shapefile(
+                    wg, wout,
+                    ["ROW", "CIRCUIT", "VOLTAGE", "geometry"],
+                )
+                inv.append({
+                    "PRODUCT": "Wires",
+                    "ROW": row,
+                    "CIRCUIT": circuit,
+                    "DELIVERY_FILE": wout.name,
+                    "STATUS": "WRITTEN",
+                })
+            else:
+                inv.append({
+                    "PRODUCT": "Wires", "ROW": row, "CIRCUIT": circuit,
+                    "DELIVERY_FILE": "", "STATUS": "NO_SPANS_IN_ROW_STRUCTURES_ONLY",
+                })
 
             srow = (
                 sg[sg["ROW"].astype(str) == row].copy()
@@ -6705,7 +9423,7 @@ def write_geometry_delivery_products(
     # Caydence RoW products - no circuit filtering.
     # --------------------------------------------------------------
     for row in sorted(effective_rows):
-        caydir = deliverables / safe_filename(row) / "Caydence"
+        caydir = delivery_dir(deliverables, "caydence", row=row)
 
         if cayd_w is not None and not cayd_w.empty:
             cw = cayd_w[cayd_w["ROW"].astype(str) == row].copy()
@@ -6758,6 +9476,566 @@ def write_geometry_delivery_products(
     return pd.DataFrame(inv)
 
 
+
+
+def recover_terminal_2d_from_3d(
+    formal_2d: gpd.GeoDataFrame,
+    source_3d: gpd.GeoDataFrame,
+    unit_to_m: float,
+    near_m: float = 6.0,
+    min_extension_m: float = 6.0,
+    min_forward_cos: float = -0.35,
+    min_away_ratio: float = 0.5,
+) -> tuple[gpd.GeoDataFrame, pd.DataFrame, gpd.GeoDataFrame]:
+    """Extend retained 2D endpoints using *observed* 3D conductor vectors.
+
+    This intentionally does not require an endpoint POA/source structure. Only
+    wires with matching circuit AND outward direction qualify; no SoW snapping.
+    The current 2D line remains intact. Candidate changes and refusals are QA'd.
+    """
+    qa = []
+    extras = []
+    if formal_2d is None or formal_2d.empty or source_3d is None or source_3d.empty:
+        return formal_2d, pd.DataFrame(), rows_to_gdf([], formal_2d.crs)
+    out = formal_2d.copy()
+    by_circuit = {txt(c): f for c, f in source_3d.groupby('CIRCUIT') if txt(c)}
+    for idx, rec in out.iterrows():
+        circ = txt(rec.get('CIRCUIT'))
+        raw = by_circuit.get(circ)
+        if raw is None or raw.empty: continue
+        geom = rec.geometry
+        if geom is None or geom.is_empty: continue
+        parts = list(geom.geoms) if hasattr(geom, 'geoms') else [geom]
+        new_parts = []
+        for part_idx, part in enumerate(parts):
+            if not hasattr(part,'coords') or len(part.coords)<2:
+                new_parts.append(part);continue
+            cc = [tuple(c[:2]) for c in part.coords]
+            original = LineString(cc)
+            for side in ('start','end'):
+                if side == 'start':
+                    anchor = np.asarray(cc[0],dtype=float)
+                    inward = np.asarray(cc[1],dtype=float)-anchor
+                else:
+                    anchor = np.asarray(cc[-1],dtype=float)
+                    inward = np.asarray(cc[-2],dtype=float)-anchor
+                norm=float(np.linalg.norm(inward))
+                if norm<1e-8: continue
+                outward=-inward/norm
+                options=[]
+                for _, wr in raw.iterrows():
+                    wire_geom = wr.geometry
+                    wire_parts = list(wire_geom.geoms) if hasattr(wire_geom,'geoms') else [wire_geom]
+                    for wpart in wire_parts:
+                        if not hasattr(wpart,'coords') or len(wpart.coords)<2:continue
+                        xyz = list(wpart.coords)
+                        for endpoint in (0,-1):
+                            a=np.asarray(xyz[endpoint][:2],dtype=float)
+                            b=np.asarray(xyz[-1 if endpoint==0 else 0][:2],dtype=float)
+                            near=float(np.linalg.norm(a-anchor))*unit_to_m
+                            if near>near_m:continue
+                            vec=b-a; length=float(np.linalg.norm(vec))
+                            if length*unit_to_m<min_extension_m:continue
+                            dot=float(np.dot(vec/length,outward))
+                            if dot < min_forward_cos:continue
+                            # Do not add a conductor that is already represented
+                            # by an existing 2D section in this formal circuit.
+                            tip=Point(float(b[0]),float(b[1]))
+                            if original.distance(tip)*unit_to_m < min_extension_m:
+                                continue
+                            # R01.05: spans into a substation often leave the
+                            # last structure at ~90 deg (R01.04 required < ~81
+                            # deg). Accept up to ~110 deg, but only if the wire
+                            # really leaves the line: its far end must be at
+                            # least min_away_ratio of its length away from it.
+                            if original.distance(tip) < min_away_ratio*length:
+                                continue
+                            options.append((near, -dot, -length, txt(wr.get('WIRE_ID')), a, b, wpart))
+                if not options:
+                    qa.append({'CIRCUIT':circ,'PART':part_idx,'SIDE':side,
+                               'ACTION':'NO_ELIGIBLE_OUTWARD_3D','WIRE_ID':'',
+                               'EXTENSION_M':0.0})
+                    continue
+                # The selected 2D phase runs through an existing endpoint.
+                # Prioritize near-colocated 3D vector, and alignment as tie breaker.
+                options.sort(key=lambda t:(round(t[0],1),t[1],t[2],t[3]))
+                best=options[0]
+                a,b=best[4],best[5]
+                v=[tuple(c[:2]) for c in best[6].coords]
+                if float(np.linalg.norm(np.asarray(v[0])-a)) > float(np.linalg.norm(np.asarray(v[-1])-a)):
+                    v.reverse()
+                # Build a bridge only between measured vector endpoint and the
+                # retained 2D terminal (never extend toward an inferred SoW point).
+                tail=[cc[0]]+v if side=='start' else [cc[-1]]+v
+                if side=='start':
+                    cc=list(reversed(tail[1:]))+cc
+                else:
+                    cc=cc+tail[1:]
+                geom_new=LineString(cc)
+                if original.is_simple and not geom_new.is_simple:
+                    # Do not introduce a NEW self-intersection on a simple route.
+                    cc=[tuple(c[:2]) for c in part.coords]
+                    qa.append({'CIRCUIT':circ,'PART':part_idx,'SIDE':side,
+                               'ACTION':'REVIEW_SELF_INTERSECTION','WIRE_ID':best[3],
+                               'EXTENSION_M':0.0})
+                    continue
+                length_m=float(best[6].length)*unit_to_m
+                qa.append({'CIRCUIT':circ,'PART':part_idx,'SIDE':side,
+                           'ACTION':'RECOVERED_3D_TERMINAL','WIRE_ID':best[3],
+                           'EXTENSION_M':round(length_m,3)})
+                extras.append({'CIRCUIT':circ,'WIRE_ID':best[3],
+                               'SIDE':side,'geometry':LineString(tail)})
+            new_parts.append(LineString(cc))
+        new_geom= _multipart_circuit_geometry(new_parts)
+        if new_geom is None:continue
+        out.at[idx,'geometry']=new_geom
+        if 'LENGTH_M' in out.columns:
+            out.at[idx,'LENGTH_M']=float(new_geom.length)*unit_to_m
+    return out, pd.DataFrame(qa,columns=['CIRCUIT','PART','SIDE','ACTION','WIRE_ID','EXTENSION_M']), rows_to_gdf(extras,formal_2d.crs)
+
+def trim_branch_overlaps(formal_2d, unit_to_m, tol_m=3.0, min_overlap_m=3.0, step_m=1.0,
+                         node_snap_m=5.0):
+    """R01.05 (20/11): a branch part must not run on top of the main line.
+
+    At a fork the TAP part often starts with spans shared with MAIN (C39 1605:
+    151 m, 1500: 23 m), drawn twice. For every part after the first, the
+    leading/trailing stretch lying within tol_m of the earlier parts is cut,
+    and the branch is reconnected from the nearest point on them, so it starts
+    where it really diverges. A part entirely on earlier parts is dropped.
+    """
+    from shapely.ops import substring
+    qa = []
+    if formal_2d is None or formal_2d.empty:
+        return formal_2d, pd.DataFrame(columns=["CIRCUIT", "ROW", "PART", "TRIM_START_M", "TRIM_END_M", "ACTION"])
+    out = formal_2d.copy()
+    tol = tol_m / unit_to_m
+    step = step_m / unit_to_m
+    for idx, rec in out.iterrows():
+        g = rec.geometry
+        parts = list(g.geoms) if hasattr(g, "geoms") else [g]
+        if len(parts) < 2:
+            continue
+        parts = sorted(parts, key=lambda x: -x.length)  # main line first
+        kept = [parts[0]]
+        changed = False
+        for pi, part in enumerate(parts[1:], 1):
+            others = unary_union(kept)
+            L = float(part.length)
+            if L <= 0:
+                continue
+            ss = list(np.arange(0.0, L, step)) + [L]
+            dist = [float(others.distance(part.interpolate(t))) for t in ss]
+            k0 = 0
+            while k0 < len(ss) and dist[k0] <= tol:
+                k0 += 1
+            if k0 == len(ss):
+                qa.append({"CIRCUIT": txt(rec.get("CIRCUIT")), "ROW": txt(rec.get("ROW")), "PART": pi,
+                           "TRIM_START_M": round(L * unit_to_m, 1), "TRIM_END_M": 0.0, "ACTION": "DROPPED_ON_MAIN"})
+                changed = True
+                continue
+            k1 = len(ss) - 1
+            while k1 > k0 and dist[k1] <= tol:
+                k1 -= 1
+            s0 = ss[k0 - 1] if k0 > 0 else 0.0
+            s1 = ss[k1 + 1] if k1 < len(ss) - 1 else L
+            if s0 * unit_to_m < min_overlap_m and (L - s1) * unit_to_m < min_overlap_m:
+                kept.append(part)
+                continue
+            core = substring(part, s0, s1)
+            cs = [tuple(c[:2]) for c in core.coords]
+            node_r = node_snap_m / unit_to_m
+            other_vertices = [tuple(c[:2]) for ln in getattr(others, "geoms", [others])
+                              for c in ln.coords]
+
+            def junction(pt):
+                # 20/11: join at the main line's vertex (the fork Structure node)
+                # when one is close, not at an arbitrary point on its segment.
+                q = nearest_points(others, Point(pt))[0]
+                if other_vertices:
+                    v = min(other_vertices, key=lambda c: math.hypot(c[0] - q.x, c[1] - q.y))
+                    if math.hypot(v[0] - q.x, v[1] - q.y) <= node_r:
+                        return v
+                return (q.x, q.y)
+
+            def clean(head, seq):
+                # drop vertices still hugging the junction so the branch leaves it straight
+                out = list(seq)
+                while len(out) > 1 and math.hypot(out[0][0] - head[0], out[0][1] - head[1]) <= tol:
+                    out.pop(0)
+                return [head] + out
+            if s0 > 0:
+                cs = clean(junction(cs[0]), cs)
+            if s1 < L:
+                cs = list(reversed(clean(junction(cs[-1]), list(reversed(cs)))))
+            kept.append(LineString(cs))
+            changed = True
+            qa.append({"CIRCUIT": txt(rec.get("CIRCUIT")), "ROW": txt(rec.get("ROW")), "PART": pi,
+                       "TRIM_START_M": round(s0 * unit_to_m, 1), "TRIM_END_M": round((L - s1) * unit_to_m, 1),
+                       "ACTION": "TRIMMED_OVERLAP"})
+        if changed:
+            newg = _multipart_circuit_geometry(kept)
+            if newg is not None:
+                out.at[idx, "geometry"] = newg
+                if "LENGTH_M" in out.columns:
+                    out.at[idx, "LENGTH_M"] = float(newg.length) * unit_to_m
+    return out, pd.DataFrame(qa, columns=["CIRCUIT", "ROW", "PART", "TRIM_START_M", "TRIM_END_M", "ACTION"])
+
+
+def recover_tap_2d_from_3d(
+    formal_2d: gpd.GeoDataFrame,
+    source_3d: gpd.GeoDataFrame,
+    unit_to_m: float,
+    covered_m: float = 15.0,
+    min_uncovered_m: float = 30.0,
+    join_m: float = 15.0,
+    min_tap_wires: int = 2,
+    min_reach_m: float = 25.0,
+    connect_max_m: float = 30.0,
+    connect_draw_m: float = 6.0,
+) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
+    """R01.05: add 2D for taps (branches, e.g. into a substation) seen in 3D.
+
+    Terminal recovery only extends the ends of a circuit path. A branch that
+    leaves the line part-way (tap to a substation) had no 2D. Here, 3D wires of
+    the circuit (not EARTH) that lie away from its 2D are grouped into spans
+    (wires sharing both ends within join_m). Each span is represented by its
+    central conductor (highest wire dropped when 4+, as a likely earth). Spans
+    are chained outward from the circuit 2D; only chains that start at the 2D
+    are added, as an extra part of the circuit geometry. A tap may start up to
+    connect_max_m from the circuit 2D (e.g. a tap leaving from a pole next to a
+    parallel circuit); the straight connector length is CONNECT_M in QA.
+    QA: 01_tap_2d_recovery.csv.
+    """
+    cols = ["CIRCUIT", "ROW", "TAP", "SPAN", "WIRE_ID", "N_WIRES", "ACTION", "LENGTH_M", "CONNECT_M"]
+    tap_lines = []
+    if formal_2d is None or formal_2d.empty or source_3d is None or source_3d.empty:
+        return formal_2d, pd.DataFrame(columns=cols), rows_to_gdf([], formal_2d.crs if formal_2d is not None else None)
+    out = formal_2d.copy()
+    qa = []
+    cov = covered_m / unit_to_m
+    jn = join_m / unit_to_m
+    src = source_3d[source_3d["WIRE_TYPE"].astype(str).str.upper() != "EARTH"] if "WIRE_TYPE" in source_3d else source_3d
+    src = src.drop_duplicates("WIRE_ID") if "WIRE_ID" in src else src
+    for circ, rows in out.groupby(out["CIRCUIT"].astype(str)):
+        if not circ:
+            continue
+        base = shapely.force_2d(rows.geometry.union_all())
+        if base is None or base.is_empty:
+            continue
+        cand = src[src["CIRCUIT"].astype(str) == circ]
+        if cand.empty:
+            continue
+        zone = base.buffer(cov)
+        items = []
+        for _, wr in cand.iterrows():
+            g = wr.geometry
+            if g is None or g.is_empty or not hasattr(g, "coords"):
+                continue
+            g2 = shapely.force_2d(g)
+            if g2.difference(zone).length * unit_to_m < min_uncovered_m:
+                continue
+            xyz = list(g.coords)
+            z = float(np.mean([c[2] for c in xyz])) if len(xyz[0]) > 2 else 0.0
+            items.append({"WIRE_ID": txt(wr.get("WIRE_ID")), "g": g2, "z": z,
+                          "a": np.asarray(xyz[0][:2], float), "b": np.asarray(xyz[-1][:2], float)})
+        if not items:
+            continue
+        # spans: union wires whose two ends coincide (either orientation)
+        parent = list(range(len(items)))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                A, B = items[i], items[j]
+                same = (np.linalg.norm(A["a"] - B["a"]) <= jn and np.linalg.norm(A["b"] - B["b"]) <= jn) or \
+                       (np.linalg.norm(A["a"] - B["b"]) <= jn and np.linalg.norm(A["b"] - B["a"]) <= jn)
+                if same:
+                    parent[find(j)] = find(i)
+        groups = defaultdict(list)
+        for i in range(len(items)):
+            groups[find(i)].append(items[i])
+        spans = []
+        for g in groups.values():
+            pool = sorted(g, key=lambda x: x["z"])
+            if len(pool) >= 4:
+                pool = pool[:-1]  # highest wire: likely an earth
+            mids = np.asarray([[x["g"].interpolate(0.5, normalized=True).x,
+                                x["g"].interpolate(0.5, normalized=True).y] for x in pool])
+            c = mids.mean(axis=0)
+            rep = pool[int(np.argmin(np.linalg.norm(mids - c, axis=1)))]
+            spans.append({"rep": rep, "n": len(g), "ends": [rep["a"], rep["b"]]})
+        # chain spans outward from the circuit 2D
+        used = set()
+        tap_no = 0
+        for si, sp in enumerate(spans):
+            if si in used:
+                continue
+            d_ends = [float(base.distance(Point(*e))) for e in sp["ends"]]
+            k = int(np.argmin(d_ends))
+            if d_ends[k] > connect_max_m / unit_to_m:
+                continue
+            tap_no += 1
+            # nearest point of the circuit 2D (interpolate/project is unreliable
+            # on a multi-part 2D and produced a 5 km connector on C39 371)
+            start_pt = nearest_points(base, Point(*sp["ends"][k]))[0]
+            connect_m = float(d_ends[k]) * unit_to_m
+            # 20/11: a straight connector is drawn only for a small gap. A tap
+            # that starts farther away (C39 1235: 20 m, at the 1250 line) is kept
+            # as its own part from its observed 3D start, without a fake stub.
+            if connect_m <= connect_draw_m:
+                coords = [(start_pt.x, start_pt.y)]
+            else:
+                coords = []
+            cur, cur_k = si, k
+            seq = []
+            while True:
+                used.add(cur)
+                rep = spans[cur]["rep"]
+                cs = [tuple(c) for c in rep["g"].coords]
+                if cur_k == 1:
+                    cs.reverse()
+                coords.extend(cs)
+                seq.append(cur)
+                tip = np.asarray(cs[-1], float)
+                nxt = None
+                for sj, sp2 in enumerate(spans):
+                    if sj in used:
+                        continue
+                    for kk, e in enumerate(sp2["ends"]):
+                        if np.linalg.norm(e - tip) <= jn:
+                            nxt = (sj, kk)
+                            break
+                    if nxt:
+                        break
+                if nxt is None:
+                    break
+                cur, cur_k = nxt
+            line = LineString(coords)
+            # A real tap has several conductors and leaves the line; a lone wire
+            # running alongside (e.g. a stray or parallel conductor) is not one.
+            reach_m = max(float(base.distance(Point(c))) for c in coords) * unit_to_m
+            if spans[seq[0]]["n"] < min_tap_wires or reach_m < min_reach_m:
+                for s_i in seq:
+                    qa.append({"CIRCUIT": circ, "ROW": "", "TAP": 0, "SPAN": 0,
+                               "WIRE_ID": spans[s_i]["rep"]["WIRE_ID"], "N_WIRES": spans[s_i]["n"],
+                               "ACTION": "REJECTED_FEW_WIRES" if spans[seq[0]]["n"] < min_tap_wires else "REJECTED_RUNS_ALONGSIDE",
+                               "LENGTH_M": round(float(spans[s_i]["rep"]["g"].length) * unit_to_m, 1)})
+                tap_no -= 1
+                continue
+            # attach to the RoW row of this circuit that is nearest the tap start
+            ridx = min(rows.index, key=lambda i: float(shapely.force_2d(out.at[i, "geometry"]).distance(start_pt)))
+            g0 = out.at[ridx, "geometry"]
+            parts = (list(g0.geoms) if hasattr(g0, "geoms") else [g0]) + [line]
+            newg = _multipart_circuit_geometry(parts)
+            if newg is None:
+                continue
+            out.at[ridx, "geometry"] = newg
+            if "LENGTH_M" in out.columns:
+                out.at[ridx, "LENGTH_M"] = float(newg.length) * unit_to_m
+            tap_lines.append({"CIRCUIT": circ, "TAP": tap_no,
+                              "WIRE_ID": ";".join(spans[x]["rep"]["WIRE_ID"] for x in seq),
+                              "CONNECT_M": round(connect_m, 1), "geometry": line})
+            for n_span, s_i in enumerate(seq, 1):
+                qa.append({"CIRCUIT": circ, "ROW": txt(out.at[ridx, "ROW"]) if "ROW" in out.columns else "",
+                           "TAP": tap_no, "SPAN": n_span, "WIRE_ID": spans[s_i]["rep"]["WIRE_ID"],
+                           "N_WIRES": spans[s_i]["n"], "ACTION": "RECOVERED_3D_TAP",
+                           "LENGTH_M": round(float(spans[s_i]["rep"]["g"].length) * unit_to_m, 1),
+                           "CONNECT_M": round(connect_m, 1) if n_span == 1 else 0.0})
+        for si, sp in enumerate(spans):
+            if si not in used:
+                qa.append({"CIRCUIT": circ, "ROW": "", "TAP": 0, "SPAN": 0, "WIRE_ID": sp["rep"]["WIRE_ID"],
+                           "N_WIRES": sp["n"], "ACTION": "NOT_CONNECTED_TO_2D",
+                           "LENGTH_M": round(float(sp["rep"]["g"].length) * unit_to_m, 1)})
+    return out, pd.DataFrame(qa, columns=cols), rows_to_gdf(tap_lines, formal_2d.crs)
+
+
+# R01.04 - SCHF and single-top SCSH representative XY from middle PHASE conductor.
+# Deliberately no Source XY substitution and no edits to 2D/Caydence wires.
+def relocate_schf_to_middle_phase(structures, cayd_w, unit_to_m,
+                                  raw_poa=None, nearby_top_m=15.0,
+                                  max_phase_distance_m=35.0,
+                                  max_tangent_degrees=15.0,
+                                  min_phase_spacing_m=1.0,
+                                  max_spacing_asymmetry=0.45,
+                                  outer_lane_circuits=None):
+    """Move SCHF and single-marker SCSH transversely to the middle PHASE.
+
+    R01.05: circuits whose 2D representative uses the outer lane keep their
+    structures on that 2D wire (Structure-on-Wire); they are not moved.
+
+    The local perpendicular cross-section is set by the middle conductor tangent.
+    We retain along-circuit station and use the closest point on the central
+    phase as the new XY. This is a *representative* structure position, not a
+    prediction of the H-frame's two physical leg positions.
+    """
+    if structures is None or structures.empty:
+        return structures, pd.DataFrame()
+    out = structures.copy()
+    records = []
+    phases = {}
+    if cayd_w is not None and not cayd_w.empty:
+        for _, wire in cayd_w.iterrows():
+            if txt(wire.get('WIRE_TYPE')).upper() != 'PHASE':
+                continue
+            circuit = txt(wire.get('CIRCUIT'))
+            if not circuit:
+                continue
+            geom = wire.geometry
+            parts = list(geom.geoms) if getattr(geom, 'geom_type', '') == 'MultiLineString' else [geom]
+            for part in parts:
+                if part is not None and part.geom_type == 'LineString' and len(part.coords) >= 2:
+                    phases.setdefault(circuit, []).append((txt(wire.get('WIRE_ID')), part))
+
+    # Keep original, circuit-attributed DXF attachment markers distinct from
+    # the consolidated Structure product. Nearby multiple tops imply a trident
+    # or multi-member arrangement and are NOT eligible for SCSH relocation.
+    poa_by_circuit = {}
+    if raw_poa is not None and not raw_poa.empty:
+        for _, marker in raw_poa.iterrows():
+            circuit = txt(marker.get('SOW_CIRCUIT'))
+            if circuit:
+                poa_by_circuit.setdefault(circuit, []).append((
+                    np.asarray([float(marker.geometry.x), float(marker.geometry.y)]),
+                    txt(marker.get('TOPO_ID'))))
+    max_dist = max_phase_distance_m / unit_to_m
+    for idx, structure in out.iterrows():
+        st = _normalise_structure_type(structure.get('STR_TYPE'))
+        # SCSH is eligible only with ONE nearby original attachment marker.
+        # Multiple distinct nearby markers indicate a trident arrangement.
+        if st not in ('SCHF', 'SCSH'):
+            continue
+        circuit = txt(structure.get('CIRCUIT'))
+        p = Point(float(structure.geometry.x), float(structure.geometry.y))
+        result = dict(STRUCT_ID=txt(structure.get('STRUCT_ID')), CIRCUIT=circuit,
+                      TOPO_ID=txt(structure.get('TOPO_ID')),
+                      STR_TYPE=st, NEARBY_TOPS=None,
+                      OLD_X=p.x, OLD_Y=p.y, NEW_X=p.x, NEW_Y=p.y,
+                      SHIFT_M=0., STATUS='UNCHANGED', REASON='',
+                      PHASE_WIRES='', MID_WIRE_ID='')
+        if outer_lane_circuits and circuit in outer_lane_circuits:
+            result.update(STATUS='UNCHANGED', REASON='OUTER_LANE_CIRCUIT')
+            records.append(result); continue
+        if st == 'SCSH':
+            if raw_poa is None or raw_poa.empty:
+                result.update(STATUS='REVIEW', REASON='NO_RAW_POA_FOR_SCSH')
+                records.append(result); continue
+            available = poa_by_circuit.get(circuit, [])
+            if not available:
+                result.update(STATUS='REVIEW', REASON='NO_SAME_CIRCUIT_POA')
+                records.append(result); continue
+            pxy = np.asarray([p.x, p.y])
+            nearest_xy, nearest_topo = min(available,
+                key=lambda r: float(np.linalg.norm(r[0] - pxy)))
+            if float(np.linalg.norm(nearest_xy-pxy)) * unit_to_m > 20.0:
+                result.update(STATUS='REVIEW', REASON='NO_LOCAL_POA')
+                records.append(result); continue
+            # Count distinct original top markers; coincident duplicates from
+            # CAD exports (<=0.75 m) count as one marker, not a trident.
+            nearby = [xy for xy, _ in available
+                if float(np.linalg.norm(xy-nearest_xy))*unit_to_m <= nearby_top_m]
+            distinct = []
+            for xy in nearby:
+                if not any(float(np.linalg.norm(xy-prev))*unit_to_m <= 0.75
+                           for prev in distinct):
+                    distinct.append(xy)
+            result['NEARBY_TOPS'] = len(distinct)
+            if len(distinct) != 1:
+                result.update(STATUS='REVIEW', REASON='MULTIPLE_NEARBY_TOWER_TOPS')
+                records.append(result); continue
+        candidates = []
+        for wire_id, geom in phases.get(circuit, []):
+            line = LineString([(float(x[0]), float(x[1])) for x in geom.coords])
+            if line.length < 1e-6:
+                continue
+            station = float(line.project(p))
+            q = line.interpolate(station)
+            dist = float(p.distance(q))
+            if dist > max_dist:
+                continue
+            step = min(float(3.0 / unit_to_m), 0.25 * line.length)
+            a = line.interpolate(max(0., station-step))
+            b = line.interpolate(min(line.length, station+step))
+            tangent = np.asarray([b.x-a.x, b.y-a.y], dtype=float)
+            norm = float(np.linalg.norm(tangent))
+            if norm < 1e-9:
+                continue
+            tangent = tangent/norm
+            # A conductor ending well short of the support cannot be used to
+            # infer its crossing, even if transverse projection would look neat.
+            axial_gap = abs(float(np.dot(
+                np.asarray([p.x-q.x,p.y-q.y]), tangent))) * unit_to_m
+            if axial_gap > 10.0:
+                continue
+            candidates.append(dict(wire_id=wire_id, dist=dist,
+                q=np.asarray([q.x,q.y]), tangent=tangent,
+                station=station, length=line.length))
+        # Exactly three local physical PHASE wires. More than three can be a
+        # double circuit or multiple spans; never guess which triplet applies.
+        # De-duplicate identical geometry endpoints of adjacent spans first.
+        unique = []
+        for cand in sorted(candidates, key=lambda r:r['dist']):
+            if any(float(np.linalg.norm(cand['q']-prev['q']))*unit_to_m < 0.4
+                   for prev in unique):
+                continue
+            unique.append(cand)
+        if len(unique) != 3:
+            result.update(STATUS='REVIEW', REASON=f'EXPECTED_3_PHASES_FOUND_{len(unique)}')
+            records.append(result); continue
+        tangent = unique[0]['tangent']
+        if any(abs(float(np.dot(tangent, c['tangent']))) <
+               np.cos(np.radians(max_tangent_degrees)) for c in unique[1:]):
+            result.update(STATUS='REVIEW', REASON='NON_PARALLEL_PHASES')
+            records.append(result); continue
+        normal = np.asarray([-tangent[1], tangent[0]])
+        ordered = sorted(unique, key=lambda c: float(np.dot(c['q'], normal)))
+        left, middle, right = ordered
+        d1 = abs(float(np.dot(middle['q']-left['q'], normal))) * unit_to_m
+        d2 = abs(float(np.dot(right['q']-middle['q'], normal))) * unit_to_m
+        if (min(d1,d2) < min_phase_spacing_m or
+            abs(d1-d2)/max(d1,d2) > max_spacing_asymmetry):
+            result.update(STATUS='REVIEW', REASON='IRREGULAR_PHASE_SPACING')
+            records.append(result); continue
+        # Construct an infinite perpendicular through original structure point.
+        # Its intersection with the locally tangent central phase is the
+        # transverse correction. No movement along the wire is permitted.
+        q = middle['q']
+        signed_along = float(np.dot(q - np.asarray([p.x,p.y]), tangent))
+        new_xy = q - signed_along*tangent
+        shift_m = float(np.linalg.norm(new_xy - np.asarray([p.x,p.y])))*unit_to_m
+        if shift_m > max_phase_distance_m:
+            result.update(STATUS='REVIEW', REASON='SHIFT_EXCEEDS_LIMIT')
+            records.append(result); continue
+        out.at[idx,'geometry'] = Point(float(new_xy[0]),float(new_xy[1]))
+        # Source attribution is retained; only the representative XY changes.
+        out.at[idx,'POS_RULE'] = st + '_MIDDLE_PHASE'
+        out.at[idx,'POS_SOURCE'] = 'CAYDENCE_LIDAR_PHASE_3D'
+        out.at[idx,'POS_CONF'] = 'HIGH'
+        # Update distance-based diagnostics for the final delivered XY.
+        for x_name,y_name,d_name in (
+            ('CLIENT_X','CLIENT_Y','CLIENT_DELTA_M'),
+            ('SRC_X','SRC_Y','SRC_DIST_M'),
+        ):
+            try:
+                sx=float(structure.get(x_name)); sy=float(structure.get(y_name))
+                if np.isfinite(sx) and np.isfinite(sy) and d_name in out.columns:
+                    out.at[idx,d_name] = float(np.linalg.norm(new_xy-np.asarray([sx,sy])))*unit_to_m
+            except (TypeError,ValueError):
+                pass
+        result.update(STATUS='MOVED', REASON='THREE_PARALLEL_PHASES',
+                      NEW_X=float(new_xy[0]), NEW_Y=float(new_xy[1]),
+                      SHIFT_M=shift_m,
+                      PHASE_WIRES=';'.join(x['wire_id'] for x in ordered),
+                      MID_WIRE_ID=middle['wire_id'])
+        records.append(result)
+    return out, pd.DataFrame(records,columns=[
+        'STRUCT_ID','CIRCUIT','TOPO_ID','STR_TYPE','NEARBY_TOPS','OLD_X','OLD_Y','NEW_X','NEW_Y',
+        'SHIFT_M','STATUS','REASON','PHASE_WIRES','MID_WIRE_ID'])
+
+
 def run_geometry_stage(
     wires_path: Path,
     points_path: Path,
@@ -6777,6 +10055,7 @@ def run_geometry_stage(
     horizontal_z_ratio: float = 0.35,
     max_join_review_m: float = 25.0,
     wire_simplify_m: float = 0.25,
+    lidar_workers: int | None = None,
 ):
     output.mkdir(parents=True, exist_ok=True)
     crs=CRS.from_epsg(epsg); u2m=unit_to_metre(crs)
@@ -6784,14 +10063,20 @@ def run_geometry_stage(
     selected_rows=set(selection.get("selected_rows",[]))
 
     console_stage("MIXING", "Building 2D wires, 3D structures and Caydence products")
-    info("EVERSOURCE 01 - GEOMETRY")
+    info("EVERSOURCE TESTER R01.05-test - 01 GEOMETRY")
     info(f"CRS: EPSG:{epsg}")
     if selected_rows:
         info("Selected RoWs: "+", ".join(sorted(selected_rows)))
 
     wires=read_dxf_wires(wires_path,crs);info(f"3D source wires: {len(wires):,}")
     raw_points=read_dxf_structure_points(points_path,crs,u2m,marker_cluster_m,marker_max_length_m)
-    supports,point_to_support=build_support_sites(raw_points,u2m,support_cluster_m)
+    kmz_ownership_refs=project_kmz(parse_sow_kmz(kmz_path),crs)
+    sow_ownership_rows=_load_sow_circuits(package_root()/"source",crs,kmz_ownership_refs)
+    raw_points=assign_poa_circuit_ownership(raw_points,sow_ownership_rows,u2m,wires=wires)
+    supports,point_to_support=build_support_sites(raw_points,u2m,support_cluster_m,wires=wires)
+    pd.DataFrame(supports.attrs.get("split_qa", []),
+                 columns=["GROUP","N_POA","N_PARTS","SPREAD_M","X","Y"]).to_csv(
+        output/"01_support_split_qa.csv", index=False)
     raw_points=raw_points.copy().reset_index(drop=True)
     raw_points["TOPO_ID"]=[point_to_support.get(int(i), "") for i in raw_points.index]
     wm,wire_review=endpoint_assignment(wires,supports,u2m,max_endpoint_m)
@@ -6844,27 +10129,183 @@ def run_geometry_stage(
             structures=structures_xy,
             structure_anchor_m=15.0,
         )
+        cayd_w, cayd_row_fix_qa = reassign_caydence_row_to_circuit_rows(
+            cayd_w, kmz, selected_rows, u2m
+        )
+        cayd_row_fix_qa.to_csv(output/"01_caydence_row_circuit_fix.csv", index=False)
+        info(f"Caydence wires moved to a RoW carrying their circuit: {len(cayd_row_fix_qa):,}")
         caydence_qa.to_csv(
             output/"01_caydence_completeness.csv",
             index=False
+        )
+        cayd_w.attrs.get("continuity_qa", pd.DataFrame()).to_csv(
+            output/"01_caydence_circuit_continuity.csv", index=False
+        )
+        cayd_w.attrs.get("earth_continuity_qa", pd.DataFrame()).to_csv(
+            output/"01_caydence_earth_continuity.csv", index=False
         )
         info(
             f"Caydence wire completeness: "
             f"{len(cayd_w):,}/{len(wires):,} source 3D wires"
         )
 
+        # Recover observed substation terminal conductors from raw 3D, even
+        # where there is deliberately no POA or source Structure.
+        final_wires, terminal_2d_qa, terminal_2d_parts = recover_terminal_2d_from_3d(
+            final_wires, cayd_w, u2m
+        )
+        terminal_2d_qa.to_csv(output/"01_terminal_2d_recovery.csv", index=False)
+        info(f"2D terminal conductor recovery: {len(terminal_2d_parts):,} added from observed 3D")
+        final_wires, tap_2d_qa, tap_2d_parts = recover_tap_2d_from_3d(final_wires, cayd_w, u2m)
+        final_wires, fork_qa = trim_branch_overlaps(final_wires, u2m)
+        tap_2d_qa.to_csv(output/"01_tap_2d_recovery.csv", index=False)
+        fork_qa.to_csv(output/"01_fork_overlap_trim.csv", index=False)
+        info(f"2D branch overlaps trimmed at forks: {int((fork_qa.get('ACTION', pd.Series(dtype=str)) != '').sum()) if not fork_qa.empty else 0}")
+        n_taps = 0 if tap_2d_qa.empty else int(
+            tap_2d_qa[tap_2d_qa["ACTION"] == "RECOVERED_3D_TAP"].groupby(["CIRCUIT", "TAP"]).ngroups)
+        info(f"2D taps recovered from observed 3D: {n_taps:,}")
+
+        # A retained 2D circuit path is not a complete inventory of real POA
+        # structures. Reinstate its observed terminals before LiDAR sampling.
+        structures_xy, recovered_terminal_poa = recover_terminal_poa_structures(
+            raw_points, cayd_w, structures_xy, csi, client, kmz, u2m
+        )
+        info(f"Recovered terminal structures from real DXF POA: {len(recovered_terminal_poa):,}")
+        recovered_terminal_poa.to_csv(output/"01_recovered_terminal_poa.csv", index=False)
+
+        # Second-pass source attribution follows order along each circuit.
+        # It only fills blank source fields and does not move a POA Structure.
+        structures_xy, corridor_qa = attribute_unmatched_structures_along_corridor(
+            structures_xy, csi, client, kmz, u2m
+        )
+        corridor_qa.to_csv(output/"01_structure_corridor_attribution.csv", index=False)
+        info("Corridor source attribution: " + str(int((corridor_qa.get("STATUS", pd.Series(dtype=str)) == "MATCHED").sum())) + " newly matched structures")
+
+        # Ground sampling returns 0-based rows; preserve that indexing even
+        # when selected RoWs have filtered a non-contiguous source index.
+        structures_xy = structures_xy.reset_index(drop=True)
+
         # Structures are a geometry deliverable, so obtain final ground Z here
         # rather than waiting for the point-cloud stage.
-        info("Sampling Structure ground elevations from source LiDAR...")
+        info("Sampling Structure ground and 3D wire classes 187/210 from source LiDAR...")
+        wire_votes = _WireLidarVotes(cayd_w, u2m)
         structures_final,ground_qa=add_ground_elevation_from_lidar(
-            structures_xy,lidar_source,crs,u2m,td
+            structures_xy,lidar_source,crs,u2m,td,wire_votes=wire_votes,
+            workers=lidar_workers,
         )
+        cayd_w, lidar_role_qa = wire_votes.apply(cayd_w)
+        lidar_role_qa.to_csv(output/"01_caydence_lidar_wire_roles.csv", index=False)
+
+        # R01.05 (20/11): the 2D wire was chosen before LiDAR roles were known.
+        # If a chosen conductor is LiDAR-confirmed EARTH, choose again without
+        # those wires, then move affected Structures onto the new 2D.
+        lidar_earth_ids = set(cayd_w.loc[
+            cayd_w["WIRE_TYPE"].astype(str).str.upper() == "EARTH", "WIRE_ID"].astype(str))
+        earth_hits = sorted(set(span_edges["WIRE_ID"].astype(str)) & lidar_earth_ids)
+        reselect_qa = []
+        if earth_hits:
+            id2row = {txt(v): i for i, v in enumerate(wires["WIRE_ID"])} if "WIRE_ID" in wires.columns else {}
+            set_lidar_earth_rows({id2row[x] for x in lidar_earth_ids if x in id2row})
+            try:
+                fw2, se2, _sx2, _pd2, jr2 = build_final_products(
+                    paths, bundles, supports, raw_points, client, kmz, csi, u2m,
+                    max_join_review_m, wire_simplify_m)
+            finally:
+                set_lidar_earth_rows(set())
+            if selected_rows:
+                fw2 = fw2[fw2["CIRCUIT"].astype(str).isin(keep_circuits)].copy()
+                se2 = se2[se2["CIRCUIT"].astype(str).isin(keep_circuits)].copy()
+            fw2, terminal_2d_qa, terminal_2d_parts = recover_terminal_2d_from_3d(fw2, cayd_w, u2m)
+            fw2, tap_2d_qa, tap_2d_parts = recover_tap_2d_from_3d(fw2, cayd_w, u2m)
+            fw2, fork_qa = trim_branch_overlaps(fw2, u2m)
+            terminal_2d_qa.to_csv(output/"01_terminal_2d_recovery.csv", index=False)
+            tap_2d_qa.to_csv(output/"01_tap_2d_recovery.csv", index=False)
+            fork_qa.to_csv(output/"01_fork_overlap_trim.csv", index=False)
+            still = sorted(set(se2["WIRE_ID"].astype(str)) & lidar_earth_ids)
+            changed_c = {txt(c) for c in span_edges.loc[span_edges["WIRE_ID"].astype(str).isin(earth_hits), "CIRCUIT"]}
+            old_geom = {txt(c): g.geometry.union_all() for c, g in final_wires.groupby("CIRCUIT")}
+            new_geom = {txt(c): g.geometry.union_all() for c, g in fw2.groupby("CIRCUIT")}
+            moved_idx, positioned = [], structures_xy.copy()
+            for i, r in structures_xy.iterrows():
+                c = txt(r.get("CIRCUIT"))
+                if c not in changed_c or c not in new_geom or c not in old_geom:
+                    continue
+                pt = r.geometry
+                d_old = float(old_geom[c].distance(pt)) * u2m
+                d_new = float(new_geom[c].distance(pt)) * u2m
+                if d_old <= 0.3 and 0.3 < d_new <= 15.0:
+                    q = nearest_points(new_geom[c], pt)[0]
+                    positioned.at[i, "geometry"] = Point(q.x, q.y)
+                    moved_idx.append(i)
+            if moved_idx:
+                repl_final, repl_qa = add_ground_elevation_from_lidar(
+                    positioned.loc[moved_idx], lidar_source, crs, u2m, td,
+                    wire_votes=None, workers=lidar_workers)
+                for i, (_, new_row) in zip(moved_idx, repl_final.iterrows()):
+                    for col in repl_final.columns:
+                        structures_final.at[i, col] = new_row[col]
+                for i, (_, new_row) in zip(moved_idx, repl_qa.iterrows()):
+                    for col in repl_qa.columns:
+                        ground_qa.at[i, col] = new_row[col]
+                structures_xy = positioned
+            for w_id in earth_hits:
+                reselect_qa.append({"WIRE_ID": w_id, "ACTION": "STILL_SELECTED" if w_id in still else "REPLACED"})
+            final_wires, span_edges, join_review = fw2, se2, jr2
+            info(f"2D re-selected after LiDAR: {len(earth_hits) - len(still)} of {len(earth_hits)} "
+                 f"EARTH-on-2D spans replaced; {len(moved_idx)} Structures moved onto the new 2D")
+        pd.DataFrame(reselect_qa, columns=["WIRE_ID", "ACTION"]).to_csv(
+            output/"01_2d_lidar_earth_reselect.csv", index=False)
+
+        # SCHF and single-top SCSH use three classified horizontal PHASE
+        # wires. SCSH with neighboring same-circuit POA stays untouched.
+        # This step runs after LiDAR role assignment and before final ground Z.
+        outer_lane_circuits = set()
+        if span_edges is not None and "LANE" in span_edges.columns:
+            outer_lane_circuits = set(
+                span_edges.loc[span_edges["LANE"].astype(str).str.startswith("OUTER"), "CIRCUIT"].astype(str))
+        positioned_xy, schf_qa = relocate_schf_to_middle_phase(
+            structures_xy, cayd_w, u2m, raw_poa=raw_points,
+            outer_lane_circuits=outer_lane_circuits)
+        schf_qa.to_csv(output/"01_structure_middle_phase_qa.csv", index=False)
+        moved_schf = int((schf_qa.get('STATUS',pd.Series(dtype=str))=='MOVED').sum())
+        review_schf = int((schf_qa.get('STATUS',pd.Series(dtype=str))=='REVIEW').sum())
+        if moved_schf:
+            changed_indices = [i for i in structures_xy.index
+                if not structures_xy.loc[i].geometry.equals(positioned_xy.loc[i].geometry)]
+            # Resample class-2 ground ONLY at modified positions. The second
+            # pass deliberately disables wire voting to avoid double counts.
+            repl_final, repl_qa = add_ground_elevation_from_lidar(
+                positioned_xy.loc[changed_indices],lidar_source,crs,u2m,td,
+                wire_votes=None, workers=lidar_workers)
+            for i, (_, new_row) in zip(changed_indices, repl_final.iterrows()):
+                for col in repl_final.columns:
+                    structures_final.at[i,col] = new_row[col]
+            # Ground QA is regenerated from the final Structure coordinates.
+            for i, (_, new_row) in zip(changed_indices, repl_qa.iterrows()):
+                for col in repl_qa.columns:
+                    ground_qa.at[i,col] = new_row[col]
+            structures_xy=positioned_xy
+        info(f"SCHF/SCSH middle-phase positioning: {moved_schf} moved; {review_schf} for QA")
+        confirmed = int((lidar_role_qa.get("METHOD", pd.Series(dtype=str)) == "LIDAR_CLASS_187_210").sum())
+        uncertain = int((lidar_role_qa.get("METHOD", pd.Series(dtype=str)) == "INSUFFICIENT_LIDAR").sum())
+        info(f"Caydence LiDAR conductor roles: {confirmed:,} class-confirmed; {uncertain:,} unconfirmed (QA CSV)")
 
         # Caydence Structures are exactly the final 3D circuit Structure product,
         # simply collected at RoW level instead of split into Circuit folders.
+        span_edges, structures_final, cayd_w, row_boundary_qa = apply_row_boundaries_at_structures(
+            span_edges, structures_final, cayd_w, bundles, kmz, selected_rows, u2m
+        )
+        row_boundary_qa.to_csv(output/"01_row_boundary_qa.csv", index=False)
+        if not row_boundary_qa.empty:
+            info("RoW boundaries at Structures: " + ", ".join(
+                f"{k} {v}" for k, v in row_boundary_qa["KIND"].value_counts().items()))
         cayd_structures=build_caydence_structures_by_row(
             structures_final,selected_rows
         )
+        cayd_dedupe_qa = cayd_structures.attrs.get("dedupe_qa", pd.DataFrame())
+        cayd_dedupe_qa.to_csv(output/"01_caydence_structure_dedupe_qa.csv", index=False)
+        if not cayd_dedupe_qa.empty:
+            info(f"Caydence Structures: {len(cayd_dedupe_qa)} duplicate records removed")
 
         deliverables=output.parent/"deliverables"
         structure_source_fields=list(
@@ -6879,6 +10320,8 @@ def run_geometry_stage(
             year,
             deliverables,
             structure_source_fields=structure_source_fields,
+            span_edges=span_edges,
+            unit_to_m=u2m,
         )
         geom_inventory.to_csv(
             output/"01_geometry_delivery_inventory.csv",
@@ -6907,9 +10350,12 @@ def run_geometry_stage(
         if gpkg.exists(): gpkg.unlink()
         for g,l in [
             (final_wires,"wires_2d"),(structures_xy,"structures_xy"),(structures_final,"structures_final"),
-            (ground_qa,"structure_ground_qa"),(span_edges,"selected_span_wires"),
+            (ground_qa,"structure_ground_qa"),(spans_one_row_per_feature(span_edges),"selected_span_wires"),
             (cayd_w,"caydence_wires_3d"),(cayd_structures,"caydence_structures_3d"),
             (build_structure_source_match_lines(structures_xy),"structure_source_match"),
+            (recovered_terminal_poa,"recovered_terminal_poa"),
+            (terminal_2d_parts,"recovered_terminal_2d"),
+            (tap_2d_parts,"recovered_tap_2d"),
             (dropped,"discarded_branches"),(earth,"earth_wires_excluded"),
             (phase_discarded,"phase_wires_discarded"),(supports,"support_points"),
             (raw_points,"source_structure_points"),(bundle_gdf,"span_bundles"),
@@ -6921,6 +10367,8 @@ def run_geometry_stage(
         kmz_rows=[{"ROW":r.row,"CIRCUIT":r.circuit,"VOLTAGE":r.voltage,"COMPANY":r.company,
                    "GLOBALID":r.globalid,"geometry":r.geometry} for r in kmz_refs if r.geometry is not None]
         write_layer(rows_to_gdf(kmz_rows,crs),gpkg,"kmz_reference")
+        write_export_settings(gpkg, year=year, selected_rows=selected_rows,
+                              unit_to_m=u2m, epsg=crs)
 
         structures_xy.drop(columns="geometry",errors="ignore").to_csv(output/"01_structure_position_review.csv",index=False)
         shift_rows=[]
@@ -9082,7 +12530,7 @@ def run_points_stage(
             for row in selected_rows:
                 tg=tile_index[tile_index['ROW']==row].copy()
                 if tg.empty: continue
-                out=deliverables/safe_filename(row)/'Tile_Index'/f"{safe_filename(row)}_Tile_Index_{year}.shp"
+                out=delivery_dir(deliverables,'tile_index',row=row)/f"{safe_filename(row)}_Tile_Index_{year}.shp"
                 _write_clean_shapefile(tg,out,['ROW','TILE_NAME','CAP_YEAR','geometry'])
                 inventory.append({'PRODUCT':'Tile Index','ROW':row,'DELIVERY_FILE':out.name,'STATUS':'WRITTEN'})
 
@@ -9090,7 +12538,7 @@ def run_points_stage(
             for row in selected_rows:
                 mg=management_units[management_units['ROW']==row].copy()
                 if mg.empty: continue
-                out=deliverables/safe_filename(row)/'Management_Units'/f"{safe_filename(row)}_Management_Unit_{year}.shp"
+                out=delivery_dir(deliverables,'management_units',row=row)/f"{safe_filename(row)}_Management_Unit_{year}.shp"
                 internal={'MU_IDX','MU_LAYER','MU_ROW_RAW'}
                 cols=[c for c in mg.columns if c not in internal and c!='geometry']+['geometry']
                 _write_clean_shapefile(mg,out,cols)

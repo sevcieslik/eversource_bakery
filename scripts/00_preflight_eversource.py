@@ -181,7 +181,20 @@ def main():
     )
     p.add_argument("--boundary-concavity-m", type=float, default=50.0)
     p.add_argument("--boundary-merge-buffer-ft", type=float, default=0.1)
+    p.add_argument(
+        "--no-cache", action="store_true",
+        help="Recalculate the LiDAR tile index, SoW/MU and coverage table "
+             "instead of reusing 00_preflight/00_cache.",
+    )
     args = p.parse_args()
+    try:
+        from bakery_version import bakery_build_label
+        print(f"[BAKERY] {bakery_build_label()}", flush=True)
+    except Exception:
+        pass
+    if args.no_cache:
+        import os
+        os.environ["BAKERY_NO_PREFLIGHT_CACHE"] = "1"
 
     tool_root = package_root()
     input_dir = Path(args.input_dir) if args.input_dir else tool_root / "input"

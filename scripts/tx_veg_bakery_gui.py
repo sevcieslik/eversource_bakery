@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+from bakery_version import BAKERY_VERSION, BAKERY_RELEASE, bakery_build_label
 
 import csv
 import json
@@ -11,6 +12,7 @@ import sys
 import threading
 import psutil
 import time
+import webbrowser
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -222,9 +224,16 @@ def hidden_process_kwargs():
 class BakeryGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("NM Group - TX Veg Delivery Bakery")
-        self.geometry("1500x900")
-        self.minsize(1180, 760)
+        self.title(f"NM Group - TX Veg Delivery Bakery {bakery_build_label()}")
+        # Size the window for the display scaling and keep it on screen.
+        try:
+            _scale = max(1.0, float(self.tk.call("tk", "scaling")) / (96 / 72))
+        except Exception:
+            _scale = 1.0
+        _w = min(int(1500 * _scale), max(800, self.winfo_screenwidth() - 40))
+        _h = min(int(900 * _scale), max(600, self.winfo_screenheight() - 80))
+        self.geometry(f"{_w}x{_h}")
+        self.minsize(min(980, _w), min(620, _h))
         self.configure(bg=BG)
 
         self.proc = None
@@ -355,6 +364,12 @@ class BakeryGUI(tk.Tk):
             padding=(12, 8)
         )
         style.configure(
+            "Small.TButton",
+            background=PANEL_2, foreground=TEXT,
+            font=("Segoe UI", 9),
+            padding=(6, 5)
+        )
+        style.configure(
             "Bakery.Horizontal.TProgressbar",
             troughcolor="#eadccd",
             background=ACCENT,
@@ -379,7 +394,7 @@ class BakeryGUI(tk.Tk):
         ttk.Label(left, text="TX VEG DELIVERY BAKERY", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             left,
-            text="NMIP26068 Eversource Production Tool  •  production workflow with a bakery problem",
+            text=f"NMIP26068 Eversource Tester {bakery_build_label()}  •  {BAKERY_RELEASE}",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(2, 0))
         self.ready_badge = tk.Label(
@@ -389,11 +404,34 @@ class BakeryGUI(tk.Tk):
         )
         self.ready_badge.pack(side="right")
 
-        body = ttk.Frame(self, style="Bakery.TFrame", padding=(18, 4, 18, 16))
-        body.pack(fill="both", expand=True)
+        # The work area scrolls only when the window is smaller than its
+        # content (high display scaling, small screens); otherwise it fills
+        # the window exactly as before.
+        scroll_host = ttk.Frame(self, style="Bakery.TFrame")
+        scroll_host.pack(fill="both", expand=True)
+        self._body_canvas = tk.Canvas(scroll_host, bg=BG, highlightthickness=0, borderwidth=0)
+        self._body_vsb = ttk.Scrollbar(scroll_host, orient="vertical",
+                                       command=self._body_canvas.yview)
+        self._body_canvas.configure(yscrollcommand=self._body_vsb.set)
+        self._body_canvas.pack(side="left", fill="both", expand=True)
+        body = ttk.Frame(self._body_canvas, style="Bakery.TFrame", padding=(18, 4, 18, 16))
+        self._body = body
+        self._body_win = self._body_canvas.create_window(0, 0, window=body, anchor="nw")
+        self._body_canvas.bind("<Configure>", self._fit_body)
+        body.bind("<Configure>", self._fit_body)
+        self.bind_all("<MouseWheel>", self._on_body_wheel, add="+")
+        self.bind_all("<Button-4>", self._on_body_wheel, add="+")
+        self.bind_all("<Button-5>", self._on_body_wheel, add="+")
+
+        # Fixed side columns follow the display scaling (Windows 125%/150%),
+        # otherwise their text is cut on high-DPI screens.
+        try:
+            ui_scale = max(1.0, float(self.tk.call("tk", "scaling")) / (96 / 72))
+        except Exception:
+            ui_scale = 1.0
 
         # Sidebar
-        sidebar = ttk.Frame(body, style="Bakery.TFrame", width=190)
+        sidebar = ttk.Frame(body, style="Bakery.TFrame", width=int(190 * ui_scale))
         sidebar.pack(side="left", fill="y", padx=(0, 12))
         sidebar.pack_propagate(False)
         stages = [
@@ -419,20 +457,30 @@ class BakeryGUI(tk.Tk):
                      font=("Segoe UI", 8)).pack(anchor="w")
             self.stage_labels[name] = (box, lbl)
 
-        # Main + right
-        main = ttk.Frame(body, style="Bakery.TFrame")
-        main.pack(side="left", fill="both", expand=True)
-        right = ttk.Frame(body, style="Bakery.TFrame", width=285)
+        # Always-visible help action, bottom of left navigation.
+        ttk.Button(
+            sidebar, text="Operator Manual", style="Secondary.TButton",
+            command=self._open_operator_manual
+        ).pack(side="bottom", fill="x", pady=(12, 0))
+
+        # Right column is packed before the main area so it keeps its width
+        # when the window is narrow; the main area takes what is left.
+        right = ttk.Frame(body, style="Bakery.TFrame", width=int(285 * ui_scale))
         right.pack(side="right", fill="y", padx=(12, 0))
         right.pack_propagate(False)
+        main = ttk.Frame(body, style="Bakery.TFrame")
+        main.pack(side="left", fill="both", expand=True)
 
         # Top row cards
         top = ttk.Frame(main, style="Bakery.TFrame")
         top.pack(fill="x")
         work_outer, work = self._card(top)
-        work_outer.pack(side="left", fill="both", expand=True, padx=(0, 6))
         prod_outer, prod = self._card(top)
-        prod_outer.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        top.columnconfigure(0, weight=1)
+        self._top_cards = (top, work_outer, prod_outer)
+        self._top_wide = None
+        self._layout_top_cards(wide=True)
+        top.bind("<Configure>", self._on_top_resize)
 
         ttk.Label(work, text="Workspace Setup", style="CardTitle.TLabel").grid(
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 10)
@@ -446,7 +494,7 @@ class BakeryGUI(tk.Tk):
         )
         self.crs_combo = ttk.Combobox(
             work, textvariable=self.crs_var,
-            values=list(CRS_OPTIONS), state="readonly", width=42
+            values=list(CRS_OPTIONS), state="readonly", width=22
         )
         self.crs_combo.grid(row=4, column=1, sticky="ew", padx=(8, 6), pady=6)
         self.crs_combo.bind(
@@ -531,7 +579,7 @@ class BakeryGUI(tk.Tk):
                    command=self._clear_log).pack(side="right")
         self.log = tk.Text(
             log_card, bg=LOG_BG, fg=LOG_FG, insertbackground="white",
-            font=("Consolas", 9), wrap="word", height=16,
+            font=("Consolas", 9), wrap="word", height=8,
             relief="flat", padx=10, pady=10
         )
         self.log.pack(fill="both", expand=True, pady=(8, 0))
@@ -574,42 +622,106 @@ class BakeryGUI(tk.Tk):
 
         btn_outer, btns = self._card(right)
         btn_outer.pack(fill="x")
+        btns.columnconfigure(0, weight=1, uniform="btn")
+        btns.columnconfigure(1, weight=1, uniform="btn")
         self.start_btn = ttk.Button(
             btns, text="▶  Start Batch", style="Accent.TButton",
             command=self._start_batch
         )
-        self.start_btn.pack(fill="x", pady=(0, 6))
+        self.start_btn.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         self.pause_btn = ttk.Button(
-            btns, text="Pause", style="Secondary.TButton",
+            btns, text="Pause", style="Small.TButton",
             command=self._toggle_pause, state="disabled"
         )
-        self.pause_btn.pack(fill="x", pady=3)
-        self.rows_btn = ttk.Button(
-            btns, text="Select RoWs", style="Secondary.TButton",
-            command=self._reopen_row_selector, state="disabled"
-        )
-        self.rows_btn.pack(fill="x", pady=3)
+        self.pause_btn.grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=3)
         self.stop_btn = ttk.Button(
-            btns, text="Stop", style="Secondary.TButton",
+            btns, text="Stop", style="Small.TButton",
             command=self._stop_batch, state="disabled"
         )
-        self.stop_btn.pack(fill="x", pady=3)
+        self.stop_btn.grid(row=1, column=1, sticky="ew", padx=(3, 0), pady=3)
+        self.rows_btn = ttk.Button(
+            btns, text="Select RoWs", style="Small.TButton",
+            command=self._reopen_row_selector, state="disabled"
+        )
+        self.rows_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=3)
         ttk.Button(
-            btns, text="Open Deliverables", style="Secondary.TButton",
+            btns, text="Deliverables", style="Small.TButton",
             command=self._open_deliverables
-        ).pack(fill="x", pady=3)
+        ).grid(row=3, column=0, sticky="ew", padx=(0, 3), pady=3)
         ttk.Button(
-            btns, text="Open QA", style="Secondary.TButton",
+            btns, text="QA", style="Small.TButton",
             command=self._open_qa
-        ).pack(fill="x", pady=3)
+        ).grid(row=3, column=1, sticky="ew", padx=(3, 0), pady=3)
+        self.gpkg_export_btn = ttk.Button(
+            btns, text="Re-export from GPKG", style="Small.TButton",
+            command=self._start_gpkg_export
+        )
+        self.gpkg_export_btn.grid(row=4, column=0, columnspan=2, sticky="ew", pady=3)
 
         self._refresh_qa()
+
+    def _fit_body(self, event=None):
+        """Stretch the work area to the window; scroll only if it does not fit."""
+        c = self._body_canvas
+        cw, ch = c.winfo_width(), c.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+        need = self._body.winfo_reqheight()
+        h = max(ch, need)
+        c.itemconfigure(self._body_win, width=cw, height=h)
+        c.configure(scrollregion=(0, 0, cw, h))
+        if need > ch + 1:
+            if not self._body_vsb.winfo_ismapped():
+                self._body_vsb.pack(side="right", fill="y", before=c)
+        elif self._body_vsb.winfo_ismapped():
+            self._body_vsb.pack_forget()
+            c.yview_moveto(0)
+
+    def _on_body_wheel(self, event):
+        if not self._body_vsb.winfo_ismapped():
+            return
+        w = event.widget
+        if isinstance(w, (tk.Text, tk.Listbox, ttk.Treeview)):
+            return  # the log and tables scroll themselves
+        try:
+            if w.winfo_toplevel() is not self:
+                return  # dialogs (RoW selector) scroll themselves
+        except Exception:
+            return
+        if getattr(event, "num", None) == 4:
+            step = -1
+        elif getattr(event, "num", None) == 5:
+            step = 1
+        else:
+            step = -1 if event.delta > 0 else 1
+        self._body_canvas.yview_scroll(step * 3, "units")
+
+    def _layout_top_cards(self, wide):
+        """Workspace and Product cards side by side, or stacked when narrow."""
+        top, work_outer, prod_outer = self._top_cards
+        if wide == self._top_wide:
+            return
+        self._top_wide = wide
+        work_outer.grid_forget()
+        prod_outer.grid_forget()
+        if wide:
+            top.columnconfigure(1, weight=0)
+            work_outer.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+            prod_outer.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        else:
+            work_outer.grid(row=0, column=0, columnspan=2, sticky="nsew")
+            prod_outer.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
+
+    def _on_top_resize(self, event=None):
+        top, work_outer, prod_outer = self._top_cards
+        need = work_outer.winfo_reqwidth() + prod_outer.winfo_reqwidth() + 12
+        self._layout_top_cards(wide=top.winfo_width() >= need)
 
     def _path_row(self, parent, row, label, var, browse, disabled=False):
         ttk.Label(parent, text=label, style="Body.TLabel").grid(
             row=row, column=0, sticky="w", pady=6
         )
-        ent = ttk.Entry(parent, textvariable=var)
+        ent = ttk.Entry(parent, textvariable=var, width=12)
         ent.grid(row=row, column=1, sticky="ew", padx=(8, 6), pady=6)
         if disabled:
             ent.configure(state="readonly")
@@ -824,6 +936,21 @@ class BakeryGUI(tk.Tk):
             return
         self._open_folder(Path(self.output_var.get()) / "QA")
 
+    def _open_operator_manual(self):
+        manual = ROOT / "docs" / "operator_manual.html"
+        if not manual.is_file():
+            messagebox.showerror(
+                "Operator Manual",
+                f"Manual not found:\n{manual}\n\nReinstall the complete Eversource Tester package.",
+            )
+            return
+        try:
+            opened = webbrowser.open(manual.resolve().as_uri())
+            if not opened:
+                raise RuntimeError("No browser accepted the manual URL")
+        except Exception as exc:
+            messagebox.showerror("Operator Manual", f"Could not open manual:\n{exc}")
+
     def _validate_start(self):
         inp = Path(self.input_var.get().strip())
         out = Path(self.output_var.get().strip())
@@ -877,7 +1004,8 @@ class BakeryGUI(tk.Tk):
         self.summary_badge.configure(text="BATCH IN PROGRESS", bg="#f6ddc8", fg=ACCENT_DARK)
         self._set_stage("PREHEATING", "Validating inputs, AOIs and LiDAR coverage")
         self._clear_log()
-        self._append_log("TX Veg Delivery Bakery batch started.")
+        self._append_log(f"TX Veg Delivery Bakery {bakery_build_label()} batch started.")
+        self._append_log(f"Release: {BAKERY_RELEASE}")
         self._append_log(f"Input:  {inp}")
         self._append_log(f"Source: {SOURCE}")
         self._append_log(f"Output: {out}")
@@ -907,6 +1035,117 @@ class BakeryGUI(tk.Tk):
         )
         self.worker_thread.start()
 
+
+    def _start_gpkg_export(self):
+        """R01.05: rebuild 45/80 (circuit) and 267 (Caydence) deliverables from the edited QA GPKG."""
+        if self.worker_thread and self.worker_thread.is_alive():
+            return
+        out_txt = self.output_var.get().strip()
+        if not out_txt:
+            messagebox.showerror("Export from edited GPKG", "Choose the output folder first.")
+            return
+        out = Path(out_txt)
+        gpkg = out / "01_geometry" / "01_eversource_geometry.gpkg"
+        if not gpkg.is_file():
+            messagebox.showerror(
+                "Export from edited GPKG",
+                f"Geometry GPKG not found:\n{gpkg}\n\nRun Geometry first.",
+            )
+            return
+        rows = self._ask_export_rows(gpkg)
+        if not rows:
+            return
+        self.cancel_requested = False
+        self.started_at = time.monotonic()
+        self.total_paused_seconds = 0.0
+        self.status_var.set("Running")
+        self.start_btn.configure(state="disabled")
+        self.gpkg_export_btn.configure(state="disabled")
+        self._clear_log()
+        self._append_log(f"TX Veg Delivery Bakery {bakery_build_label()}: export from edited GPKG.")
+        self._append_log(f"GPKG: {gpkg}")
+
+        def work():
+            try:
+                rc = self._run_process(
+                    "RE-PACKING",
+                    ROOT / "scripts" / "04_export_geometry_from_gpkg.py",
+                    "--output-root", str(out),
+                    "--rows", ",".join(rows),
+                )
+                if rc != 0:
+                    raise RuntimeError("Export from GPKG failed.")
+                self.events.put(("done", None))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+            finally:
+                self.after(0, lambda: self.gpkg_export_btn.configure(state="normal"))
+
+        self.worker_thread = threading.Thread(target=work, daemon=True)
+        self.worker_thread.start()
+
+    def _ask_export_rows(self, gpkg: Path):
+        """Choose the RoWs to re-export. Default: the RoWs selected for the run."""
+        try:
+            kw = {}
+            if os.name == "nt":
+                kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            res = subprocess.run(
+                [PY, str(ROOT / "scripts" / "04_export_geometry_from_gpkg.py"),
+                 "--gpkg", str(gpkg), "--list-rows"],
+                capture_output=True, text=True, timeout=300, **kw,
+            )
+            vals = dict(
+                line.split("=", 1) for line in res.stdout.splitlines() if "=" in line
+            )
+            selected = [r for r in vals.get("SELECTED_ROWS", "").split(";") if r]
+            found = [r for r in vals.get("FOUND_ROWS", "").split(";") if r]
+        except Exception as exc:
+            messagebox.showerror("Re-export from GPKG", f"Could not read RoWs from the GPKG:\n{exc}")
+            return None
+        rows = sorted(set(selected) | set(found))
+        if not rows:
+            messagebox.showerror("Re-export from GPKG", "No RoWs found in the GPKG.")
+            return None
+        default = set(selected) or set(found)
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Re-export from GPKG")
+        dlg.configure(bg=BG)
+        dlg.transient(self)
+        dlg.grab_set()
+        frm = ttk.Frame(dlg, style="Bakery.TFrame", padding=16)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(
+            frm,
+            text=("Rebuild 45_structure_shapefile, 80_powerline_vectors and 267_caydence_conductors for the RoWs ticked below.\n"
+                  "Save and close the GPKG in QGIS first. Current folders are copied to QA.\n"
+                  "Tile Index, Management Units and LAS are not touched."),
+            style="Side.TLabel", justify="left",
+        ).pack(anchor="w", pady=(0, 10))
+        ttk.Style(self).configure("Dlg.TCheckbutton", background=BG, foreground=TEXT)
+        vars_ = {}
+        for r in rows:
+            note = "" if r in selected else "   (not selected for this Geometry run)"
+            v = tk.BooleanVar(value=r in default)
+            vars_[r] = v
+            ttk.Checkbutton(frm, text=r + note, variable=v, style="Dlg.TCheckbutton").pack(anchor="w", pady=1)
+        result = {"rows": None}
+
+        def ok():
+            chosen = [r for r, v in vars_.items() if v.get()]
+            if not chosen:
+                messagebox.showwarning("Re-export from GPKG", "Tick at least one RoW.", parent=dlg)
+                return
+            result["rows"] = chosen
+            dlg.destroy()
+
+        btns = ttk.Frame(frm, style="Bakery.TFrame")
+        btns.pack(fill="x", pady=(12, 0))
+        ttk.Button(btns, text="Re-export", style="Accent.TButton", command=ok).pack(side="right")
+        ttk.Button(btns, text="Cancel", style="Small.TButton", command=dlg.destroy).pack(side="right", padx=6)
+        dlg.wait_window()
+        return result["rows"]
 
     def _read_preflight_rows(self, output_root: Path):
         """Read the preflight coverage table for the GUI RoW selection dialog."""
@@ -1384,6 +1623,7 @@ class BakeryGUI(tk.Tk):
                     ROOT / "scripts" / "01_build_eversource_geometry.py",
                     *common,
                     "--selection", str(selection),
+                    "--workers", str(workers),
                 )
                 if rc != 0:
                     raise RuntimeError("Geometry stage failed.")
@@ -1653,8 +1893,9 @@ class BakeryGUI(tk.Tk):
                     st = event[1]
                     detail = {
                         "PREHEATING": "Checking source data, AOIs and LiDAR coverage",
-                        "MIXING": "Building geometry and Caydence products",
+                        "MIXING": "Building geometry and Caydence products (LiDAR sampling shows a progress bar)",
                         "BAKING / ICING / PACKING": "Building selected point-cloud products",
+                        "RE-PACKING": "Rebuilding 45/80/267 products from the edited GPKG",
                     }.get(st, "Processing")
                     self._set_stage(st, detail)
                 elif kind == "progress":

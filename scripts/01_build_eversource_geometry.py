@@ -35,11 +35,18 @@ def main():
     p.add_argument("--epsg", type=int, default=None)
     p.add_argument("--year", type=int, default=2026)
     p.add_argument("--selection", default=None)
+    p.add_argument("--workers", type=int, default=None,
+                   help="Processes for LiDAR ground/wire sampling (default: auto, max 8).")
     p.add_argument(
         "-o", "--output", default=None,
         help="Explicit Stage 01 output. Overrides --output-root.",
     )
     args = p.parse_args()
+    try:
+        from bakery_version import bakery_build_label
+        print(f"[BAKERY] {bakery_build_label()}", flush=True)
+    except Exception:
+        pass
 
     tool_root = package_root()
     input_dir = Path(args.input_dir) if args.input_dir else tool_root / "input"
@@ -77,6 +84,7 @@ def main():
             wires, points, lidar, client, kmz,
             epsg, args.year, output,
             selection if selection.exists() else None,
+            lidar_workers=args.workers,
         )
         print("\nGEOMETRY COMPLETE")
         return 0
