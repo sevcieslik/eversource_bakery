@@ -98,10 +98,15 @@ def main():
         target.rename(archive)
         print("Previous QA archived:", archive, flush=True)
     staging.rename(target)
+    deliverable_snapshot = sorted(
+        (str(x.relative_to(delivery)).replace("\\\\", "/"), x.stat().st_size, x.stat().st_mtime_ns)
+        for x in delivery.rglob("*") if x.is_file()
+    )
     manifest = {"created_utc": stamp, "gpkg": str(gpkg),
                 "gpkg_size": gpkg.stat().st_size, "gpkg_mtime_ns": gpkg.stat().st_mtime_ns,
-                "deliverables": str(delivery), "source_dxf": str(wire),
-                "poa_dxf": str(poa), "sow_sqlite": str(sqlite[0])}
+                "deliverables": str(delivery), "delivery_snapshot": deliverable_snapshot,
+                "source_dxf": str(wire), "poa_dxf": str(poa),
+                "sow_sqlite": str(sqlite[0])}
     (target / "QA_Run_Manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print("QA COMPLETE; operator review required", flush=True)
     print("QA_REPORT=" + str(target / "QA_Report.html"), flush=True)
