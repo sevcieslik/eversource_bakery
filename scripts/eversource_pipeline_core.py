@@ -8699,8 +8699,25 @@ def apply_row_boundaries_at_structures(
             src = r.get("SOURCE_IDX")
             if c and pd.notna(src):
                 for bid in wire_bundle.get(int(src), []):
-                    if (c, bid) in bundle_rows:
-                        rows, rule = set(bundle_rows[(c, bid)]), "SPAN"
+                    if (c, bid) not in bundle_rows:
+                        continue
+                    span_row_set = set(bundle_rows[(c, bid)])
+                    eligible = span_row_set & sel if sel else span_row_set
+                    if eligible:
+                        rows, rule = eligible, "SPAN"
+                        break
+                    # A full-circuit span can belong to an unselected RoW.
+                    # Never overwrite a wire's already resolved selected RoW
+                    # with that span's RoW and silently drop it from product 267.
+                    if sel and cur in sel:
+                        rows, rule = {cur}, "SPAN_OUTSIDE_SELECTION"
+                        qa.append({
+                            "KIND": "CAYDENCE_SPAN_ROW_OUTSIDE_SELECTION",
+                            "CIRCUIT": c, "ID": txt(r.get("WIRE_ID")),
+                            "ROW": cur,
+                            "SPAN_ROWS": ";".join(sorted(span_row_set)),
+                            "RULE": rule,
+                        })
                         break
             if rows is None and c and st_idx.get(c) and r.geometry is not None:
                 co = list(r.geometry.coords)
@@ -8711,6 +8728,15 @@ def apply_row_boundaries_at_structures(
                     rows, rule = near, "STRUCTURE"
             if not rows:
                 rows = {cur}
+            if sel:
+                unselected = set(rows) - sel
+                if unselected:
+                    qa.append({
+                        "KIND": "CAYDENCE_ROW_OUTSIDE_SELECTION",
+                        "CIRCUIT": c, "ID": txt(r.get("WIRE_ID")),
+                        "ROW": cur, "SPAN_ROWS": ";".join(sorted(unselected)),
+                        "RULE": rule,
+                    })
             rows = sorted(x for x in rows if x)
             if cur in rows:
                 rows.remove(cur)
