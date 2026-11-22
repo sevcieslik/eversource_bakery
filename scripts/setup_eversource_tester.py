@@ -56,8 +56,9 @@ import lazrs
 import psutil
 import matplotlib
 import tkinter
+import sys
 from pathlib import Path
-qa = Path(__file__).resolve().with_name("qa_inspector.py")
+qa = Path(sys.argv[1]) / "qa_inspector.py"
 assert qa.is_file(), f"Bundled Geometry QA Inspector missing: {qa}"
 
 print("Environment imports: OK")
@@ -71,7 +72,7 @@ missing = [
 ]
 assert not missing, "Missing GDAL drivers: " + ", ".join(missing)
 """
-    run([py, "-c", code])
+    run([py, "-c", code, str(SCRIPT_DIR)])
 
 
 def main():
