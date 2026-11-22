@@ -8754,6 +8754,66 @@ def apply_row_boundaries_at_structures(
         for k in ("continuity_qa", "earth_continuity_qa"):
             if k in getattr(cayd_w, "attrs", {}):
                 cw.attrs[k] = cayd_w.attrs[k]
+
+    # R01.05 boundary POA recovery. A whole-circuit path may put its terminal
+    # Structure in an unselected RoW, even though its original DXF conductors
+    # have been correctly recovered into a selected RoW (e.g. C39 310:9932,
+    # PT00203, CT_17 -> CT_16). Keep the source-matched physical Structure
+    # and publish an additional selected-RoW representation. Never infer a
+    # new physical Structure from a wire endpoint alone.
+    if sel and sf is not None and not sf.empty and cw is not None and not cw.empty:
+        endpoint_index = defaultdict(list)
+        attach = 3.0 / unit_to_m
+        for _, wr in cw.iterrows():
+            if txt(wr.get("ROW_RULE")) != "SPAN_OUTSIDE_SELECTION":
+                continue
+            c, rn, wid = txt(wr.get("CIRCUIT")), txt(wr.get("ROW")), txt(wr.get("WIRE_ID"))
+            if not c or rn not in sel or wr.geometry is None or wr.geometry.is_empty:
+                continue
+            parts = list(wr.geometry.geoms) if hasattr(wr.geometry, "geoms") else [wr.geometry]
+            for part in parts:
+                if not hasattr(part, "coords") or len(part.coords) < 2:
+                    continue
+                for xy in (part.coords[0], part.coords[-1]):
+                    endpoint_index[c].append((rn, wid, Point(float(xy[0]), float(xy[1]))))
+
+        already = {(txt(r.get("CIRCUIT")), txt(r.get("TOPO_ID")), txt(r.get("ROW")))
+                   for _, r in sf.iterrows()}
+        extra = []
+        for _, st in sf.iterrows():
+            c, topo, old_row = (txt(st.get("CIRCUIT")),
+                                txt(st.get("TOPO_ID")), txt(st.get("ROW")))
+            if not c or not topo or old_row in sel or st.geometry is None:
+                continue
+            matches = defaultdict(set)
+            for rn, wid, endpoint in endpoint_index.get(c, []):
+                if st.geometry.distance(endpoint) <= attach:
+                    matches[rn].add(wid)
+            # At least two distinct 3D wires meeting the original POA are
+            # required, and their selected RoW must be unambiguous.
+            candidates = [rn for rn, ids in matches.items() if len(ids) >= 2]
+            if len(candidates) != 1:
+                if matches:
+                    qa.append({"KIND": "BOUNDARY_POA_REVIEW", "CIRCUIT": c,
+                               "ID": topo, "ROW": old_row,
+                               "ADDED_ROW": ";".join(sorted(matches)), "RULE": "AMBIGUOUS_OR_FEW_WIRES"})
+                continue
+            new_row = candidates[0]
+            if (c, topo, new_row) in already:
+                continue
+            d = st.copy()
+            d["ROW"] = new_row
+            d["ROW_RULE"] = "BOUNDARY_WIRE_POA_RECOVERY"
+            extra.append(d)
+            already.add((c, topo, new_row))
+            qa.append({"KIND": "BOUNDARY_POA_STRUCTURE_RECOVERED", "CIRCUIT": c,
+                       "ID": f"{topo}/{txt(st.get('STRUCT_ID'))}",
+                       "ROW": old_row, "ADDED_ROW": new_row,
+                       "RULE": "MATCHED_3D_ENDPOINTS"})
+        if extra:
+            sf = gpd.GeoDataFrame(pd.concat(
+                [sf, gpd.GeoDataFrame(extra, crs=sf.crs)], ignore_index=True),
+                geometry="geometry", crs=sf.crs)
     return se, sf, cw, pd.DataFrame(qa)
 
 
