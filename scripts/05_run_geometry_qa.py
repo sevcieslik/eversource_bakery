@@ -89,9 +89,33 @@ def main():
     print("SoW SQLite:", sqlite[0], flush=True)
     print("GPKG:", gpkg, flush=True)
     print("Deliverables:", delivery, flush=True)
-    rc = subprocess.call(cmd)
+    # Always retain the inspector's complete console output, including
+    # Python tracebacks. Streaming via our own pipe makes Windows/GUI
+    # subprocess failures visible in Bakery's Run Log as well as on disk.
+    log_path = staging / "QA_Execution.log"
+    try:
+        with log_path.open("w", encoding="utf-8", errors="replace") as log:
+            log.write("Command: " + subprocess.list2cmdline(cmd) + "\\n")
+            log.flush()
+            process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
+                errors="replace", bufsize=1,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                log.write(line)
+                log.flush()
+                print(line.rstrip("\\r\\n"), flush=True)
+            rc = process.wait()
+    except Exception as exc:
+        message = f"QA LAUNCH FAILED: {type(exc).__name__}: {exc}"
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(message + "\\n")
+        print(message, flush=True)
+        return 2
     if rc != 0 or not (staging / "QA_Report.html").is_file():
-        print(f"QA FAILED (exit={rc}). Staged diagnostics retained in {staging}", flush=True)
+        print(f"QA FAILED (exit={rc}). Full traceback: {log_path}", flush=True)
         return rc or 2
     if target.exists():
         archive = qa_root / f"geometry_validation_archive_{stamp}"
