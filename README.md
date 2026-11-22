@@ -1,5 +1,6 @@
 # Eversource Tester R01.05-test
 
+> **Current approved release: R01.06 (22 Nov 2026).** Geometry QA v0.3 is bundled and uses the same Bakery venv. [R01.06 release notes](docs/RELEASE_NOTES_R01.06.md).\n\n
 **R01.05-test** is the current **test build** for operator UAT. **R01.04** remains the last accepted release. The initial R01.00 geometry deliverables for CT_17 and CT_33 were reviewed and accepted by the project operator.
 
 Detailed changes and test results: [`docs/RELEASE_NOTES_R01.05-test.md`](docs/RELEASE_NOTES_R01.05-test.md).
