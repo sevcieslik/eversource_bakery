@@ -8897,6 +8897,20 @@ def _recover_boundary_poa_spans(se, sf, cw, bundles, selected_rows, qa, unit_to_
                        "N_CANDIDATES": len(candidates)})
             continue
         i, other = candidates[0]
+        # Keep actual selected PHASE geometry. A terminal's 2D representative
+        # can be laterally offset from its physical support; blindly joining
+        # that offset would manufacture a whisker/phase jump. QA the offset.
+        seg = se.at[i, "geometry"]
+        if seg is not None and not seg.is_empty and hasattr(seg, "coords"):
+            ends = list(seg.coords)
+            endpoint_gap_m = min(
+                st.geometry.distance(Point(float(xy[0]), float(xy[1])))
+                for xy in (ends[0], ends[-1])) * unit_to_m
+            if endpoint_gap_m > 5.0:
+                qa.append({"KIND": "BOUNDARY_POA_2D_ENDPOINT_OFFSET_REVIEW",
+                           "CIRCUIT": circuit, "ID": topo, "ROW": row,
+                           "GAP_M": round(endpoint_gap_m, 3),
+                           "RULE": "CHECK_ORIGINAL_PHASE_WIRE"})
         se.at[i, "ROWS"] = ";".join(sorted(set(_split_rows(se.at[i, "ROWS"])) | {row}))
         se.at[i, "RECOVERED_ROWS"] = ";".join(
             sorted(set(_split_rows(se.at[i, "RECOVERED_ROWS"])) | {row}))
