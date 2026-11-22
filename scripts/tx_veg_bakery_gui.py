@@ -245,6 +245,9 @@ class BakeryGUI(tk.Tk):
         self.started_at = None
         self.current_stage = ""
         self.last_progress_total = 0
+        # This-session only: never trust stale output/00_preflight JSON on launch.
+        self.preflight_validated_this_run = False
+        self.preflight_rows_this_run = []
 
         # Preflight -> operator RoW selection pause.
         self.row_selection_done = threading.Event()
@@ -291,7 +294,7 @@ class BakeryGUI(tk.Tk):
         self.other_epsg_var = tk.StringVar(value="")
         self.year_var = tk.StringVar(value="2026")
         self.workers_var = tk.IntVar(value=12)
-        self.status_var = tk.StringVar(value="Ready to preheat")
+        self.status_var = tk.StringVar(value="Ready for preflight")
         self.runtime_var = tk.StringVar(value="00:00:00")
         self.rows_var = tk.StringVar(value="Not checked")
         self.deliverables_var = tk.StringVar(value="—")
@@ -398,7 +401,7 @@ class BakeryGUI(tk.Tk):
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(2, 0))
         self.ready_badge = tk.Label(
-            header, text="  READY TO PREHEAT  ",
+            header, text="  READY FOR PREFLIGHT  ",
             bg="#eadccd", fg=TEXT, font=("Segoe UI Semibold", 10),
             padx=10, pady=8
         )
@@ -587,8 +590,8 @@ class BakeryGUI(tk.Tk):
 
         # Right summary
         badge = tk.Label(
-            right, text="BATCH READY FOR DELIVERY",
-            bg=GREEN_BG, fg="#2e5f2c",
+            right, text="READY FOR PREFLIGHT",
+            bg="#eadccd", fg=TEXT,
             font=("Segoe UI Semibold", 11), padx=10, pady=12
         )
         badge.pack(fill="x", pady=(0, 10))
@@ -749,6 +752,9 @@ class BakeryGUI(tk.Tk):
         )
         if d:
             self.input_var.set(d)
+            self.preflight_validated_this_run = False
+            self.preflight_rows_this_run = []
+            self.rows_var.set("Not checked")
             self._save_paths()
             self._update_crs_from_input(show_errors=True)
             self._refresh_qa()
@@ -760,6 +766,9 @@ class BakeryGUI(tk.Tk):
         )
         if d:
             self.output_var.set(d)
+            self.preflight_validated_this_run = False
+            self.preflight_rows_this_run = []
+            self.rows_var.set("Not checked")
             self._save_paths()
             self._refresh_qa()
 
@@ -891,14 +900,11 @@ class BakeryGUI(tk.Tk):
             "products": bool(self._selected_products()),
             "preflight": False,
         }
-        if out:
-            sel = out / "00_preflight" / "00_preflight_selection.json"
-            if sel.exists():
-                try:
-                    d = json.loads(sel.read_text(encoding="utf-8"))
-                    checks["preflight"] = bool(d.get("selected_rows"))
-                except Exception:
-                    pass
+        # A cached preflight selection file can belong to a prior run.
+        # The indicator becomes green only when this process validates inputs
+        # and the operator confirms RoWs in the current GUI session.
+        checks["preflight"] = bool(self.preflight_validated_this_run and
+                                   self.preflight_rows_this_run)
 
         for key, ok in checks.items():
             lbl, label = self.qa_labels[key]
@@ -991,6 +997,9 @@ class BakeryGUI(tk.Tk):
         self.pause_started = None
         self.total_paused_seconds = 0.0
         self.started_at = time.monotonic()
+        self.preflight_validated_this_run = False
+        self.preflight_rows_this_run = []
+        self._refresh_qa()
         self.progress["value"] = 0
         self.subprogress["value"] = 0
         self.stage_pct_var.set("0%")
@@ -1945,6 +1954,8 @@ class BakeryGUI(tk.Tk):
                     )
                 elif kind == "rows":
                     rows = event[1]
+                    self.preflight_rows_this_run = list(rows)
+                    self.preflight_validated_this_run = bool(rows)
                     if len(rows) <= 3:
                         self.rows_var.set(", ".join(rows))
                     else:
@@ -1969,13 +1980,13 @@ class BakeryGUI(tk.Tk):
 
     def _finish_success(self):
         self.started_at = None
-        self.status_var.set("Complete")
+        self.status_var.set("Processing complete - QA required")
         self.progress["value"] = 100
         self.subprogress["value"] = 100
         self.stage_pct_var.set("100%")
-        self.stage_detail_var.set("Batch ready for delivery")
-        self.ready_badge.configure(text="  BATCH READY FOR DELIVERY  ", bg=GREEN_BG, fg="#2e5f2c")
-        self.summary_badge.configure(text="BATCH READY FOR DELIVERY", bg=GREEN_BG, fg="#2e5f2c")
+        self.stage_detail_var.set("Processing complete - independent QA required before delivery")
+        self.ready_badge.configure(text="  PROCESSING COMPLETE - QA REQUIRED  ", bg="#f5e5c8", fg=ACCENT_DARK)
+        self.summary_badge.configure(text="QA REQUIRED BEFORE DELIVERY", bg="#f5e5c8", fg=ACCENT_DARK)
         self.start_btn.configure(state="normal")
         self.pause_btn.configure(state="disabled", text="Pause")
         self.stop_btn.configure(state="disabled")
