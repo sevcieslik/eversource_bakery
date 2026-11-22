@@ -651,15 +651,20 @@ class BakeryGUI(tk.Tk):
             btns, text="Deliverables", style="Small.TButton",
             command=self._open_deliverables
         ).grid(row=3, column=0, sticky="ew", padx=(0, 3), pady=3)
-        ttk.Button(
-            btns, text="QA", style="Small.TButton",
-            command=self._open_qa
-        ).grid(row=3, column=1, sticky="ew", padx=(3, 0), pady=3)
+        self.qa_run_btn = ttk.Button(
+            btns, text="Run Geometry QA", style="Small.TButton",
+            command=self._run_geometry_qa
+        )
+        self.qa_run_btn.grid(row=3, column=1, sticky="ew", padx=(3, 0), pady=3)
         self.gpkg_export_btn = ttk.Button(
             btns, text="Re-export from GPKG", style="Small.TButton",
             command=self._start_gpkg_export
         )
         self.gpkg_export_btn.grid(row=4, column=0, columnspan=2, sticky="ew", pady=3)
+        ttk.Button(
+            btns, text="QA Results", style="Small.TButton",
+            command=self._open_qa_results
+        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=3)
 
         self._refresh_qa()
 
@@ -937,10 +942,76 @@ class BakeryGUI(tk.Tk):
             return
         self._open_folder(Path(self.output_var.get()) / "deliverables")
 
-    def _open_qa(self):
-        if not self.output_var.get().strip():
+    def _open_qa_results(self):
+        out = self.output_var.get().strip()
+        if not out:
+            messagebox.showwarning("Geometry QA", "Select an output folder.")
             return
-        self._open_folder(Path(self.output_var.get()) / "QA")
+        target = Path(out) / "QA" / "geometry_validation"
+        report = target / "QA_Report.html"
+        if report.is_file():
+            webbrowser.open(report.resolve().as_uri())
+        elif target.is_dir():
+            self._open_folder(target)
+        else:
+            messagebox.showinfo("Geometry QA", "No report yet. Select Run Geometry QA.")
+
+    def _run_geometry_qa(self):
+        """Validate the current Geometry GPKG, actual deliverables and original sources."""
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showinfo("Geometry QA", "Wait for the current Bakery task to finish.")
+            return
+        inp = Path(self.input_var.get().strip())
+        out = Path(self.output_var.get().strip())
+        gpkg = out / "01_geometry" / "01_eversource_geometry.gpkg"
+        if not gpkg.is_file() or not (out / "deliverables").is_dir():
+            messagebox.showwarning(
+                "Geometry QA",
+                "Geometry output and deliverables are required. Complete Geometry first.\n"
+                f"Expected GPKG:\n{gpkg}",
+            )
+            return
+        qa_launcher = ROOT / "scripts" / "05_run_geometry_qa.py"
+        qa_engine = ROOT / "scripts" / "qa_inspector.py"
+        if not qa_launcher.is_file() or not qa_engine.is_file():
+            messagebox.showerror(
+                "Geometry QA",
+                "QA Inspector is not installed in Bakery/scripts/.\n"
+                "Install the complete Geometry QA integration package.",
+            )
+            return
+        self.cancel_requested = False
+        self.started_at = time.monotonic()
+        self.status_var.set("Geometry QA running")
+        self.stage_detail_var.set("Checking original DXF, GPKG and 45/80/267 deliverables")
+        self.ready_badge.configure(text="  GEOMETRY QA RUNNING  ", bg="#f5e5c8", fg=ACCENT_DARK)
+        self.summary_badge.configure(text="GEOMETRY QA IN PROGRESS", bg="#f5e5c8", fg=ACCENT_DARK)
+        self.qa_run_btn.configure(state="disabled")
+        self.start_btn.configure(state="disabled")
+        self.gpkg_export_btn.configure(state="disabled")
+        self._clear_log()
+        self._append_log(f"Geometry QA: {gpkg}")
+        self._append_log("One run only. No production Geometry files will be modified.")
+
+        def work():
+            try:
+                rc = self._run_process(
+                    "GEOMETRY QA", qa_launcher,
+                    "--input-dir", str(inp),
+                    "--source-dir", str(SOURCE),
+                    "--output-root", str(out),
+                )
+                if rc:
+                    raise RuntimeError(f"Geometry QA returned exit code {rc}. See log for details.")
+                report = out / "QA" / "geometry_validation" / "QA_Report.html"
+                if not report.is_file():
+                    raise RuntimeError(f"Geometry QA completed without report: {report}")
+                self.events.put(("geometry_qa_done", str(report)))
+            except Exception as exc:
+                self.events.put(("geometry_qa_error", str(exc)))
+
+        self.worker_thread = threading.Thread(target=work, daemon=True)
+        self.worker_thread.start()
 
     def _open_operator_manual(self):
         manual = ROOT / "docs" / "operator_manual.html"
@@ -1905,6 +1976,7 @@ class BakeryGUI(tk.Tk):
                         "MIXING": "Building geometry and Caydence products (LiDAR sampling shows a progress bar)",
                         "BAKING / ICING / PACKING": "Building selected point-cloud products",
                         "RE-PACKING": "Rebuilding 45/80/267 products from the edited GPKG",
+                    "GEOMETRY QA": "Checking sources, one GPKG and products 45/80/267",
                     }.get(st, "Processing")
                     self._set_stage(st, detail)
                 elif kind == "progress":
@@ -1961,6 +2033,32 @@ class BakeryGUI(tk.Tk):
                     else:
                         self.rows_var.set(f"{len(rows)} RoWs")
                     self._refresh_qa()
+                elif kind == "geometry_qa_done":
+                    self.started_at = None
+                    self.status_var.set("QA complete - operator review required")
+                    self.stage_detail_var.set("QA report generated | Review findings before delivery")
+                    self.ready_badge.configure(text="  QA COMPLETE - REVIEW REQUIRED  ",
+                                               bg="#f5e5c8", fg=ACCENT_DARK)
+                    self.summary_badge.configure(text="QA REPORT READY FOR REVIEW",
+                                                 bg="#f5e5c8", fg=ACCENT_DARK)
+                    self.qa_run_btn.configure(state="normal")
+                    self.start_btn.configure(state="normal")
+                    self.gpkg_export_btn.configure(state="normal")
+                    self._append_log("GEOMETRY QA COMPLETE. Operator review required.")
+                    webbrowser.open(Path(event[1]).resolve().as_uri())
+                elif kind == "geometry_qa_error":
+                    self.started_at = None
+                    self.status_var.set("Geometry QA failed")
+                    self.stage_detail_var.set("QA failed; previous report retained")
+                    self.ready_badge.configure(text="  GEOMETRY QA NEEDS ATTENTION  ",
+                                               bg="#f4d8d2", fg="#8b3427")
+                    self.summary_badge.configure(text="QA ERROR",
+                                                 bg="#f4d8d2", fg="#8b3427")
+                    self.qa_run_btn.configure(state="normal")
+                    self.start_btn.configure(state="normal")
+                    self.gpkg_export_btn.configure(state="normal")
+                    self._append_log("QA ERROR: " + event[1])
+                    messagebox.showerror("Geometry QA", event[1])
                 elif kind == "done":
                     self._finish_success()
                 elif kind == "error":
