@@ -9,3 +9,4 @@ scipy
 laspy
 lazrs
 psutil
+matplotlib>=3.8

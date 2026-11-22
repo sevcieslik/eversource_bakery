@@ -18,7 +18,7 @@ GUI = SCRIPT_DIR / "tx_veg_bakery_gui.py"
 MAIN = SCRIPT_DIR / "run_eversource_pipeline.py"
 
 BINARY_STACK = [
-    "numpy", "pandas", "scipy", "shapely",
+    "numpy", "pandas", "scipy", "shapely", "matplotlib",
     "pyproj", "pyogrio", "geopandas", "lazrs",
 ]
 BASE = ["ezdxf", "laspy"]
@@ -54,7 +54,12 @@ import scipy
 import laspy
 import lazrs
 import psutil
+import matplotlib
 import tkinter
+import sys
+from pathlib import Path
+qa = Path(sys.argv[1]) / "qa_inspector.py"
+assert qa.is_file(), f"Bundled Geometry QA Inspector missing: {qa}"
 
 print("Environment imports: OK")
 print("Python geospatial stack: OK")
@@ -67,7 +72,7 @@ missing = [
 ]
 assert not missing, "Missing GDAL drivers: " + ", ".join(missing)
 """
-    run([py, "-c", code])
+    run([py, "-c", code, str(SCRIPT_DIR)])
 
 
 def main():
@@ -90,7 +95,8 @@ def main():
     if os.name == "nt" and struct.calcsize("P") * 8 != 64:
         fail("64-bit Python is required.")
 
-    for required in (REQ, GUI, MAIN):
+    for required in (REQ, GUI, MAIN, SCRIPT_DIR / "qa_inspector.py",
+                     SCRIPT_DIR / "05_run_geometry_qa.py"):
         if not required.exists():
             fail(f"Missing {required}")
 
