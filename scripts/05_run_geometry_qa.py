@@ -95,7 +95,7 @@ def main():
     log_path = staging / "QA_Execution.log"
     try:
         with log_path.open("w", encoding="utf-8", errors="replace") as log:
-            log.write("Command: " + subprocess.list2cmdline(cmd) + "\\n")
+            log.write("Command: " + subprocess.list2cmdline(cmd) + "\n")
             log.flush()
             process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -106,12 +106,12 @@ def main():
             for line in process.stdout:
                 log.write(line)
                 log.flush()
-                print(line.rstrip("\\r\\n"), flush=True)
+                print(line.rstrip("\r\n"), flush=True)
             rc = process.wait()
     except Exception as exc:
         message = f"QA LAUNCH FAILED: {type(exc).__name__}: {exc}"
         with log_path.open("a", encoding="utf-8") as log:
-            log.write(message + "\\n")
+            log.write(message + "\n")
         print(message, flush=True)
         return 2
     if rc != 0 or not (staging / "QA_Report.html").is_file():
