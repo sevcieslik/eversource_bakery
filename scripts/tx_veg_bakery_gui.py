@@ -950,6 +950,33 @@ class BakeryGUI(tk.Tk):
         target = Path(out) / "QA" / "geometry_validation"
         report = target / "QA_Report.html"
         if report.is_file():
+            manifest_path = target / "QA_Run_Manifest.json"
+            if manifest_path.is_file():
+                try:
+                    state = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    gpkg = Path(state["gpkg"])
+                    delivery = Path(state["deliverables"])
+                    actual = sorted(
+                        (str(p.relative_to(delivery)).replace("\\\\", "/"),
+                         p.stat().st_size, p.stat().st_mtime_ns)
+                        for p in delivery.rglob("*") if p.is_file()
+                    ) if delivery.is_dir() else []
+                    prior = [tuple(x) for x in state.get("delivery_snapshot", [])]
+                    changed = (not gpkg.is_file()
+                               or gpkg.stat().st_size != state.get("gpkg_size")
+                               or gpkg.stat().st_mtime_ns != state.get("gpkg_mtime_ns")
+                               or actual != prior)
+                    if changed:
+                        messagebox.showwarning(
+                            "Geometry QA - outdated results",
+                            "Geometry GPKG or deliverables changed since validation. "
+                            "Re-run Geometry QA before using this report for delivery.",
+                        )
+                except (KeyError, OSError, ValueError, TypeError) as exc:
+                    messagebox.showwarning(
+                        "Geometry QA - report metadata",
+                        f"Cannot verify QA report freshness: {exc}",
+                    )
             webbrowser.open(report.resolve().as_uri())
         elif target.is_dir():
             self._open_folder(target)
