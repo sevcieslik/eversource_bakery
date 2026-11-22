@@ -8754,7 +8754,190 @@ def apply_row_boundaries_at_structures(
         for k in ("continuity_qa", "earth_continuity_qa"):
             if k in getattr(cayd_w, "attrs", {}):
                 cw.attrs[k] = cayd_w.attrs[k]
+
+    # R01.05 boundary POA recovery. A whole-circuit path may put its terminal
+    # Structure in an unselected RoW, even though its original DXF conductors
+    # have been correctly recovered into a selected RoW (e.g. C39 310:9932,
+    # PT00203, CT_17 -> CT_16). Keep the source-matched physical Structure
+    # and publish an additional selected-RoW representation. Never infer a
+    # new physical Structure from a wire endpoint alone.
+    if sel and sf is not None and not sf.empty and cw is not None and not cw.empty:
+        endpoint_index = defaultdict(list)
+        attach = 3.0 / unit_to_m
+        for _, wr in cw.iterrows():
+            if txt(wr.get("ROW_RULE")) != "SPAN_OUTSIDE_SELECTION":
+                continue
+            c, rn, wid = txt(wr.get("CIRCUIT")), txt(wr.get("ROW")), txt(wr.get("WIRE_ID"))
+            if not c or rn not in sel or wr.geometry is None or wr.geometry.is_empty:
+                continue
+            parts = list(wr.geometry.geoms) if hasattr(wr.geometry, "geoms") else [wr.geometry]
+            for part in parts:
+                if not hasattr(part, "coords") or len(part.coords) < 2:
+                    continue
+                for xy in (part.coords[0], part.coords[-1]):
+                    endpoint_index[c].append((rn, wid, Point(float(xy[0]), float(xy[1]))))
+
+        already = {(txt(r.get("CIRCUIT")), txt(r.get("TOPO_ID")), txt(r.get("ROW")))
+                   for _, r in sf.iterrows()}
+        extra = []
+        for _, st in sf.iterrows():
+            c, topo, old_row = (txt(st.get("CIRCUIT")),
+                                txt(st.get("TOPO_ID")), txt(st.get("ROW")))
+            if not c or not topo or old_row in sel or st.geometry is None:
+                continue
+            matches = defaultdict(set)
+            for rn, wid, endpoint in endpoint_index.get(c, []):
+                if st.geometry.distance(endpoint) <= attach:
+                    matches[rn].add(wid)
+            # At least two distinct 3D wires meeting the original POA are
+            # required, and their selected RoW must be unambiguous.
+            candidates = [rn for rn, ids in matches.items() if len(ids) >= 2]
+            if len(candidates) != 1:
+                if matches:
+                    qa.append({"KIND": "BOUNDARY_POA_REVIEW", "CIRCUIT": c,
+                               "ID": topo, "ROW": old_row,
+                               "ADDED_ROW": ";".join(sorted(matches)), "RULE": "AMBIGUOUS_OR_FEW_WIRES"})
+                continue
+            new_row = candidates[0]
+            if (c, topo, new_row) in already:
+                continue
+            d = st.copy()
+            d["ROW"] = new_row
+            d["ROW_RULE"] = "BOUNDARY_WIRE_POA_RECOVERY"
+            extra.append(d)
+            already.add((c, topo, new_row))
+            qa.append({"KIND": "BOUNDARY_POA_STRUCTURE_RECOVERED", "CIRCUIT": c,
+                       "ID": f"{topo}/{txt(st.get('STRUCT_ID'))}",
+                       "ROW": old_row, "ADDED_ROW": new_row,
+                       "RULE": "MATCHED_3D_ENDPOINTS"})
+        if extra:
+            sf = gpd.GeoDataFrame(pd.concat(
+                [sf, gpd.GeoDataFrame(extra, crs=sf.crs)], ignore_index=True),
+                geometry="geometry", crs=sf.crs)
+    # Recover the original 2D span together with its restored boundary POA.
+    # Without this, product 45 contains the Structure but product 80 ends early.
+    se, sf = _recover_boundary_poa_spans(se, sf, cw, bundles, sel, qa, unit_to_m)
     return se, sf, cw, pd.DataFrame(qa)
+
+
+def _recover_boundary_poa_spans(se, sf, cw, bundles, selected_rows, qa, unit_to_m):
+    """Deliver the connected 2D span when a real POA Structure was recovered.
+
+    Operates only on an already recovered, source-matched physical support and
+    two independently attributable source 3D conductors. Never invents nodes,
+    connects unrelated circuits, or changes the original unselected-RoW span.
+    """
+    if se is None or se.empty or sf is None or sf.empty or cw is None or cw.empty:
+        return se, sf
+    recovered = sf[sf["ROW_RULE"].astype(str) == "BOUNDARY_WIRE_POA_RECOVERY"]
+    if recovered.empty:
+        return se, sf
+
+    bundle_members = {int(b["BUNDLE_ID"]): set(int(x) for x in (b.get("ALL_WIRE_ROWS") or []))
+                      for b in (bundles or [])}
+    attach = 3.0 / unit_to_m
+    if "RECOVERED_ROWS" not in se.columns:
+        se = se.copy()
+        se["RECOVERED_ROWS"] = ""
+    existing_structures = {(txt(x.get("CIRCUIT")), txt(x.get("TOPO_ID")), txt(x.get("ROW")))
+                           for _, x in sf.iterrows()}
+    additions = []
+    for _, st in recovered.iterrows():
+        circuit, topo, row = (txt(st.get("CIRCUIT")), txt(st.get("TOPO_ID")),
+                              txt(st.get("ROW")))
+        if row not in selected_rows or st.geometry is None or st.geometry.is_empty:
+            continue
+        wire_members = set()
+        for _, wire in cw.iterrows():
+            if (txt(wire.get("CIRCUIT")) != circuit or txt(wire.get("ROW")) != row
+                    or txt(wire.get("ROW_RULE")) != "SPAN_OUTSIDE_SELECTION"):
+                continue
+            geom = wire.geometry
+            if geom is None or geom.is_empty:
+                continue
+            parts = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+            attached = False
+            for part in parts:
+                if hasattr(part, "coords") and len(part.coords) >= 2:
+                    for xy in (part.coords[0], part.coords[-1]):
+                        if st.geometry.distance(Point(float(xy[0]), float(xy[1]))) <= attach:
+                            attached = True
+                            break
+                if attached:
+                    break
+            if attached and pd.notna(wire.get("SOURCE_IDX")):
+                wire_members.add(int(wire.get("SOURCE_IDX")))
+        if len(wire_members) < 2:
+            continue
+
+        candidates = []
+        for i, sp in se.iterrows():
+            if txt(sp.get("CIRCUIT")) != circuit:
+                continue
+            if topo not in (txt(sp.get("STRUCT_A")), txt(sp.get("STRUCT_B"))):
+                continue
+            span_rows = set(_split_rows(sp.get("ROWS")))
+            if row in span_rows or not span_rows or span_rows & selected_rows:
+                continue
+            try:
+                bid = int(sp.get("BUNDLE_ID"))
+            except (TypeError, ValueError):
+                continue
+            if len(bundle_members.get(bid, set()) & wire_members) < 2:
+                continue
+            other = (txt(sp.get("STRUCT_B")) if txt(sp.get("STRUCT_A")) == topo
+                     else txt(sp.get("STRUCT_A")))
+            if not other or not ((sf["CIRCUIT"].astype(str) == circuit) &
+                                 (sf["TOPO_ID"].astype(str) == other)).any():
+                continue
+            candidates.append((i, other))
+        if len(candidates) != 1:
+            qa.append({"KIND": "BOUNDARY_POA_SPAN_REVIEW", "CIRCUIT": circuit,
+                       "ID": topo, "ROW": txt(st.get("ROW")), "ADDED_ROW": row,
+                       "N_CANDIDATES": len(candidates)})
+            continue
+        i, other = candidates[0]
+        # Keep actual selected PHASE geometry. A terminal's 2D representative
+        # can be laterally offset from its physical support; blindly joining
+        # that offset would manufacture a whisker/phase jump. QA the offset.
+        seg = se.at[i, "geometry"]
+        if seg is not None and not seg.is_empty and hasattr(seg, "coords"):
+            ends = list(seg.coords)
+            endpoint_gap_m = min(
+                st.geometry.distance(Point(float(xy[0]), float(xy[1])))
+                for xy in (ends[0], ends[-1])) * unit_to_m
+            if endpoint_gap_m > 5.0:
+                qa.append({"KIND": "BOUNDARY_POA_2D_ENDPOINT_OFFSET_REVIEW",
+                           "CIRCUIT": circuit, "ID": topo, "ROW": row,
+                           "GAP_M": round(endpoint_gap_m, 3),
+                           "RULE": "CHECK_ORIGINAL_PHASE_WIRE"})
+        se.at[i, "ROWS"] = ";".join(sorted(set(_split_rows(se.at[i, "ROWS"])) | {row}))
+        se.at[i, "RECOVERED_ROWS"] = ";".join(
+            sorted(set(_split_rows(se.at[i, "RECOVERED_ROWS"])) | {row}))
+        qa.append({"KIND": "BOUNDARY_POA_SPAN_RECOVERED", "CIRCUIT": circuit,
+                   "ID": f"{txt(se.at[i, 'STRUCT_A'])}-{txt(se.at[i, 'STRUCT_B'])}",
+                   "ROW": txt(se.at[i, "ROW"]), "ADDED_ROW": row,
+                   "BUNDLE_ID": int(se.at[i, "BUNDLE_ID"])})
+
+        # Both ends of the published 2D span require a real support in the
+        # same selected RoW. Copy existing support attribution only; no dummy.
+        key = (circuit, other, row)
+        if key not in existing_structures:
+            original = sf[(sf["CIRCUIT"].astype(str) == circuit) &
+                          (sf["TOPO_ID"].astype(str) == other)]
+            if len(original) == 1:
+                duplicate = original.iloc[0].copy()
+                duplicate["ROW"] = row
+                duplicate["ROW_RULE"] = "BOUNDARY_SPAN_END"
+                additions.append(duplicate)
+                existing_structures.add(key)
+                qa.append({"KIND": "BOUNDARY_POA_OTHER_END_RECOVERED",
+                           "CIRCUIT": circuit, "ID": other,
+                           "ROW": txt(original.iloc[0].get("ROW")), "ADDED_ROW": row})
+    if additions:
+        sf = gpd.GeoDataFrame(pd.concat([sf, gpd.GeoDataFrame(additions, crs=sf.crs)],
+                                      ignore_index=True), geometry="geometry", crs=sf.crs)
+    return se, sf
 
 
 def _circuit_wire_parts_by_row(wire_geom, spans_c, unit_to_m, tol_m=0.5):
@@ -8876,8 +9059,11 @@ def spans_one_row_per_feature(span_edges):
         return span_edges
     out = span_edges.copy()
     out["ROW_RULE"] = [
-        ["OWN" if r == txt(prim) else "OVERLAP_DUPLICATE" for r in _split_rows(rows)]
-        for rows, prim in zip(out["ROWS"], out["ROW"])
+        ["OWN" if r == txt(prim) else
+         ("BOUNDARY_POA_SPAN_RECOVERY" if r in _split_rows(rec) else "OVERLAP_DUPLICATE")
+         for r in _split_rows(rows)]
+        for rows, prim, rec in zip(out["ROWS"], out["ROW"],
+                                  out.get("RECOVERED_ROWS", pd.Series([""] * len(out))))
     ]
     out["ROW"] = out["ROWS"].map(_split_rows)
     out = out.explode(["ROW", "ROW_RULE"]).drop(columns=["ROWS"])
