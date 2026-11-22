@@ -1,5 +1,6 @@
 # Eversource Tester R01.05-test
 
+> **Current approved release: R01.06 (22 Nov 2026).** Geometry QA v0.3 is bundled and uses the same Bakery venv. [R01.06 release notes](RELEASE_NOTES_R01.06.md).\n\n
 ## Geometry QA integration (v0.3)
 
 After completing Geometry, choose **Run Geometry QA** in the GUI. Bakery automatically provides the current project's original wires and POA DXFs, source Structures (SHP or ZIP), SoW SQLite, one Geometry GPKG and the actual deliverables 45/80/267. The independent QA engine is read-only: no Geometry rerun and no modification of source or delivered data.

@@ -22,8 +22,8 @@ import json
 import subprocess
 from pathlib import Path
 
-BAKERY_VERSION = "R01.05-test"
-BAKERY_RELEASE = "2D central phase, circuit-named levels, duplicate DXF wires"
+BAKERY_VERSION = "R01.06"
+BAKERY_RELEASE = "Geometry QA integration, RoW boundary recovery, validated batch statuses"
 
 _HERE = Path(__file__).resolve().parent
 
