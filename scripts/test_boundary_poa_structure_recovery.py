@@ -47,7 +47,18 @@ assert all(cw.ROW=="CT_16")
 assert se.loc[0,"ROWS"] == "CT_16;CT_17", se.loc[0,"ROWS"]
 assert se.loc[0,"RECOVERED_ROWS"] == "CT_16"
 assert "BOUNDARY_POA_SPAN_RECOVERED" in set(qa.KIND)
+assert "BOUNDARY_POA_2D_ENDPOINT_OFFSET_REVIEW" not in set(qa.KIND)
 assert len(sf[(sf.CIRCUIT=="310")&(sf.TOPO_ID=="ST00196")&(sf.ROW=="CT_16")]) == 1
+
+# Physical POA has proof from 3D endpoints, but selected middle PHASE
+# may end laterally away from the support. The 2D span must still be
+# delivered; do not manufacture a cross-phase connector to the POA.
+far_span = span.copy()
+far_span.at[0, "geometry"] = LineString([(0, 27), (500, 27)])
+far_se, _, _, far_qa = apply_row_boundaries_at_structures(
+    far_span, structures, wires, bundles, kmz, {"CT_06", "CT_16"}, U2M)
+assert far_se.loc[0, "ROWS"] == "CT_16;CT_17"
+assert "BOUNDARY_POA_2D_ENDPOINT_OFFSET_REVIEW" in set(far_qa.KIND)
 
 # Without two distinct matching 3D wires, do not recover automatically.
 se2,sf2,_,qa2=apply_row_boundaries_at_structures(span,structures,wires.iloc[:1],
