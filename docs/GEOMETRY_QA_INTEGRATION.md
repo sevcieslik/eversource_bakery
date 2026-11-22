@@ -9,7 +9,7 @@ Scope: GUI and independent QA workflow only. No change to Geometry algorithms or
 - **QA Results** button opens the latest successful `QA_Report.html` (or its folder).
 - `scripts/05_run_geometry_qa.py` discovers original wires/POA DXF, source Structure SHP/ZIP and SoW SQLite; verifies a single GPKG and delivered product directory. Ambiguous/missing inputs stop with an explicit error.
 - Validated output always lands in `output/QA/geometry_validation/`: HTML report, QA issue GPKG/CSV, statistical CSVs, maps and `QA_Run_Manifest.json`.
-- Successful reruns archive the prior `geometry_validation`; failed reruns leave the previous successful report intact. Intermediate/failed staging is retained for diagnosis.
+- Successful reruns archive the prior `geometry_validation`; failed reruns leave the previous successful report intact. Intermediate/failed staging is retained for diagnosis. A run manifest records GPKG and delivered-file size/mtime; **QA Results** warns if current Geometry or any deliverable differs from the validated snapshot.
 - Separate QA dependencies: `scripts/requirements_geometry_qa.txt`.
 
 ## GUI state and safety
