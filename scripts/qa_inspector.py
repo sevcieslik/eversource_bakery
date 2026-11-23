@@ -621,8 +621,8 @@ def build(args):
                 ec=sum(any(shapely.force_2d(w.geometry).distance(p)*unit<=4 for w in earth) for p in samples)/len(samples)
                 pc=sum(any(shapely.force_2d(w.geometry).distance(p)*unit<=6 for w in non_earth) for p in samples)/len(samples)
                 if ec>=.85 and pc<=.05:
-                    issue('E01_EARTH_ONLY_2D_BRANCH','HIGH',c,row2.get('ROW'),
-                          part,'Secondary 2D branch has confirmed EARTH but no nearby PHASE evidence',
+                    issue('E01_POSSIBLE_EARTH_ONLY_2D_BRANCH','REVIEW',c,row2.get('ROW'),
+                          part,'Secondary 2D branch follows EARTH-attributed source wires without nearby non-EARTH evidence; confirm conductor roles',
                           metric=part.length*unit,
                           why=f'EARTH sample coverage={ec:.0%}, non-EARTH={pc:.0%}; check original 3D')
     # 80 product completeness against 2D span inventory in the *same run*.
