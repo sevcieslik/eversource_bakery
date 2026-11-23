@@ -30,3 +30,16 @@ These are a diagnostic prediction based on **previous output**, not proof that t
 3. Check `track_assignment_review` for corrected track labels and source evidence counts, and compare `structures_final` source matches against 93/241 baseline.
 4. Verify 379, A152, N186, 381 voltage, wire product 80, all source 3D wires in product 267, and end structures. Differences in DXF voltage labels must remain reviewable.
 5. Do not merge to main until Cluster 10 and other cluster regressions pass.
+
+## Cluster 10 failed UAT and voltage guard (23 Nov 2026)
+
+Operator reran Geometry after the first POA/source track-owner correction. Although source-matched structures rose from **93 to 193**, Inspector reported **650 W04_VOLTAGE_MISMATCH** findings. The new GPKG confirmed:
+
+- Track 2 A152 -> 379: source DXF `Mainline_115kV` (299 conductors) was assigned circuit 379 at 345 kV.
+- Track 3 379 -> A152: source DXF `Mainline_345kV` (250 conductors) was assigned circuit A152 at 115 kV.
+- Track 5 379 -> N186: source DXF `Mainline_345kV` (101 conductors) was assigned circuit N186 at 115 kV.
+- Total 650 voltage conflicts are real cross-voltage mismatches caused by the first correction, not missing 3D wires. Source 3D wires remained 1,184.
+
+**Correction:** do not change track `CKEY` if the strong POA+source votes point to a circuit with a known voltage different from the confidently derived source DXF voltage. Retain original circuit and mark `LAYER_RULE=POA_SOURCE_VOLTAGE_CONFLICT` and `CONF=REVIEW`, recording both voltage evidence and the candidate. This avoids a false increase in source matching at the cost of incorrect 3D wire attribution.
+
+**Important:** The fundamental disagreement between source structure positions/POA votes and source DXF conductor voltage is **not resolved**. We must not claim that 379/A152/N186 source matching is repaired merely by blocking the reattribution. Test and inspect physical-track ownership and reference alignment with original wire geometry before merge.
