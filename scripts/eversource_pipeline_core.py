@@ -10492,6 +10492,15 @@ def run_geometry_stage(
             bundles,track_lookup,wires,client,kmz,u2m,
             raw_points=raw_points,client_structure_index=csi
         )
+        if not track_review.empty:
+            changed_tracks = track_review[
+                track_review["LAYER_RULE"].astype(str) == "POA_SOURCE_CORRECTED"
+            ]
+            for _, fix in changed_tracks.iterrows():
+                info("  POA+SOURCE track correction "
+                     f"{fix['TRACK_ID']}: {fix['ORIGINAL_CKEY']} -> {fix['CKEY']} "
+                     f"({int(fix['POA_SOURCE_MATCHES'])}/{int(fix['POA_SOURCE_TOTAL'])} "
+                     "validated physical supports)")
         paths,dropped=build_circuit_paths(bundles,supports,u2m)
         final_wires,span_edges,structures_xy,phase_discarded,join_review=build_final_products(
             paths,bundles,supports,raw_points,client,kmz,csi,u2m,max_join_review_m,wire_simplify_m
