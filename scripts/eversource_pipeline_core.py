@@ -1758,7 +1758,8 @@ def build_client_structure_index(g: gpd.GeoDataFrame):
         for key, indexes in keys.items():
             sg = x.iloc[indexes].reset_index(drop=True)
             groups[key] = (sg, cKDTree(np.column_stack([sg.geometry.x, sg.geometry.y])))
-    return {"groups": groups, "global": None, "columns": cols,
+    global_tree = cKDTree(np.column_stack([x.geometry.x, x.geometry.y]))
+    return {"groups": groups, "global": (x, global_tree), "columns": cols,
             "source_field_map": source_field_map, "delivery_source_fields": delivery_source_fields}
 
 
@@ -5268,6 +5269,96 @@ def attribute_unmatched_structures_along_corridor(
                            "ALONG_OFFSET_M":round(choices[0][5],2) if choices else None})
     return result, pd.DataFrame(qa)
 
+
+
+def recover_source_circuit_mismatches(
+    structures: gpd.GeoDataFrame,
+    source_index: dict,
+    unit_to_m: float,
+    max_match_m: float = 15.0,
+) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
+    """Recover missing attribution when source LINE_NO differs from the circuit.
+
+    Accept only a single source point within 15 m not already used by another
+    output structure. Preserve physical XY, source GIS_NO and original SRC_LINE.
+    """
+    pack = source_index.get("global")
+    if not pack or structures is None or structures.empty:
+        return structures, pd.DataFrame()
+    source, tree = pack
+    result = structures.copy()
+    source_fields = source_index.get("delivery_source_fields", [])
+    field_map = source_index.get("source_field_map", {})
+    line_field = next((v for k, v in field_map.items() if k.upper() == "LINE_NO"), "LINE_NO")
+    used = set()
+    for _, r in result.iterrows():
+        if int(r.get("IS_DUMMY", 0) or 0):
+            continue
+        gid = txt(r.get("SRC_GID"))
+        if gid:
+            used.add(("GLOBALID", gid))
+        elif pd.notna(r.get("SRC_X")) and pd.notna(r.get("SRC_Y")):
+            used.add(("SOURCE_XY", round(float(r["SRC_X"]), 3),
+                      round(float(r["SRC_Y"]), 3), txt(r.get("SRC_STRUCT"))))
+
+    audit = []
+    proposed = []
+    for i, r in result.iterrows():
+        if not int(r.get("IS_DUMMY", 0) or 0):
+            continue
+        p = r.geometry
+        if p is None or p.is_empty:
+            continue
+        hits = tree.query_ball_point([float(p.x), float(p.y)], r=max_match_m / unit_to_m)
+        choices = sorted(
+            ((float(p.distance(source.iloc[j].geometry)) * unit_to_m, int(j)) for j in hits),
+            key=lambda item: (item[0], item[1]),
+        )
+        if not choices:
+            audit.append({"OUTPUT_INDEX": int(i), "CIRCUIT": txt(r.get("CIRCUIT")),
+                          "STATUS": "NO_SOURCE_WITHIN_15M"})
+            continue
+        if len(choices) != 1:
+            audit.append({"OUTPUT_INDEX": int(i), "CIRCUIT": txt(r.get("CIRCUIT")),
+                          "STATUS": "AMBIGUOUS_SOURCE_WITHIN_15M", "CANDIDATES": len(choices)})
+            continue
+        dist, j = choices[0]
+        proposed.append((dist, int(i), j))
+
+    for dist, i, j in sorted(proposed):
+        r = result.loc[i]
+        sr = source.iloc[j]
+        identity = _source_match_identity(sr)
+        circuit = txt(r.get("CIRCUIT"))
+        if identity in used:
+            audit.append({"OUTPUT_INDEX": i, "CIRCUIT": circuit,
+                          "STATUS": "SOURCE_ALREADY_ASSIGNED", "DIST_M": round(dist, 3)})
+            continue
+        source_line = txt(sr.get("LINE_NO"))
+        audit_status = ("RECOVERED_SAME_CIRCUIT" if circuit_key(source_line) == circuit_key(circuit)
+                        else "SOURCE_CIRCUIT_MISMATCH")
+        attrs = client_structure_values(sr, txt(r.get("TOPO_ID")))
+        mapped = client_structure_all_values(sr, source_index)
+        for fld in source_fields:
+            if fld in result.columns:
+                result.at[i, fld] = mapped.get(fld)
+        for fld in ("STRUCT_ID", "SRC_GID", "SRC_LINE", "SRC_STRUCT", "SRC_X", "SRC_Y"):
+            if fld in result.columns:
+                result.at[i, fld] = attrs.get(fld)
+        if line_field in result.columns:
+            result.at[i, line_field] = circuit
+        if "LINE_NO" in result.columns:
+            result.at[i, "LINE_NO"] = circuit
+        result.at[i, "SRC_DIST_M"] = float(dist)
+        result.at[i, "SRC_MATCH"] = audit_status
+        result.at[i, "IS_DUMMY"] = 0
+        used.add(identity)
+        audit.append({"OUTPUT_INDEX": i, "CIRCUIT": circuit,
+                      "STATUS": audit_status, "SOURCE_LINE_NO": source_line,
+                      "GIS_NO": txt(sr.get("GIS_NO")),
+                      "STRUCTURE_": txt(sr.get("STRUCTURE_")),
+                      "DIST_M": round(float(dist), 3)})
+    return result, pd.DataFrame(audit)
 
 def build_caydence_structures_by_row(
     structures_final: gpd.GeoDataFrame,
@@ -10606,6 +10697,16 @@ def run_geometry_stage(
         )
         corridor_qa.to_csv(output/"01_structure_corridor_attribution.csv", index=False)
         info("Corridor source attribution: " + str(int((corridor_qa.get("STATUS", pd.Series(dtype=str)) == "MATCHED").sum())) + " newly matched structures")
+
+        # Resolve unambiguous source circuit mismatches after normal matching.
+        structures_xy, mismatch_qa = recover_source_circuit_mismatches(
+            structures_xy, csi, u2m
+        )
+        mismatch_qa.to_csv(output / "01_structure_source_circuit_mismatch.csv", index=False)
+        info("Source circuit mismatch recovered: " + str(int(
+            (mismatch_qa.get("STATUS", pd.Series(dtype=str)) == "SOURCE_CIRCUIT_MISMATCH").sum()
+        )))
+
 
         # Ground sampling returns 0-based rows; preserve that indexing even
         # when selected RoWs have filtered a non-contiguous source index.
