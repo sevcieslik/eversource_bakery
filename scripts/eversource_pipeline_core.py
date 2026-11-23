@@ -5028,6 +5028,7 @@ def _corridor_axes_for_circuit(circuit, client, kmz):
 def attribute_unmatched_structures_along_corridor(
     structures, source_index, client, kmz, unit_to_m,
     corridor_half_width_m=75.0,
+    raw_points=None,
 ):
     """One-to-one attribute-only recovery between existing matched anchors.
 
@@ -5042,6 +5043,9 @@ def attribute_unmatched_structures_along_corridor(
     result = structures.copy()
     qa = []
     source_groups = source_index.get("groups", {})
+    # Raw contractor POA circuit votes are independent of source structure order.
+    # Use nearby votes to prevent a G128 source ID being placed on a C129 POA.
+    poa_markers = raw_points if raw_points is not None and not raw_points.empty else None
     srcfields = source_index.get("delivery_source_fields", [])
     for circuit, indexes in result.groupby("CIRCUIT", dropna=True).groups.items():
         key = circuit_key(circuit)
@@ -5101,7 +5105,24 @@ def attribute_unmatched_structures_along_corridor(
                 status = "OUTSIDE_CORRIDOR" if lateral > corridor_half_width_m else "NO_CANDIDATE"
                 choices = []
                 if lateral <= corridor_half_width_m:
-                    for j, sr, spos, soff, ident in source_items:
+                    # A physically attached POA with two consistent foreign-circuit
+                    # clues is not a valid candidate for ordered source attribution.
+                    conflict = False
+                    if poa_markers is not None:
+                        attached = poa_markers[poa_markers.geometry.distance(r.geometry) <= 3.0 / unit_to_m]
+                        for _, marker in attached.iterrows():
+                            sow_c = circuit_key(marker.get("SOW_CIRCUIT"))
+                            wire_c = circuit_key(marker.get("WIRE_CIRCUIT"))
+                            try:
+                                votes = int(marker.get("WIRE_VOTES") or 0)
+                            except (TypeError, ValueError):
+                                votes = 0
+                            if sow_c and wire_c and sow_c == wire_c and sow_c != key and votes >= 2:
+                                conflict = True
+                                break
+                    if conflict:
+                        status = "S01_CIRCUIT_CONFLICT"
+                    for j, sr, spos, soff, ident in ([] if conflict else source_items):
                         if ident in used or soff > corridor_half_width_m:
                             continue
                         # Existing matched control structures establish the monotonic
@@ -5134,6 +5155,19 @@ def attribute_unmatched_structures_along_corridor(
                         status = "AMBIGUOUS_ORDER"
                     elif choices:
                         score, j, src, srcpos, ident, along_m = choices[0]
+                        physical_dist = float(r.geometry.distance(src.geometry)) * unit_to_m
+                        lo = max([k for k, _, _ in known if k < opos], default=None)
+                        hi = min([k for k, _, _ in known if k > opos], default=None)
+                        # Above 15m require independent two-sided corridor anchors.
+                        # Above 75m do not guess source IDs at all.
+                        if physical_dist > 75.0 or (physical_dist > 15.0 and (lo is None or hi is None)):
+                            status = "S02_DISTANT_SOURCE_UNCONFIRMED"
+                            qa.append({"OUTPUT_INDEX": i, "CIRCUIT": str(circuit),
+                                       "STATUS": status, "CROSS_OFFSET_M": round(lateral, 2),
+                                       "SOURCE_STRUCT": txt(src.get("STRUCTURE_")),
+                                       "ALONG_OFFSET_M": round(along_m, 2),
+                                       "SOURCE_DISTANCE_M": round(physical_dist, 2)})
+                            continue
                         # Reject assignments crossing existing control anchors or
                         # another already accepted output (known is updated below).
                         vals = client_structure_values(src, txt(r.get("TOPO_ID")))
@@ -5150,8 +5184,9 @@ def attribute_unmatched_structures_along_corridor(
                             if fld in result.columns:
                                 result.at[i,fld] = src.get(fld)
                         result.at[i,"SRC_DIST_M"] = float(r.geometry.distance(src.geometry))*unit_to_m
-                        result.at[i,"SRC_MATCH"] = ("CORRIDOR_AMBIGUOUS_NEAREST" if ambiguous
-                                                    else "CORRIDOR_ORDERED")
+                        result.at[i,"SRC_MATCH"] = ("CORRIDOR_DISTANT_REVIEW" if physical_dist > 15.0
+                                                    else ("CORRIDOR_AMBIGUOUS_NEAREST" if ambiguous
+                                                          else "CORRIDOR_ORDERED"))
                         result.at[i,"IS_DUMMY"] = 0
                         used.add(ident)
                         known.append((opos,srcpos,i))
@@ -10388,7 +10423,7 @@ def run_geometry_stage(
         # Second-pass source attribution follows order along each circuit.
         # It only fills blank source fields and does not move a POA Structure.
         structures_xy, corridor_qa = attribute_unmatched_structures_along_corridor(
-            structures_xy, csi, client, kmz, u2m
+            structures_xy, csi, client, kmz, u2m, raw_points=raw_points
         )
         corridor_qa.to_csv(output/"01_structure_corridor_attribution.csv", index=False)
         info("Corridor source attribution: " + str(int((corridor_qa.get("STATUS", pd.Series(dtype=str)) == "MATCHED").sum())) + " newly matched structures")
