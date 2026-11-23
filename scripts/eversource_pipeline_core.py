@@ -9840,6 +9840,79 @@ def recover_terminal_2d_from_3d(
             out.at[idx,'LENGTH_M']=float(new_geom.length)*unit_to_m
     return out, pd.DataFrame(qa,columns=['CIRCUIT','PART','SIDE','ACTION','WIRE_ID','EXTENSION_M']), rows_to_gdf(extras,formal_2d.crs)
 
+def suppress_earth_only_2d_branches(formal_2d, source_3d, unit_to_m):
+    """Drop secondary 2D parts only when EARTH-only evidence is unambiguous.
+
+    Retain the main representation, preserve every source/Caydence 3D wire, and
+    keep ambiguous/PHASE-bearing branches for operator QA. This check is run
+    after class 187/210 voting, not before.
+    """
+    cols = ["CIRCUIT", "ROW", "PART", "LENGTH_M", "EARTH_IDS",
+            "EARTH_COVERAGE_PCT", "PHASE_COVERAGE_PCT", "ACTION"]
+    qa = []
+    if formal_2d is None or formal_2d.empty or source_3d is None or source_3d.empty:
+        return formal_2d, pd.DataFrame(columns=cols)
+    out = formal_2d.copy()
+    radius_earth = 4.0 / unit_to_m
+    radius_phase = 6.0 / unit_to_m
+    join_tol = 8.0 / unit_to_m
+    for idx, rec in out.iterrows():
+        g = rec.geometry
+        parts = list(getattr(g, "geoms", [g]))
+        parts = [p for p in parts if isinstance(p, LineString) and p.length > 0]
+        if len(parts) < 2:
+            continue
+        # The longest physical run is not an automatically removable branch.
+        main = max(parts, key=lambda part: part.length)
+        retained = [main]
+        circ = txt(rec.get("CIRCUIT"))
+        own = source_3d[source_3d["CIRCUIT"].astype(str) == circ]
+        earth = [(txt(r.get("WIRE_ID")), force_2d(r.geometry)) for _, r in own.iterrows()
+                 if txt(r.get("WIRE_TYPE")).upper() == "EARTH" and r.geometry is not None]
+        phase = [force_2d(r.geometry) for _, r in own.iterrows()
+                 if txt(r.get("WIRE_TYPE")).upper() != "EARTH" and r.geometry is not None]
+        changed = False
+        for part_no, part in enumerate(parts):
+            if part.equals(main):
+                continue
+            length_m = part.length * unit_to_m
+            endpoints = (Point(part.coords[0]), Point(part.coords[-1]))
+            # Only a genuine side branch from the retained 2D network.
+            if min(float(main.distance(p)) for p in endpoints) > join_tol:
+                retained.append(part)
+                continue
+            if length_m < 15.0 or not earth:
+                retained.append(part)
+                continue
+            # Exclude fork junctions from the classification sample because
+            # PHASE wires belonging to the main route naturally run there.
+            sample = [part.interpolate(f, normalized=True) for f in np.linspace(0.15, 0.85, 13)]
+            near_earth = [any(w.distance(p) <= radius_earth for _, w in earth) for p in sample]
+            near_phase = [any(w.distance(p) <= radius_phase for w in phase) for p in sample]
+            earth_ratio = sum(near_earth) / len(sample)
+            phase_ratio = sum(near_phase) / len(sample)
+            ids = sorted({wid for wid, w in earth if w.distance(part) <= radius_earth})
+            confirmed = earth_ratio >= 0.85 and phase_ratio <= 0.05 and len(ids) >= 1
+            qa.append({"CIRCUIT": circ, "ROW": txt(rec.get("ROW")),
+                       "PART": part_no, "LENGTH_M": round(length_m, 2),
+                       "EARTH_IDS": ";".join(ids),
+                       "EARTH_COVERAGE_PCT": round(earth_ratio * 100, 1),
+                       "PHASE_COVERAGE_PCT": round(phase_ratio * 100, 1),
+                       "ACTION": "EARTH_ONLY_BRANCH_EXCLUDED" if confirmed
+                                 else "REVIEW_OR_RETAIN"})
+            if confirmed:
+                changed = True
+            else:
+                retained.append(part)
+        if changed:
+            merged = _multipart_circuit_geometry(retained)
+            if merged is not None:
+                out.at[idx, "geometry"] = merged
+                if "LENGTH_M" in out.columns:
+                    out.at[idx, "LENGTH_M"] = merged.length * unit_to_m
+    return out, pd.DataFrame(qa, columns=cols)
+
+
 def trim_branch_overlaps(formal_2d, unit_to_m, tol_m=3.0, min_overlap_m=3.0, step_m=1.0,
                          node_snap_m=5.0):
     """R01.05 (20/11): a branch part must not run on top of the main line.
@@ -10502,6 +10575,16 @@ def run_geometry_stage(
                  f"EARTH-on-2D spans replaced; {len(moved_idx)} Structures moved onto the new 2D")
         pd.DataFrame(reselect_qa, columns=["WIRE_ID", "ACTION"]).to_csv(
             output/"01_2d_lidar_earth_reselect.csv", index=False)
+
+        # Remove only independently confirmed EARTH-only secondary 2D runs.
+        # Product 267 remains a lossless inventory of original 3D conductors.
+        final_wires, earth_branch_qa = suppress_earth_only_2d_branches(
+            final_wires, cayd_w, u2m
+        )
+        earth_branch_qa.to_csv(output/"01_earth_only_2d_branches.csv", index=False)
+        info("EARTH-only 2D branches excluded: " +
+             str(int((earth_branch_qa.get("ACTION", pd.Series(dtype=str)) ==
+                      "EARTH_ONLY_BRANCH_EXCLUDED").sum())))
 
         # SCHF and single-top SCSH use three classified horizontal PHASE
         # wires. SCSH with neighboring same-circuit POA stays untouched.
