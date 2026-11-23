@@ -522,9 +522,9 @@ def build(args):
                 if length_m>args.whisker_max_m or length_m<1.0:continue
                 others=unary_union([p for j,p in enumerate(parts) if j!=ix])
                 ends=[Point(part.coords[0]),Point(part.coords[-1])]
-                d=[p.distance(others)*unit for p in ends]
-                tip=ends[0] if d[0]>d[1] else ends[1]
-                near=min(d);far=max(d)
+                endpoint_distances=[p.distance(others)*unit for p in ends]
+                tip=ends[0] if endpoint_distances[0]>endpoint_distances[1] else ends[1]
+                near=min(endpoint_distances);far=max(endpoint_distances)
                 if near<=args.whisker_join_m and far>=args.whisker_tip_m:
                     poa_dist=float(poa_tree.query([tip.x,tip.y])[0])*unit
                     if poa_dist>args.whisker_poa_m:
