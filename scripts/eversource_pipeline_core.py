@@ -2565,7 +2565,10 @@ def combined_references(client, kmz):
     return refs, labels
 
 
-def assign_tracks_to_circuits(bundles, track_lookup, wires, client, kmz, unit_to_m):
+def assign_tracks_to_circuits(
+    bundles, track_lookup, wires, client, kmz, unit_to_m,
+    raw_points=None, client_structure_index=None,
+):
     refs, labels = combined_references(client, kmz)
     by_track = defaultdict(list)
     for b in bundles:
@@ -2586,7 +2589,30 @@ def assign_tracks_to_circuits(bundles, track_lookup, wires, client, kmz, unit_to
         label_to_keys[txt(key)].append(key)
     known_labels = {k for k in label_to_keys if k}
     layer_col = "SOURCE_LAYER" if "SOURCE_LAYER" in wires.columns else None
-
+    # Validated physical supports: POA wire attribution AND a source structure
+    # from the same circuit within 15 m. Vote once per distinct physical TOPO_ID.
+    validated_supports = defaultdict(Counter)
+    if (raw_points is not None and not raw_points.empty
+            and client_structure_index is not None
+            and "TOPO_ID" in raw_points.columns):
+        source_groups = client_structure_index.get("groups", {})
+        for _, poa in raw_points.iterrows():
+            topo = txt(poa.get("TOPO_ID"))
+            sow = circuit_key(poa.get("SOW_CIRCUIT"))
+            wire = circuit_key(poa.get("WIRE_CIRCUIT"))
+            try:
+                votes = int(poa.get("WIRE_VOTES") or 0)
+            except (TypeError, ValueError):
+                votes = 0
+            if not topo or not sow or not wire or sow != wire or votes < 2:
+                continue
+            pack = source_groups.get(wire)
+            if pack is None:
+                continue
+            distance, _ = pack[1].query([float(poa.geometry.x), float(poa.geometry.y)])
+            if float(distance) * unit_to_m > 15.0:
+                continue
+            validated_supports[topo][wire] += 1
     rows, track_meta = [], {}
     for tid, bs in sorted(by_track.items()):
         samples = []
@@ -2633,6 +2659,7 @@ def assign_tracks_to_circuits(bundles, track_lookup, wires, client, kmz, unit_to
                     rank = 1
                 scores.append((rank, med, float(np.quantile(ds,0.9)), key))
         scores.sort()
+        scores_ranked = list(scores)
         layer_rule = "LAYER_CIRCUIT" if hint_keys else ("LAYER_KV" if track_kv else "")
         if scores and scores[0][0] == 2:
             layer_rule = "KV_MISMATCH"
@@ -2642,19 +2669,50 @@ def assign_tracks_to_circuits(bundles, track_lookup, wires, client, kmz, unit_to
         else:
             best_d, _, best_key = scores[0]
             second_d = scores[1][0] if len(scores)>1 else None
+        # A track can be reattributed only with >=4 distinct supported POAs,
+        # >=80% source-confirmed agreement and no conflicting support vote.
+        track_supports = {txt(b.get(side))
+                          for b in bs for side in ("STRUCT_A", "STRUCT_B")}
+        support_votes = Counter()
+        for topo in track_supports:
+            claims = validated_supports.get(topo, {})
+            if len(claims) == 1:
+                support_votes[next(iter(claims))] += 1
+        physical_owner, n_physical = (support_votes.most_common(1)[0]
+                                      if support_votes else ("", 0))
+        physical_total = sum(support_votes.values())
+        original_key = best_key
+        physical_confirmed = (
+            physical_owner in refs and n_physical >= 4
+            and n_physical / max(physical_total, 1) >= 0.80
+        )
+        if physical_confirmed and physical_owner != best_key:
+            best_key = physical_owner
+            for rank, med, q90, key in scores_ranked:
+                if key == best_key:
+                    best_d = med
+                    break
+            layer_rule = "POA_SOURCE_CORRECTED"
+        elif physical_confirmed:
+            layer_rule = "POA_SOURCE_CONFIRMED"
+        elif physical_total >= 4 and n_physical / physical_total < 0.80:
+            layer_rule = "POA_SOURCE_AMBIGUOUS"
         margin = (second_d-best_d) if best_d is not None and second_d is not None else None
         if margin is not None and margin < 0:
             margin = None  # winner chosen by layer evidence, not by distance
         conf = "HIGH" if best_d is not None and best_d <= 15 and (margin is None or margin >= 5) else (
             "MEDIUM" if best_d is not None and best_d <= 40 and (margin is None or margin >= 2) else "REVIEW"
         )
-        if layer_rule == "KV_MISMATCH":
+        if layer_rule in ("KV_MISMATCH", "POA_SOURCE_AMBIGUOUS", "POA_SOURCE_CORRECTED"):
             conf = "REVIEW"
         label = client.get(best_key, {}).get("line_no") or labels.get(best_key, best_key)
         track_meta[tid] = {"CKEY":best_key, "CIRCUIT":label, "DIST_M":best_d,
                            "SECOND_M":second_d, "MARGIN_M":margin, "CONF":conf}
         rows.append({
             "TRACK_ID":tid, "N_BUNDLES":len(bs), "CKEY":best_key, "CIRCUIT":label,
+            "ORIGINAL_CKEY":original_key,
+            "POA_SOURCE_CKEY":physical_owner, "POA_SOURCE_MATCHES":n_physical,
+            "POA_SOURCE_TOTAL":physical_total,
             "DIST_M":best_d, "SECOND_M":second_d, "MARGIN_M":margin, "CONF":conf,
             "LAYER_KV":track_kv, "LAYER_RULE":layer_rule,
             "geometry": unary_union([b["geometry"] for b in bs]),
@@ -6186,7 +6244,10 @@ def run(wires_path,points_path,lidar_source,client_source,kmz_path,management_un
         info(f"  Management Unit features for FULL RoWs: {len(management_units):,}")
 
         info("\nAssigning complete physical tracks to client circuits...")
-        track_meta,track_review=assign_tracks_to_circuits(bundles,track_lookup,wires,client,kmz,u2m)
+        track_meta,track_review=assign_tracks_to_circuits(
+            bundles,track_lookup,wires,client,kmz,u2m,
+            raw_points=raw_points,client_structure_index=csi
+        )
         counts=track_review["CIRCUIT"].value_counts().to_dict() if not track_review.empty else {}
         info("  track attribution: "+", ".join(f"{k}={v}" for k,v in counts.items()))
 
@@ -10427,7 +10488,10 @@ def run_geometry_stage(
         csi=build_client_structure_index(client_structures)
         kmz_refs=project_kmz(parse_sow_kmz(kmz_path),crs);kmz=kmz_lookup(kmz_refs)
 
-        track_meta,track_review=assign_tracks_to_circuits(bundles,track_lookup,wires,client,kmz,u2m)
+        track_meta,track_review=assign_tracks_to_circuits(
+            bundles,track_lookup,wires,client,kmz,u2m,
+            raw_points=raw_points,client_structure_index=csi
+        )
         paths,dropped=build_circuit_paths(bundles,supports,u2m)
         final_wires,span_edges,structures_xy,phase_discarded,join_review=build_final_products(
             paths,bundles,supports,raw_points,client,kmz,csi,u2m,max_join_review_m,wire_simplify_m
