@@ -838,10 +838,22 @@ def build(args):
     # Write static offline HTML, table of checks, circuit statistics and maps.
     wa=pd.DataFrame(wire_audit);sa=pd.DataFrame(structure_audit);iss=pd.DataFrame(records)
     by_circuit=[]
-    for c in sorted(set(wa.SRC_CIRCUIT)-{''} | set(sa.CIRCUIT)-{''}):
-        by_circuit.append(dict(CIRCUIT=c,DXF_WIRES=int((wa.SRC_CIRCUIT==c).sum()),
-         GPKG_MATCHED=int(((wa.SRC_CIRCUIT==c)&(wa.GPKG_STATUS!='MISSING_GPKG')).sum()),
-         DELIVERY_MATCHED=int(((wa.SRC_CIRCUIT==c)&(wa.DELIVERY_STATUS=='DELIVERED')).sum()),
+    # DXF layers encode voltage, not circuit. Use the matched GPKG's WIRE_ID.
+    ownership=collections.defaultdict(set)
+    for wid,rows in c_by.items():
+        for rec in rows:
+            ownership[wid].update(split(rec.get('CIRCUIT')))
+    per_circuit=collections.defaultdict(lambda: collections.Counter())
+    for a in wire_audit:
+        for c in ownership.get(a['WIRE_ID'],()):
+            per_circuit[c]['DXF_WIRES']+=1
+            if a['GPKG_STATUS']!='MISSING_GPKG':per_circuit[c]['GPKG_MATCHED']+=1
+            if a['DELIVERY_STATUS']=='DELIVERED':per_circuit[c]['DELIVERY_MATCHED']+=1
+    for c in sorted(set(per_circuit) | set(sa.CIRCUIT)-{''}):
+        cnt=per_circuit[c]
+        by_circuit.append(dict(CIRCUIT=c,DXF_WIRES=cnt['DXF_WIRES'],
+         GPKG_MATCHED=cnt['GPKG_MATCHED'],
+         DELIVERY_MATCHED=cnt['DELIVERY_MATCHED'],
          STRUCTURES=int((sa.CIRCUIT==c).sum()),
          SOURCE_MATCHED=int(((sa.CIRCUIT==c)&(sa.SOURCE_MATCH=='MATCHED')).sum()),
          ISSUES=int((iss.CIRCUIT==c).sum()) if not iss.empty else 0))
@@ -867,7 +879,7 @@ img{{width:100%;border:1px solid #dce2e8;background:white;border-radius:8px}}.ma
     content+=table([{'CHECK':k,'COUNT':v} for k,v in sorted(stats['issues_by_check'].items())],['CHECK','COUNT'])
     content+='<h2>Terminal matching, positive and unresolved</h2>'+table([{'METRIC':k,'COUNT':v} for k,v in sorted(counters.items())],['METRIC','COUNT'])
     content+='<h2>Delivery completeness and positive matching</h2>'+table([{'MEASURE':k,'COUNT':v} for k,v in positive.items()],['MEASURE','COUNT'])
-    content+='<h2>Circuit scorecard</h2>'+table(c_rows,['CIRCUIT','DXF_WIRES','GPKG_MATCHED','DELIVERY_MATCHED','STRUCTURES','SOURCE_MATCHED','ISSUES'])
+    content+='<h2>Circuit scorecard</h2><p>Wire circuit attribution comes from matched GPKG WIRE_ID, since source DXF names voltage only. Totals may overlap when a conductor is assigned to multiple circuits/RoWs. ISSUES includes INFO.</p>'+table(c_rows,['CIRCUIT','DXF_WIRES','GPKG_MATCHED','DELIVERY_MATCHED','STRUCTURES','SOURCE_MATCHED','ISSUES'])
     content+='<h2>Maps</h2><div class="mapgrid"><figure><img src="maps/all_circuits.png"><figcaption>All 2D circuits and QA locations</figcaption></figure>'
     if records:content+='<figure><img src="maps/qa_issues.png"><figcaption>Issues by severity</figcaption></figure>'
     content+='</div><h2>Individual circuits</h2><div class="mapgrid">'
