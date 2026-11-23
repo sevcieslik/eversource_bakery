@@ -2686,7 +2686,17 @@ def assign_tracks_to_circuits(
             physical_owner in refs and n_physical >= 4
             and n_physical / max(physical_total, 1) >= 0.80
         )
-        if physical_confirmed and physical_owner != best_key:
+        # DXF wire voltage is independent evidence. The POA ownership votes
+        # were inferred partly from SoW proximity; they cannot override an
+        # explicit source wire class into a different-voltage circuit.
+        target_kv = ref_kv.get(physical_owner, "")
+        voltage_conflict = bool(
+            physical_confirmed and track_kv and target_kv
+            and track_kv != target_kv
+        )
+        if voltage_conflict:
+            layer_rule = "POA_SOURCE_VOLTAGE_CONFLICT"
+        elif physical_confirmed and physical_owner != best_key:
             best_key = physical_owner
             for rank, med, q90, key in scores_ranked:
                 if key == best_key:
@@ -2703,7 +2713,8 @@ def assign_tracks_to_circuits(
         conf = "HIGH" if best_d is not None and best_d <= 15 and (margin is None or margin >= 5) else (
             "MEDIUM" if best_d is not None and best_d <= 40 and (margin is None or margin >= 2) else "REVIEW"
         )
-        if layer_rule in ("KV_MISMATCH", "POA_SOURCE_AMBIGUOUS", "POA_SOURCE_CORRECTED"):
+        if layer_rule in ("KV_MISMATCH", "POA_SOURCE_AMBIGUOUS",
+                          "POA_SOURCE_CORRECTED", "POA_SOURCE_VOLTAGE_CONFLICT"):
             conf = "REVIEW"
         label = client.get(best_key, {}).get("line_no") or labels.get(best_key, best_key)
         track_meta[tid] = {"CKEY":best_key, "CIRCUIT":label, "DIST_M":best_d,
@@ -2713,6 +2724,8 @@ def assign_tracks_to_circuits(
             "ORIGINAL_CKEY":original_key,
             "POA_SOURCE_CKEY":physical_owner, "POA_SOURCE_MATCHES":n_physical,
             "POA_SOURCE_TOTAL":physical_total,
+            "POA_SOURCE_VOLTAGE_CONFLICT":int(voltage_conflict),
+            "POA_SOURCE_TARGET_KV":target_kv,
             "DIST_M":best_d, "SECOND_M":second_d, "MARGIN_M":margin, "CONF":conf,
             "LAYER_KV":track_kv, "LAYER_RULE":layer_rule,
             "geometry": unary_union([b["geometry"] for b in bs]),
@@ -10496,6 +10509,16 @@ def run_geometry_stage(
             changed_tracks = track_review[
                 track_review["LAYER_RULE"].astype(str) == "POA_SOURCE_CORRECTED"
             ]
+            conflicts = track_review[
+                track_review["LAYER_RULE"].astype(str) ==
+                "POA_SOURCE_VOLTAGE_CONFLICT"
+            ]
+            for _, warning in conflicts.iterrows():
+                info("  QA POA/SOURCE vs DXF voltage conflict "
+                     f"track {warning['TRACK_ID']}: kept {warning['ORIGINAL_CKEY']} "
+                     f"({warning['LAYER_KV']}kV source DXF); POA indicated "
+                     f"{warning['POA_SOURCE_CKEY']} "
+                     f"({warning['POA_SOURCE_TARGET_KV']}kV)")
             for _, fix in changed_tracks.iterrows():
                 info("  POA+SOURCE track correction "
                      f"{fix['TRACK_ID']}: {fix['ORIGINAL_CKEY']} -> {fix['CKEY']} "
