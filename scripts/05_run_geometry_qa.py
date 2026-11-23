@@ -117,11 +117,36 @@ def main():
     if rc != 0 or not (staging / "QA_Report.html").is_file():
         print(f"QA FAILED (exit={rc}). Full traceback: {log_path}", flush=True)
         return rc or 2
+    # On Windows a QGIS/Explorer handle can lock the previous QA directory.
+    # Do not lose a successful inspector run or report it as a geometry error.
+    # Keep the timestamped completed run when the canonical folder is locked.
+    published = staging
     if target.exists():
         archive = qa_root / f"geometry_validation_archive_{stamp}"
-        target.rename(archive)
-        print("Previous QA archived:", archive, flush=True)
-    staging.rename(target)
+        try:
+            target.rename(archive)
+            print("Previous QA archived:", archive, flush=True)
+        except PermissionError as exc:
+            print("QA PUBLISH WARNING: previous report folder is locked; "
+                  "leaving it unchanged. New complete report retained at:",
+                  staging, flush=True)
+            print(f"Archive blocked: {exc}", flush=True)
+        else:
+            try:
+                staging.rename(target)
+                published = target
+            except PermissionError as exc:
+                print("QA PUBLISH WARNING: cannot activate new report folder. "
+                      "New complete report retained at:", staging, flush=True)
+                print(f"Publish blocked: {exc}", flush=True)
+    else:
+        try:
+            staging.rename(target)
+            published = target
+        except PermissionError as exc:
+            print("QA PUBLISH WARNING: cannot create canonical QA directory; "
+                  "new report retained at:", staging, flush=True)
+            print(f"Publish blocked: {exc}", flush=True)
     deliverable_snapshot = sorted(
         (str(x.relative_to(delivery)).replace("\\\\", "/"), x.stat().st_size, x.stat().st_mtime_ns)
         for x in delivery.rglob("*") if x.is_file()
@@ -131,10 +156,10 @@ def main():
                 "deliverables": str(delivery), "delivery_snapshot": deliverable_snapshot,
                 "source_dxf": str(wire), "poa_dxf": str(poa),
                 "sow_sqlite": str(sqlite[0])}
-    (target / "QA_Run_Manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (published / "QA_Run_Manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print("QA COMPLETE; operator review required", flush=True)
-    print("QA_REPORT=" + str(target / "QA_Report.html"), flush=True)
-    print("QA_OUTPUT=" + str(target), flush=True)
+    print("QA_REPORT=" + str(published / "QA_Report.html"), flush=True)
+    print("QA_OUTPUT=" + str(published), flush=True)
     return 0
 
 
