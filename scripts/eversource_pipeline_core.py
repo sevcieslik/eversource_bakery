@@ -9840,7 +9840,7 @@ def recover_terminal_2d_from_3d(
             out.at[idx,'LENGTH_M']=float(new_geom.length)*unit_to_m
     return out, pd.DataFrame(qa,columns=['CIRCUIT','PART','SIDE','ACTION','WIRE_ID','EXTENSION_M']), rows_to_gdf(extras,formal_2d.crs)
 
-def suppress_earth_only_2d_branches(formal_2d, source_3d, unit_to_m):
+def suppress_earth_only_2d_branches(formal_2d, source_3d, unit_to_m, role_audit=None):
     """Drop secondary 2D parts only when EARTH-only evidence is unambiguous.
 
     Retain the main representation, preserve every source/Caydence 3D wire, and
@@ -9853,6 +9853,13 @@ def suppress_earth_only_2d_branches(formal_2d, source_3d, unit_to_m):
     if formal_2d is None or formal_2d.empty or source_3d is None or source_3d.empty:
         return formal_2d, pd.DataFrame(columns=cols)
     out = formal_2d.copy()
+    verified_earth = set()
+    if role_audit is not None and not role_audit.empty:
+        verified_earth = {
+            txt(r.get("WIRE_ID")) for _, r in role_audit.iterrows()
+            if txt(r.get("FINAL_TYPE")).upper() == "EARTH"
+            and txt(r.get("METHOD")) in ("EXPLICIT_DXF_LEVEL", "LIDAR_CLASS_187_210")
+        }
     radius_earth = 4.0 / unit_to_m
     radius_phase = 6.0 / unit_to_m
     join_tol = 8.0 / unit_to_m
@@ -9868,9 +9875,11 @@ def suppress_earth_only_2d_branches(formal_2d, source_3d, unit_to_m):
         circ = txt(rec.get("CIRCUIT"))
         own = source_3d[source_3d["CIRCUIT"].astype(str) == circ]
         earth = [(txt(r.get("WIRE_ID")), force_2d(r.geometry)) for _, r in own.iterrows()
-                 if txt(r.get("WIRE_TYPE")).upper() == "EARTH" and r.geometry is not None]
+                 if txt(r.get("WIRE_TYPE")).upper() == "EARTH"
+                 and txt(r.get("WIRE_ID")) in verified_earth and r.geometry is not None]
         phase = [force_2d(r.geometry) for _, r in own.iterrows()
-                 if txt(r.get("WIRE_TYPE")).upper() != "EARTH" and r.geometry is not None]
+                 if txt(r.get("WIRE_TYPE")).upper() != "EARTH"
+                 or txt(r.get("WIRE_ID")) not in verified_earth]
         changed = False
         for part_no, part in enumerate(parts):
             if part.equals(main):
@@ -10579,7 +10588,7 @@ def run_geometry_stage(
         # Remove only independently confirmed EARTH-only secondary 2D runs.
         # Product 267 remains a lossless inventory of original 3D conductors.
         final_wires, earth_branch_qa = suppress_earth_only_2d_branches(
-            final_wires, cayd_w, u2m
+            final_wires, cayd_w, u2m, role_audit=lidar_role_qa
         )
         earth_branch_qa.to_csv(output/"01_earth_only_2d_branches.csv", index=False)
         info("EARTH-only 2D branches excluded: " +
