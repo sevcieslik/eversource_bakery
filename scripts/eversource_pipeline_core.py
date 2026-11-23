@@ -9878,8 +9878,9 @@ def suppress_earth_only_2d_branches(formal_2d, source_3d, unit_to_m, role_audit=
                  if txt(r.get("WIRE_TYPE")).upper() == "EARTH"
                  and txt(r.get("WIRE_ID")) in verified_earth and r.geometry is not None]
         phase = [force_2d(r.geometry) for _, r in own.iterrows()
-                 if txt(r.get("WIRE_TYPE")).upper() != "EARTH"
-                 or txt(r.get("WIRE_ID")) not in verified_earth]
+                 if (txt(r.get("WIRE_TYPE")).upper() != "EARTH"
+                     or txt(r.get("WIRE_ID")) not in verified_earth)
+                 and r.geometry is not None]
         changed = False
         for part_no, part in enumerate(parts):
             if part.equals(main):
