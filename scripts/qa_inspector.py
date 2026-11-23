@@ -547,6 +547,22 @@ def build(args):
         nearest=cKDTree(xy).query(xy,k=2)[0][:,1]*unit
         if float(np.median(nearest))<=400.0:
             potential_split_poa.update(pi for pi,_ in entries)
+    # A valid source-matched POA can be present in the input DXF even though
+    # the corresponding 3D conductor span was never vectorised. Test the actual
+    # source wire geometry, independently from the generated GPKG/delivery.
+    # A conservative 3m buffer avoids treating nearby conductor endpoints as
+    # missing; ambiguous cases retain their original review/critical checks.
+    source_wire_geoms=[shapely.force_2d(w['geometry']) for w in wdf
+                       if w.get('geometry') is not None and not w['geometry'].is_empty]
+    source_wire_tree=STRtree(source_wire_geoms) if source_wire_geoms else None
+    def source_wire_distance_m(point):
+        if source_wire_tree is None:return float('inf')
+        geom=shapely.force_2d(point)
+        candidates=source_wire_tree.query(geom.buffer(3.0/unit))
+        if len(candidates):
+            return min(float(source_wire_geoms[int(j)].distance(geom))*unit for j in candidates)
+        nearest=source_wire_tree.nearest(geom)
+        return float(source_wire_geoms[int(nearest)].distance(geom))*unit
     # Correlate source->delivery and POA->delivery at one physical location.
     paired_poa=set()
     for r,c,dist_p,pi in pending_missing_source:
@@ -560,14 +576,25 @@ def build(args):
         # delivered 45, and the source/POA association is unambiguous.
         if (src_unique and dist_p<=args.source_search_m and nearby_same.empty
                 and ref_gid and pid not in paired_poa):
-            split_candidate=pi in potential_split_poa
-            issue('POTENTIAL_CIRCUIT_SPLIT_ACROSS_ROWS' if split_candidate else 'S07_MISSING_STRUCTURE_WITH_POA',
-                  'REVIEW' if split_candidate else 'CRITICAL',c,'',ppt,
-                  ('Consecutive source-matched POAs extend beyond delivered 2D geometry; '
-                   'possible cross-RoW continuation, verify adjacent RoW before accepting'
-                   if split_candidate else 'Source-matched POA structure absent from delivery: investigate'),
-                  source_id=ref_gid,output_id=pid,metric=dist_p,
-                  why=f'STRUCTURE_={val(r.get("STRUCTURE_"))}; LINE_NO={c}; POA={pid}; SPLIT_CANDIDATE={int(split_candidate)}')
+            wire_distance=source_wire_distance_m(ppt)
+            no_vector=wire_distance>3.0
+            split_candidate=(pi in potential_split_poa) and not no_vector
+            code=('POA_WITHOUT_VECTORIZED_WIRES' if no_vector else
+                  'POTENTIAL_CIRCUIT_SPLIT_ACROSS_ROWS' if split_candidate else
+                  'S07_MISSING_STRUCTURE_WITH_POA')
+            severity='REVIEW' if (no_vector or split_candidate) else 'CRITICAL'
+            description=(
+                'Source-matched attachment point has no 3D vectorized wire within 3m; '
+                'verify DXF coverage and processing scope before delivery'
+                if no_vector else
+                'Consecutive source-matched POAs extend beyond delivered 2D geometry; '
+                'possible cross-RoW continuation, verify adjacent RoW'
+                if split_candidate else
+                'Source-matched POA structure absent from delivery: investigate')
+            issue(code,severity,c,'',ppt,description,source_id=ref_gid,output_id=pid,
+                  metric=dist_p,
+                  why=f'STRUCTURE_={val(r.get("STRUCTURE_"))}; LINE_NO={c}; POA={pid}; '
+                      f'NEAREST_RAW_WIRE_M={wire_distance:.2f}; SPLIT_CANDIDATE={int(split_candidate)}')
             paired_poa.add(pid)
         else:
             near_delivered=s45[(s45.CIRCUIT.astype(str)==c)&
@@ -883,7 +910,14 @@ img{{width:100%;border:1px solid #dce2e8;background:white;border-radius:8px}}.ma
     content+='<h2>Terminal matching, positive and unresolved</h2>'+table([{'METRIC':k,'COUNT':v} for k,v in sorted(counters.items())],['METRIC','COUNT'])
     content+='<h2>Delivery completeness and positive matching</h2>'+table([{'MEASURE':k,'COUNT':v} for k,v in positive.items()],['MEASURE','COUNT'])
     content+='<h2>Circuit scorecard</h2><p>Wire circuit attribution comes from matched GPKG WIRE_ID, since source DXF names voltage only. Totals may overlap when a conductor is assigned to multiple circuits/RoWs. ISSUES includes INFO.</p>'+table(c_rows,['CIRCUIT','DXF_WIRES','GPKG_MATCHED','DELIVERY_MATCHED','STRUCTURES','SOURCE_MATCHED','ISSUES'])
-    content+='<h2>Potential cross-RoW circuit continuations</h2>'+table([dict(CIRCUIT=c,COUNT=sum(r['CHECK']=='POTENTIAL_CIRCUIT_SPLIT_ACROSS_ROWS' and r['CIRCUIT']==c for r in records),STATUS='REVIEW: confirm adjacent RoW') for c in sorted({r['CIRCUIT'] for r in records if r['CHECK']=='POTENTIAL_CIRCUIT_SPLIT_ACROSS_ROWS'})],['CIRCUIT','COUNT','STATUS'])
+    content+='<h2>Input DXF coverage and cross-RoW continuations</h2>'
+    input_rows=[]
+    for c in sorted({r['CIRCUIT'] for r in records if r['CHECK'] in ('POA_WITHOUT_VECTORIZED_WIRES','POTENTIAL_CIRCUIT_SPLIT_ACROSS_ROWS')}):
+        input_rows.append(dict(CIRCUIT=c,
+          POA_NO_WIRES=sum(r['CHECK']=='POA_WITHOUT_VECTORIZED_WIRES' and r['CIRCUIT']==c for r in records),
+          POSSIBLE_ROW_SPLIT=sum(r['CHECK']=='POTENTIAL_CIRCUIT_SPLIT_ACROSS_ROWS' and r['CIRCUIT']==c for r in records),
+          STATUS='REVIEW: verify DXF vectorisation and RoW scope'))
+    content+=table(input_rows,['CIRCUIT','POA_NO_WIRES','POSSIBLE_ROW_SPLIT','STATUS'])
     content+='<h2>Maps</h2><div class="mapgrid"><figure><img src="maps/all_circuits.png"><figcaption>All 2D circuits and QA locations</figcaption></figure>'
     if records:content+='<figure><img src="maps/qa_issues.png"><figcaption>Issues by severity</figcaption></figure>'
     content+='</div><h2>Individual circuits</h2><div class="mapgrid">'
