@@ -516,35 +516,37 @@ def build(args):
                       'Two distinct source supports with different nearby POAs share a delivered support candidate',
                       str(ri.get('GLOBALID'))+';'+str(rj.get('GLOBALID')),metric=dist)
     else:source_scope=[]
-    # Confirm a split only if a source point is represented in Geometry, lies
-    # beyond the along-line extent of delivered product-45 supports, and is
-    # near the same physical circuit. Interior omissions remain CRITICAL.
-    geometry_gids=collections.defaultdict(list)
-    for _,sr in st.iterrows():
-        if norm(sr.get('GLOBALID')):
-            geometry_gids[norm(sr.get('GLOBALID'))].append(sr)
+    # Source continuation outside delivered geometry is a potential RoW split.
+    # At least three nearby POAs on one circuit must extend beyond the
+    # delivered wire endpoint. Never claim a confirmed adjacent RoW here.
     wire2_by_circuit=collections.defaultdict(list)
     for _,wr in wire2.iterrows():
         g=shapely.force_2d(wr.geometry)
         parts=list(g.geoms) if hasattr(g,'geoms') else [g]
         wire2_by_circuit[val(wr.get('CIRCUIT'))].extend(
-            p for p in parts if isinstance(p,LineString) and not p.is_empty)
-    def confirmed_row_split(source_record,circuit,point):
-        gid=norm(source_record.get('GLOBALID'))
-        linked=[r for r in geometry_gids.get(gid,[])
-                if val(r.get('CIRCUIT'))==circuit and r.geometry.distance(point)*unit<=15.0]
-        if not linked:return False
-        delivered=s45[s45.CIRCUIT.astype(str)==circuit]
-        if len(delivered)<2:return False
-        for line in wire2_by_circuit.get(circuit,[]):
-            if line.distance(point)*unit>15.0:continue
-            stations=[line.project(shapely.force_2d(g)) for g in delivered.geometry
-                      if line.distance(g)*unit<=15.0]
-            if len(stations)<2:continue
-            station=line.project(point)
-            if station < min(stations)-3.0/unit or station > max(stations)+3.0/unit:
-                return True
-        return False
+            p for p in parts if isinstance(p,LineString) and p.length>0)
+    continuation_candidates=collections.defaultdict(list)
+    for r,c,dist_p,pi in pending_missing_source:
+        if dist_p>args.source_search_m:continue
+        pt=poa[pi][1]
+        same=s45[(s45.CIRCUIT.astype(str)==c)&
+                 (s45.geometry.distance(pt)*unit<=args.poa_distance_m)]
+        if not same.empty:continue
+        lines=wire2_by_circuit.get(c,[])
+        if not lines:continue
+        line=min(lines,key=lambda x:x.distance(pt))
+        distance=line.distance(pt)*unit
+        endpoint=min(pt.distance(Point(line.coords[0])),
+                     pt.distance(Point(line.coords[-1])))*unit
+        if distance>args.poa_distance_m and endpoint<=distance+30:
+            continuation_candidates[c].append((pi,pt))
+    potential_split_poa=set()
+    for c,entries in continuation_candidates.items():
+        if len(entries)<3:continue
+        xy=np.asarray([[p.x,p.y] for _,p in entries])
+        nearest=cKDTree(xy).query(xy,k=2)[0][:,1]*unit
+        if float(np.median(nearest))<=400.0:
+            potential_split_poa.update(pi for pi,_ in entries)
     # Correlate source->delivery and POA->delivery at one physical location.
     paired_poa=set()
     for r,c,dist_p,pi in pending_missing_source:
@@ -558,13 +560,14 @@ def build(args):
         # delivered 45, and the source/POA association is unambiguous.
         if (src_unique and dist_p<=args.source_search_m and nearby_same.empty
                 and ref_gid and pid not in paired_poa):
-            split_verified=confirmed_row_split(r,c,ppt)
-            issue('CIRCUIT_SPLIT_ACROSS_ROWS' if split_verified else 'S07_MISSING_STRUCTURE_WITH_POA',
-                  'INFO' if split_verified else 'CRITICAL',c,'',ppt,
-                  ('Circuit continues beyond the delivered structure range; retain for future cross-RoW stitching'
-                   if split_verified else 'Source-matched POA structure absent within delivery scope: inspect omission'),
+            split_candidate=pi in potential_split_poa
+            issue('POTENTIAL_CIRCUIT_SPLIT_ACROSS_ROWS' if split_candidate else 'S07_MISSING_STRUCTURE_WITH_POA',
+                  'REVIEW' if split_candidate else 'CRITICAL',c,'',ppt,
+                  ('Consecutive source-matched POAs extend beyond delivered 2D geometry; '
+                   'possible cross-RoW continuation, verify adjacent RoW before accepting'
+                   if split_candidate else 'Source-matched POA structure absent from delivery: investigate'),
                   source_id=ref_gid,output_id=pid,metric=dist_p,
-                  why=f'STRUCTURE_={val(r.get("STRUCTURE_"))}; LINE_NO={c}; POA={pid}; VERIFIED_SPLIT={int(split_verified)}')
+                  why=f'STRUCTURE_={val(r.get("STRUCTURE_"))}; LINE_NO={c}; POA={pid}; SPLIT_CANDIDATE={int(split_candidate)}')
             paired_poa.add(pid)
         else:
             near_delivered=s45[(s45.CIRCUIT.astype(str)==c)&
@@ -880,6 +883,7 @@ img{{width:100%;border:1px solid #dce2e8;background:white;border-radius:8px}}.ma
     content+='<h2>Terminal matching, positive and unresolved</h2>'+table([{'METRIC':k,'COUNT':v} for k,v in sorted(counters.items())],['METRIC','COUNT'])
     content+='<h2>Delivery completeness and positive matching</h2>'+table([{'MEASURE':k,'COUNT':v} for k,v in positive.items()],['MEASURE','COUNT'])
     content+='<h2>Circuit scorecard</h2><p>Wire circuit attribution comes from matched GPKG WIRE_ID, since source DXF names voltage only. Totals may overlap when a conductor is assigned to multiple circuits/RoWs. ISSUES includes INFO.</p>'+table(c_rows,['CIRCUIT','DXF_WIRES','GPKG_MATCHED','DELIVERY_MATCHED','STRUCTURES','SOURCE_MATCHED','ISSUES'])
+    content+='<h2>Potential cross-RoW circuit continuations</h2>'+table([dict(CIRCUIT=c,COUNT=sum(r['CHECK']=='POTENTIAL_CIRCUIT_SPLIT_ACROSS_ROWS' and r['CIRCUIT']==c for r in records),STATUS='REVIEW: confirm adjacent RoW') for c in sorted({r['CIRCUIT'] for r in records if r['CHECK']=='POTENTIAL_CIRCUIT_SPLIT_ACROSS_ROWS'})],['CIRCUIT','COUNT','STATUS'])
     content+='<h2>Maps</h2><div class="mapgrid"><figure><img src="maps/all_circuits.png"><figcaption>All 2D circuits and QA locations</figcaption></figure>'
     if records:content+='<figure><img src="maps/qa_issues.png"><figcaption>Issues by severity</figcaption></figure>'
     content+='</div><h2>Individual circuits</h2><div class="mapgrid">'
