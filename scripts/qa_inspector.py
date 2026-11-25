@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 from shapely.geometry import Point, LineString
+import shapely
 from shapely.ops import unary_union
 from shapely.strtree import STRtree
 import matplotlib
@@ -296,7 +297,7 @@ def build(args):
     if not Path(args.deliverables).is_dir():
         raise FileNotFoundError(f"Deliverables folder does not exist: {args.deliverables}")
     wdf=source_wires(args.wires_dxf);poa=poa_points(args.poa_dxf)
-    requested=('caydence_wires_3d','structures_final','wires_2d','selected_span_wires','kmz_reference','export_settings','recovered_tap_2d','source_wire_review')
+    requested=('caydence_wires_3d','structures_final','wires_2d','selected_span_wires','kmz_reference','export_settings','recovered_tap_2d','source_wire_review','source_structure_points')
     gpkg_data={layer:(get_layer(gpkg,layer) if layer in available_layers else gpd.GeoDataFrame(geometry=[],crs=None)) for layer in requested}
     cayd=gpkg_data['caydence_wires_3d'];st=gpkg_data['structures_final'];wire2=gpkg_data['wires_2d']
     if cayd.empty or st.empty: raise RuntimeError('Required Geometry layers are empty; see [INPUT] diagnostics above')
@@ -391,7 +392,11 @@ def build(args):
     for ix,r in s45.iterrows():
         key=norm(r.get('GLOBALID'));match=src_id.get(key,[]) if key else []
         missing=[fld for fld in ('GLOBALID','STRUCT_ID','STR_TYPE') if not val(r.get(fld))]
-        if missing:
+        if missing and match and missing == ['STR_TYPE'] and not val(match[0].get('STR_TYPE')):
+            issue('SOURCE_ATTRIBUTE_MISSING','INFO',r.get('CIRCUIT'),r.get('ROW'),r.geometry,
+                  'STR_TYPE is NULL in original client source; preserved in delivery',
+                  source_id=val(match[0].get('GLOBALID')),output_id=f'45:{ix}')
+        elif missing:
             # Don't borrow fields from a nearby structure on a different circuit.
             same_circuit=source[source.get('LINE_NO',pd.Series(index=source.index,dtype=str)).astype(str)==val(r.get('CIRCUIT'))]
             if not same_circuit.empty:
@@ -419,6 +424,59 @@ def build(args):
         structure_audit.append(dict(CIRCUIT=val(r.get('CIRCUIT')),ROW=val(r.get('ROW')),STRUCT_ID=val(r.get('STRUCT_ID')),
                        GLOBALID=val(r.get('GLOBALID')),SOURCE_MATCH='MATCHED' if match else 'UNMATCHED',
                        MISSING_FIELDS=';'.join(missing),CONFLICTS=';'.join(conflicts)))
+    # Independent checks for unreliable ordered structure-source attribution.
+    # POA circuit evidence is compared to the physical TOPO_ID, not to a
+    # geometrically nearest conductor of a different circuit.
+    poa_layer=gpkg_data['source_structure_points']
+    if not poa_layer.empty and 'TOPO_ID' in poa_layer.columns:
+        by_topo=collections.defaultdict(list)
+        for _,marker in poa_layer.iterrows():
+            topo=val(marker.get('TOPO_ID'))
+            if topo and marker.geometry is not None and not marker.geometry.is_empty:
+                by_topo[topo].append(marker)
+        for _,support in st.iterrows():
+            topo=val(support.get('TOPO_ID'))
+            circuit=val(support.get('CIRCUIT'))
+            match_method=val(support.get('SRC_MATCH'))
+            if not topo or not circuit or not match_method.startswith('CORRIDOR'):
+                continue
+            for marker in by_topo.get(topo,[]):
+                if support.geometry.distance(marker.geometry)*unit > 3.0:
+                    continue
+                sow=val(marker.get('SOW_CIRCUIT'))
+                wire=val(marker.get('WIRE_CIRCUIT'))
+                try:votes=int(marker.get('WIRE_VOTES') or 0)
+                except (TypeError,ValueError):votes=0
+                if sow and wire and norm(sow)==norm(wire) and norm(sow)!=norm(circuit) and votes>=2:
+                    issue('S06_FOREIGN_CIRCUIT_SUPPORT','HIGH',circuit,support.get('ROW'),
+                          support.geometry,'Assigned client structure is on a POA with corroborated foreign-circuit attribution',
+                          source_id=val(support.get('SRC_STRUCT')),
+                          output_id=topo,why=f'SOW={sow}, WIRE={wire}, VOTES={votes}, SRC_MATCH={match_method}')
+                    break
+            try:source_distance=float(support.get('SRC_DIST_M'))
+            except (TypeError,ValueError):continue
+            if np.isfinite(source_distance) and source_distance>15.0:
+                issue('S07_DISTANT_SOURCE_MATCH','REVIEW',circuit,support.get('ROW'),
+                      support.geometry,'Ordered source structure assignment is more than 15m from its physical support',
+                      source_id=val(support.get('SRC_STRUCT')),output_id=topo,
+                      metric=source_distance,why='Verify independent source anchors and circuit topology')
+    # Two different TOPO_IDs with the same source structure identity on the
+    # same circuit are suspicious unless one is an intentional RoW duplicate.
+    source_to_topos=collections.defaultdict(set)
+    for _,support in st.iterrows():
+        source_id=val(support.get('SRC_GID')) or val(support.get('SRC_STRUCT'))
+        if source_id and val(support.get('CIRCUIT')) and val(support.get('TOPO_ID')):
+            source_to_topos[(val(support.get('CIRCUIT')),source_id)].add(val(support.get('TOPO_ID')))
+    for (c,source_id),topos in source_to_topos.items():
+        if len(topos)>1:
+            subset=st[(st['CIRCUIT'].astype(str)==c) &
+                      ((st.get('SRC_GID',pd.Series(index=st.index,dtype=str)).astype(str)==source_id) |
+                       (st.get('SRC_STRUCT',pd.Series(index=st.index,dtype=str)).astype(str)==source_id))]
+            if not subset.empty:
+                issue('S08_SOURCE_ID_MULTIPLE_SUPPORTS','REVIEW',c,'',subset.geometry.iloc[0],
+                      'One source structure ID is assigned to several distinct topology supports',
+                      source_id=source_id,why='TOPO_IDs: '+', '.join(sorted(topos)))
+
     # Source-side omission review: only sources near original POA & within output circuit scope.
     if len(source) and len(poa) and len(s45):
         source_coords=np.array([[p.x,p.y] for p in source.geometry]);pcoords=np.array([[p.x,p.y] for _,p in poa]);
@@ -458,6 +516,53 @@ def build(args):
                       'Two distinct source supports with different nearby POAs share a delivered support candidate',
                       str(ri.get('GLOBALID'))+';'+str(rj.get('GLOBALID')),metric=dist)
     else:source_scope=[]
+    # Source continuation outside delivered geometry is a potential RoW split.
+    # At least three nearby POAs on one circuit must extend beyond the
+    # delivered wire endpoint. Never claim a confirmed adjacent RoW here.
+    wire2_by_circuit=collections.defaultdict(list)
+    for _,wr in wire2.iterrows():
+        g=shapely.force_2d(wr.geometry)
+        parts=list(g.geoms) if hasattr(g,'geoms') else [g]
+        wire2_by_circuit[val(wr.get('CIRCUIT'))].extend(
+            p for p in parts if isinstance(p,LineString) and p.length>0)
+    continuation_candidates=collections.defaultdict(list)
+    for r,c,dist_p,pi in pending_missing_source:
+        if dist_p>args.source_search_m:continue
+        pt=poa[pi][1]
+        same=s45[(s45.CIRCUIT.astype(str)==c)&
+                 (s45.geometry.distance(pt)*unit<=args.poa_distance_m)]
+        if not same.empty:continue
+        lines=wire2_by_circuit.get(c,[])
+        if not lines:continue
+        line=min(lines,key=lambda x:x.distance(pt))
+        distance=line.distance(pt)*unit
+        endpoint=min(pt.distance(Point(line.coords[0])),
+                     pt.distance(Point(line.coords[-1])))*unit
+        if distance>args.poa_distance_m and endpoint<=distance+30:
+            continuation_candidates[c].append((pi,pt))
+    potential_split_poa=set()
+    for c,entries in continuation_candidates.items():
+        if len(entries)<3:continue
+        xy=np.asarray([[p.x,p.y] for _,p in entries])
+        nearest=cKDTree(xy).query(xy,k=2)[0][:,1]*unit
+        if float(np.median(nearest))<=400.0:
+            potential_split_poa.update(pi for pi,_ in entries)
+    # A valid source-matched POA can be present in the input DXF even though
+    # the corresponding 3D conductor span was never vectorised. Test the actual
+    # source wire geometry, independently from the generated GPKG/delivery.
+    # A conservative 3m buffer avoids treating nearby conductor endpoints as
+    # missing; ambiguous cases retain their original review/critical checks.
+    source_wire_geoms=[shapely.force_2d(w['geometry']) for w in wdf
+                       if w.get('geometry') is not None and not w['geometry'].is_empty]
+    source_wire_tree=STRtree(source_wire_geoms) if source_wire_geoms else None
+    def source_wire_distance_m(point):
+        if source_wire_tree is None:return float('inf')
+        geom=shapely.force_2d(point)
+        candidates=source_wire_tree.query(geom.buffer(3.0/unit))
+        if len(candidates):
+            return min(float(source_wire_geoms[int(j)].distance(geom))*unit for j in candidates)
+        nearest=source_wire_tree.nearest(geom)
+        return float(source_wire_geoms[int(nearest)].distance(geom))*unit
     # Correlate source->delivery and POA->delivery at one physical location.
     paired_poa=set()
     for r,c,dist_p,pi in pending_missing_source:
@@ -471,15 +576,48 @@ def build(args):
         # delivered 45, and the source/POA association is unambiguous.
         if (src_unique and dist_p<=args.source_search_m and nearby_same.empty
                 and ref_gid and pid not in paired_poa):
-            issue('S07_MISSING_STRUCTURE_WITH_POA','CRITICAL',c,'',ppt,
-                  'Source-matched POA structure absent from product 45: check Bakery RoW boundary and export',
-                  source_id=ref_gid,output_id=pid,metric=dist_p,
-                  why=f'STRUCTURE_={val(r.get("STRUCTURE_"))}; LINE_NO={c}; POA={pid}')
+            wire_distance=source_wire_distance_m(ppt)
+            no_vector=wire_distance>3.0
+            split_candidate=(pi in potential_split_poa) and not no_vector
+            code=('POA_WITHOUT_VECTORIZED_WIRES' if no_vector else
+                  'POTENTIAL_CIRCUIT_SPLIT_ACROSS_ROWS' if split_candidate else
+                  'S07_MISSING_STRUCTURE_WITH_POA')
+            severity='REVIEW' if (no_vector or split_candidate) else 'CRITICAL'
+            description=(
+                'Source-matched attachment point has no 3D vectorized wire within 3m; '
+                'verify DXF coverage and processing scope before delivery'
+                if no_vector else
+                'Consecutive source-matched POAs extend beyond delivered 2D geometry; '
+                'possible cross-RoW continuation, verify adjacent RoW'
+                if split_candidate else
+                'Source-matched POA structure absent from delivery: investigate')
+            issue(code,severity,c,'',ppt,description,source_id=ref_gid,output_id=pid,
+                  metric=dist_p,
+                  why=f'STRUCTURE_={val(r.get("STRUCTURE_"))}; LINE_NO={c}; POA={pid}; '
+                      f'NEAREST_RAW_WIRE_M={wire_distance:.2f}; SPLIT_CANDIDATE={int(split_candidate)}')
             paired_poa.add(pid)
         else:
-            issue('S04_SOURCE_NOT_DELIVERED','REVIEW',c,'',r.geometry,
-                  'Source structure near POA absent by GLOBALID from product 45; verify scope/POA',
+            near_delivered=s45[(s45.CIRCUIT.astype(str)==c)&
+                               (s45.geometry.distance(r.geometry)*unit<=args.merge_distance_m)]
+            # Multiple original points can describe one physical support. Do not
+            # treat the extra GLOBALIDs as missing delivered structures.
+            duplicate=bool(len(near_delivered)) and (
+                any(ncal.get('GLOBALID') != ref_gid for _,ncal in near_delivered.iterrows()))
+            issue('DUPLICATE_SOURCE_STRUCTURE' if duplicate else 'S04_SOURCE_NOT_DELIVERED',
+                  'INFO' if duplicate else 'REVIEW',c,'',r.geometry,
+                  ('Extra client source record at an already delivered physical support'
+                   if duplicate else 'Source structure near POA absent by GLOBALID from product 45; verify scope/POA'),
                   ref_gid,metric=dist_p)
+    # Check orphan POAs against original DXF conductor endpoint topology.
+    raw_ends=[]
+    for wire in wdf:
+        g=wire.get('geometry')
+        if g is None or g.is_empty:continue
+        parts=list(g.geoms) if hasattr(g,'geoms') else [g]
+        for part in parts:
+            if isinstance(part,LineString) and len(part.coords)>=2:
+                raw_ends.extend([part.coords[0][:2],part.coords[-1][:2]])
+    endpoint_tree=cKDTree(np.asarray(raw_ends)) if raw_ends else None
     # Check POA standalone proximity to 45; do not duplicate a confirmed S07.
     if len(poa) and len(s45):
         tree=cKDTree(np.array([[p.x,p.y] for p in s45.geometry]))
@@ -487,8 +625,12 @@ def build(args):
             if pid in paired_poa:continue
             dist=float(tree.query([p.x,p.y])[0])*unit
             if dist>args.poa_distance_m:
-                issue('S06_POA_FAR_FROM_STRUCTURE','REVIEW','','',p,
-                    'Tower Top POA has no nearby product-45 structure; may be legitimate topology/scope',pid,metric=dist)
+                orphan=endpoint_tree is not None and float(endpoint_tree.query([p.x,p.y])[0])*unit>3.0
+                issue('ORPHAN_SOURCE_POA' if orphan else 'S06_POA_FAR_FROM_STRUCTURE',
+                      'INFO' if orphan else 'REVIEW','','',p,
+                      ('Isolated contractor POA has no conductor endpoint; excluded from delivered topology'
+                       if orphan else 'Tower Top POA has no nearby product-45 structure; inspect connected source wires'),
+                      pid,metric=dist)
     # 80/2D artifact detection: local lateral zigzag + short dangling geometries; no prior-run comparison.
     art_summary=collections.Counter()
     for _,r in wire2.iterrows():
@@ -522,9 +664,9 @@ def build(args):
                 if length_m>args.whisker_max_m or length_m<1.0:continue
                 others=unary_union([p for j,p in enumerate(parts) if j!=ix])
                 ends=[Point(part.coords[0]),Point(part.coords[-1])]
-                d=[p.distance(others)*unit for p in ends]
-                tip=ends[0] if d[0]>d[1] else ends[1]
-                near=min(d);far=max(d)
+                endpoint_distances=[p.distance(others)*unit for p in ends]
+                tip=ends[0] if endpoint_distances[0]>endpoint_distances[1] else ends[1]
+                near=min(endpoint_distances);far=max(endpoint_distances)
                 if near<=args.whisker_join_m and far>=args.whisker_tip_m:
                     poa_dist=float(poa_tree.query([tip.x,tip.y])[0])*unit
                     if poa_dist>args.whisker_poa_m:
@@ -546,6 +688,31 @@ def build(args):
               f'{pct:.0f}% of source 3D conductor >{args.coverage_corridor_m}m from representative 2D; check tap/scope',
               src['wire_id'],metric=float(ds[ix].max()))
 
+    # EARTH-only branch audit: inspect secondary 2D parts after independent
+    # LiDAR conductor typing. Do not report a branch when evidence is uncertain
+    # or a PHASE conductor runs along its interior.
+    if not wire2.empty and not cayd.empty and 'WIRE_TYPE' in cayd.columns:
+        for _,row2 in wire2.iterrows():
+            geom=row2.geometry
+            parts=[p for p in getattr(geom,'geoms',[geom])
+                   if isinstance(p,LineString) and not p.is_empty]
+            if len(parts)<2:continue
+            main=max(parts,key=lambda p:p.length)
+            c=val(row2.get('CIRCUIT'))
+            candidates=cayd[cayd['CIRCUIT'].astype(str)==c]
+            earth=[r for _,r in candidates.iterrows() if val(r.get('WIRE_TYPE')).upper()=='EARTH']
+            non_earth=[r for _,r in candidates.iterrows() if val(r.get('WIRE_TYPE')).upper()!='EARTH']
+            for part in parts:
+                if part.equals(main) or part.length*unit<15:continue
+                if min(main.distance(Point(part.coords[0])),main.distance(Point(part.coords[-1])))*unit>8:continue
+                samples=[part.interpolate(f,normalized=True) for f in np.linspace(.15,.85,13)]
+                ec=sum(any(shapely.force_2d(w.geometry).distance(p)*unit<=4 for w in earth) for p in samples)/len(samples)
+                pc=sum(any(shapely.force_2d(w.geometry).distance(p)*unit<=6 for w in non_earth) for p in samples)/len(samples)
+                if ec>=.85 and pc<=.05:
+                    issue('E01_POSSIBLE_EARTH_ONLY_2D_BRANCH','REVIEW',c,row2.get('ROW'),
+                          part,'Secondary 2D branch follows EARTH-attributed source wires without nearby non-EARTH evidence; confirm conductor roles',
+                          metric=part.length*unit,
+                          why=f'EARTH sample coverage={ec:.0%}, non-EARTH={pc:.0%}; check original 3D')
     # 80 product completeness against 2D span inventory in the *same run*.
     # Explicit source 2D is the selected_span_wires layer (never earlier GPKGs).
     delivered80=d['80']
@@ -567,7 +734,9 @@ def build(args):
     for rec in term:
         counters[f"{rec['DATASET']}_{rec['STATUS']}"]+=1
         if rec['DATASET']=='2D' and rec['STATUS']=='STRUCTURE_LINKED_OFFSET':
-            issue('T02_STRUCTURE_2D_OFFSET','REVIEW',rec['CIRCUIT'],rec['ROW'],rec['geometry'],
+            issue('T02_VERIFIED_PHYSICAL_SUPPORT_OFFSET' if rec.get('LINKED_TOPO_ID') else 'T02_STRUCTURE_2D_OFFSET',
+                  'INFO' if rec.get('LINKED_TOPO_ID') else 'REVIEW',
+                  rec['CIRCUIT'],rec['ROW'],rec['geometry'],
                   'Physical support verified through span topology and product 45, but representative 2D endpoint is laterally offset; check conductor arrangement (possible trident), not missing Structure',
                   source_id=rec['LINKED_TOPO_ID'],metric=rec['LINKED_STRUCTURE_M'],
                   why=f"Linked TOPO_ID={rec['LINKED_TOPO_ID']}; product-45 support verified at {rec['LINKED_PRODUCT45_M']} m")
@@ -699,10 +868,22 @@ def build(args):
     # Write static offline HTML, table of checks, circuit statistics and maps.
     wa=pd.DataFrame(wire_audit);sa=pd.DataFrame(structure_audit);iss=pd.DataFrame(records)
     by_circuit=[]
-    for c in sorted(set(wa.SRC_CIRCUIT)-{''} | set(sa.CIRCUIT)-{''}):
-        by_circuit.append(dict(CIRCUIT=c,DXF_WIRES=int((wa.SRC_CIRCUIT==c).sum()),
-         GPKG_MATCHED=int(((wa.SRC_CIRCUIT==c)&(wa.GPKG_STATUS!='MISSING_GPKG')).sum()),
-         DELIVERY_MATCHED=int(((wa.SRC_CIRCUIT==c)&(wa.DELIVERY_STATUS=='DELIVERED')).sum()),
+    # DXF layers encode voltage, not circuit. Use the matched GPKG's WIRE_ID.
+    ownership=collections.defaultdict(set)
+    for wid,rows in c_by.items():
+        for rec in rows:
+            ownership[wid].update(split(rec.get('CIRCUIT')))
+    per_circuit=collections.defaultdict(lambda: collections.Counter())
+    for a in wire_audit:
+        for c in ownership.get(a['WIRE_ID'],()):
+            per_circuit[c]['DXF_WIRES']+=1
+            if a['GPKG_STATUS']!='MISSING_GPKG':per_circuit[c]['GPKG_MATCHED']+=1
+            if a['DELIVERY_STATUS']=='DELIVERED':per_circuit[c]['DELIVERY_MATCHED']+=1
+    for c in sorted(set(per_circuit) | set(sa.CIRCUIT)-{''}):
+        cnt=per_circuit[c]
+        by_circuit.append(dict(CIRCUIT=c,DXF_WIRES=cnt['DXF_WIRES'],
+         GPKG_MATCHED=cnt['GPKG_MATCHED'],
+         DELIVERY_MATCHED=cnt['DELIVERY_MATCHED'],
          STRUCTURES=int((sa.CIRCUIT==c).sum()),
          SOURCE_MATCHED=int(((sa.CIRCUIT==c)&(sa.SOURCE_MATCH=='MATCHED')).sum()),
          ISSUES=int((iss.CIRCUIT==c).sum()) if not iss.empty else 0))
@@ -728,7 +909,15 @@ img{{width:100%;border:1px solid #dce2e8;background:white;border-radius:8px}}.ma
     content+=table([{'CHECK':k,'COUNT':v} for k,v in sorted(stats['issues_by_check'].items())],['CHECK','COUNT'])
     content+='<h2>Terminal matching, positive and unresolved</h2>'+table([{'METRIC':k,'COUNT':v} for k,v in sorted(counters.items())],['METRIC','COUNT'])
     content+='<h2>Delivery completeness and positive matching</h2>'+table([{'MEASURE':k,'COUNT':v} for k,v in positive.items()],['MEASURE','COUNT'])
-    content+='<h2>Circuit scorecard</h2>'+table(c_rows,['CIRCUIT','DXF_WIRES','GPKG_MATCHED','DELIVERY_MATCHED','STRUCTURES','SOURCE_MATCHED','ISSUES'])
+    content+='<h2>Circuit scorecard</h2><p>Wire circuit attribution comes from matched GPKG WIRE_ID, since source DXF names voltage only. Totals may overlap when a conductor is assigned to multiple circuits/RoWs. ISSUES includes INFO.</p>'+table(c_rows,['CIRCUIT','DXF_WIRES','GPKG_MATCHED','DELIVERY_MATCHED','STRUCTURES','SOURCE_MATCHED','ISSUES'])
+    content+='<h2>Input DXF coverage and cross-RoW continuations</h2>'
+    input_rows=[]
+    for c in sorted({r['CIRCUIT'] for r in records if r['CHECK'] in ('POA_WITHOUT_VECTORIZED_WIRES','POTENTIAL_CIRCUIT_SPLIT_ACROSS_ROWS')}):
+        input_rows.append(dict(CIRCUIT=c,
+          POA_NO_WIRES=sum(r['CHECK']=='POA_WITHOUT_VECTORIZED_WIRES' and r['CIRCUIT']==c for r in records),
+          POSSIBLE_ROW_SPLIT=sum(r['CHECK']=='POTENTIAL_CIRCUIT_SPLIT_ACROSS_ROWS' and r['CIRCUIT']==c for r in records),
+          STATUS='REVIEW: verify DXF vectorisation and RoW scope'))
+    content+=table(input_rows,['CIRCUIT','POA_NO_WIRES','POSSIBLE_ROW_SPLIT','STATUS'])
     content+='<h2>Maps</h2><div class="mapgrid"><figure><img src="maps/all_circuits.png"><figcaption>All 2D circuits and QA locations</figcaption></figure>'
     if records:content+='<figure><img src="maps/qa_issues.png"><figcaption>Issues by severity</figcaption></figure>'
     content+='</div><h2>Individual circuits</h2><div class="mapgrid">'

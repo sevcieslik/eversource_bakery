@@ -1,5 +1,12 @@
 # Eversource Tester R01.05-test
 
+## Standalone QA Inspector for existing projects
+
+The Bakery left sidebar now contains **QA Inspector**. It opens an independent window with three browse fields for the **original DXF input folder**, **original Structures and SoW SQLite source folder**, and **existing output folder**. This action does not run Preflight, Geometry or batch processing; it can inspect an earlier Bakery run using paths different from the current workspace. Click **Run Geometry QA**, then view **Open QA Report** / **Open QA Folder**. The inspector uses the same `scripts/.venv` and stores results in the selected legacy output's `QA/geometry_validation`.
+
+**Required for full QA v0.3:** the older output must already contain `01_geometry/01_eversource_geometry.gpkg` with expected layers and `deliverables/` with 45/80/267 products. This is not a raw-DXF-only inspector, and it does not reconstruct a missing GPKG. The separate right-hand **Run Geometry QA** button continues to validate the currently selected Bakery output automatically.
+
+
 > **Current approved release: R01.06 (22 Nov 2026).** Geometry QA v0.3 is bundled and uses the same Bakery venv. [R01.06 release notes](RELEASE_NOTES_R01.06.md).\n\n
 ## Geometry QA integration (v0.3)
 

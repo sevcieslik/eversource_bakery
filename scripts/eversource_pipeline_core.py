@@ -1758,7 +1758,8 @@ def build_client_structure_index(g: gpd.GeoDataFrame):
         for key, indexes in keys.items():
             sg = x.iloc[indexes].reset_index(drop=True)
             groups[key] = (sg, cKDTree(np.column_stack([sg.geometry.x, sg.geometry.y])))
-    return {"groups": groups, "global": None, "columns": cols,
+    global_tree = cKDTree(np.column_stack([x.geometry.x, x.geometry.y]))
+    return {"groups": groups, "global": (x, global_tree), "columns": cols,
             "source_field_map": source_field_map, "delivery_source_fields": delivery_source_fields}
 
 
@@ -2565,7 +2566,10 @@ def combined_references(client, kmz):
     return refs, labels
 
 
-def assign_tracks_to_circuits(bundles, track_lookup, wires, client, kmz, unit_to_m):
+def assign_tracks_to_circuits(
+    bundles, track_lookup, wires, client, kmz, unit_to_m,
+    raw_points=None, client_structure_index=None,
+):
     refs, labels = combined_references(client, kmz)
     by_track = defaultdict(list)
     for b in bundles:
@@ -2586,7 +2590,30 @@ def assign_tracks_to_circuits(bundles, track_lookup, wires, client, kmz, unit_to
         label_to_keys[txt(key)].append(key)
     known_labels = {k for k in label_to_keys if k}
     layer_col = "SOURCE_LAYER" if "SOURCE_LAYER" in wires.columns else None
-
+    # Validated physical supports: POA wire attribution AND a source structure
+    # from the same circuit within 15 m. Vote once per distinct physical TOPO_ID.
+    validated_supports = defaultdict(Counter)
+    if (raw_points is not None and not raw_points.empty
+            and client_structure_index is not None
+            and "TOPO_ID" in raw_points.columns):
+        source_groups = client_structure_index.get("groups", {})
+        for _, poa in raw_points.iterrows():
+            topo = txt(poa.get("TOPO_ID"))
+            sow = circuit_key(poa.get("SOW_CIRCUIT"))
+            wire = circuit_key(poa.get("WIRE_CIRCUIT"))
+            try:
+                votes = int(poa.get("WIRE_VOTES") or 0)
+            except (TypeError, ValueError):
+                votes = 0
+            if not topo or not sow or not wire or sow != wire or votes < 2:
+                continue
+            pack = source_groups.get(wire)
+            if pack is None:
+                continue
+            distance, _ = pack[1].query([float(poa.geometry.x), float(poa.geometry.y)])
+            if float(distance) * unit_to_m > 15.0:
+                continue
+            validated_supports[topo][wire] += 1
     rows, track_meta = [], {}
     for tid, bs in sorted(by_track.items()):
         samples = []
@@ -2633,6 +2660,7 @@ def assign_tracks_to_circuits(bundles, track_lookup, wires, client, kmz, unit_to
                     rank = 1
                 scores.append((rank, med, float(np.quantile(ds,0.9)), key))
         scores.sort()
+        scores_ranked = list(scores)
         layer_rule = "LAYER_CIRCUIT" if hint_keys else ("LAYER_KV" if track_kv else "")
         if scores and scores[0][0] == 2:
             layer_rule = "KV_MISMATCH"
@@ -2642,19 +2670,63 @@ def assign_tracks_to_circuits(bundles, track_lookup, wires, client, kmz, unit_to
         else:
             best_d, _, best_key = scores[0]
             second_d = scores[1][0] if len(scores)>1 else None
+        # A track can be reattributed only with >=4 distinct supported POAs,
+        # >=80% source-confirmed agreement and no conflicting support vote.
+        track_supports = {txt(b.get(side))
+                          for b in bs for side in ("STRUCT_A", "STRUCT_B")}
+        support_votes = Counter()
+        for topo in track_supports:
+            claims = validated_supports.get(topo, {})
+            if len(claims) == 1:
+                support_votes[next(iter(claims))] += 1
+        physical_owner, n_physical = (support_votes.most_common(1)[0]
+                                      if support_votes else ("", 0))
+        physical_total = sum(support_votes.values())
+        original_key = best_key
+        physical_confirmed = (
+            physical_owner in refs and n_physical >= 4
+            and n_physical / max(physical_total, 1) >= 0.80
+        )
+        # DXF wire voltage is independent evidence. The POA ownership votes
+        # were inferred partly from SoW proximity; they cannot override an
+        # explicit source wire class into a different-voltage circuit.
+        target_kv = ref_kv.get(physical_owner, "")
+        voltage_conflict = bool(
+            physical_confirmed and track_kv and target_kv
+            and track_kv != target_kv
+        )
+        if voltage_conflict:
+            layer_rule = "POA_SOURCE_VOLTAGE_CONFLICT"
+        elif physical_confirmed and physical_owner != best_key:
+            best_key = physical_owner
+            for rank, med, q90, key in scores_ranked:
+                if key == best_key:
+                    best_d = med
+                    break
+            layer_rule = "POA_SOURCE_CORRECTED"
+        elif physical_confirmed:
+            layer_rule = "POA_SOURCE_CONFIRMED"
+        elif physical_total >= 4 and n_physical / physical_total < 0.80:
+            layer_rule = "POA_SOURCE_AMBIGUOUS"
         margin = (second_d-best_d) if best_d is not None and second_d is not None else None
         if margin is not None and margin < 0:
             margin = None  # winner chosen by layer evidence, not by distance
         conf = "HIGH" if best_d is not None and best_d <= 15 and (margin is None or margin >= 5) else (
             "MEDIUM" if best_d is not None and best_d <= 40 and (margin is None or margin >= 2) else "REVIEW"
         )
-        if layer_rule == "KV_MISMATCH":
+        if layer_rule in ("KV_MISMATCH", "POA_SOURCE_AMBIGUOUS",
+                          "POA_SOURCE_CORRECTED", "POA_SOURCE_VOLTAGE_CONFLICT"):
             conf = "REVIEW"
         label = client.get(best_key, {}).get("line_no") or labels.get(best_key, best_key)
         track_meta[tid] = {"CKEY":best_key, "CIRCUIT":label, "DIST_M":best_d,
                            "SECOND_M":second_d, "MARGIN_M":margin, "CONF":conf}
         rows.append({
             "TRACK_ID":tid, "N_BUNDLES":len(bs), "CKEY":best_key, "CIRCUIT":label,
+            "ORIGINAL_CKEY":original_key,
+            "POA_SOURCE_CKEY":physical_owner, "POA_SOURCE_MATCHES":n_physical,
+            "POA_SOURCE_TOTAL":physical_total,
+            "POA_SOURCE_VOLTAGE_CONFLICT":int(voltage_conflict),
+            "POA_SOURCE_TARGET_KV":target_kv,
             "DIST_M":best_d, "SECOND_M":second_d, "MARGIN_M":margin, "CONF":conf,
             "LAYER_KV":track_kv, "LAYER_RULE":layer_rule,
             "geometry": unary_union([b["geometry"] for b in bs]),
@@ -5028,6 +5100,7 @@ def _corridor_axes_for_circuit(circuit, client, kmz):
 def attribute_unmatched_structures_along_corridor(
     structures, source_index, client, kmz, unit_to_m,
     corridor_half_width_m=75.0,
+    raw_points=None,
 ):
     """One-to-one attribute-only recovery between existing matched anchors.
 
@@ -5042,6 +5115,9 @@ def attribute_unmatched_structures_along_corridor(
     result = structures.copy()
     qa = []
     source_groups = source_index.get("groups", {})
+    # Raw contractor POA circuit votes are independent of source structure order.
+    # Use nearby votes to prevent a G128 source ID being placed on a C129 POA.
+    poa_markers = raw_points if raw_points is not None and not raw_points.empty else None
     srcfields = source_index.get("delivery_source_fields", [])
     for circuit, indexes in result.groupby("CIRCUIT", dropna=True).groups.items():
         key = circuit_key(circuit)
@@ -5101,7 +5177,24 @@ def attribute_unmatched_structures_along_corridor(
                 status = "OUTSIDE_CORRIDOR" if lateral > corridor_half_width_m else "NO_CANDIDATE"
                 choices = []
                 if lateral <= corridor_half_width_m:
-                    for j, sr, spos, soff, ident in source_items:
+                    # A physically attached POA with two consistent foreign-circuit
+                    # clues is not a valid candidate for ordered source attribution.
+                    conflict = False
+                    if poa_markers is not None:
+                        attached = poa_markers[poa_markers.geometry.distance(r.geometry) <= 3.0 / unit_to_m]
+                        for _, marker in attached.iterrows():
+                            sow_c = circuit_key(marker.get("SOW_CIRCUIT"))
+                            wire_c = circuit_key(marker.get("WIRE_CIRCUIT"))
+                            try:
+                                votes = int(marker.get("WIRE_VOTES") or 0)
+                            except (TypeError, ValueError):
+                                votes = 0
+                            if sow_c and wire_c and sow_c == wire_c and sow_c != key and votes >= 2:
+                                conflict = True
+                                break
+                    if conflict:
+                        status = "S01_CIRCUIT_CONFLICT"
+                    for j, sr, spos, soff, ident in ([] if conflict else source_items):
                         if ident in used or soff > corridor_half_width_m:
                             continue
                         # Existing matched control structures establish the monotonic
@@ -5134,6 +5227,19 @@ def attribute_unmatched_structures_along_corridor(
                         status = "AMBIGUOUS_ORDER"
                     elif choices:
                         score, j, src, srcpos, ident, along_m = choices[0]
+                        physical_dist = float(r.geometry.distance(src.geometry)) * unit_to_m
+                        lo = max([k for k, _, _ in known if k < opos], default=None)
+                        hi = min([k for k, _, _ in known if k > opos], default=None)
+                        # Above 15m require independent two-sided corridor anchors.
+                        # Above 75m do not guess source IDs at all.
+                        if physical_dist > 75.0 or (physical_dist > 15.0 and (lo is None or hi is None)):
+                            status = "S02_DISTANT_SOURCE_UNCONFIRMED"
+                            qa.append({"OUTPUT_INDEX": i, "CIRCUIT": str(circuit),
+                                       "STATUS": status, "CROSS_OFFSET_M": round(lateral, 2),
+                                       "SOURCE_STRUCT": txt(src.get("STRUCTURE_")),
+                                       "ALONG_OFFSET_M": round(along_m, 2),
+                                       "SOURCE_DISTANCE_M": round(physical_dist, 2)})
+                            continue
                         # Reject assignments crossing existing control anchors or
                         # another already accepted output (known is updated below).
                         vals = client_structure_values(src, txt(r.get("TOPO_ID")))
@@ -5150,8 +5256,9 @@ def attribute_unmatched_structures_along_corridor(
                             if fld in result.columns:
                                 result.at[i,fld] = src.get(fld)
                         result.at[i,"SRC_DIST_M"] = float(r.geometry.distance(src.geometry))*unit_to_m
-                        result.at[i,"SRC_MATCH"] = ("CORRIDOR_AMBIGUOUS_NEAREST" if ambiguous
-                                                    else "CORRIDOR_ORDERED")
+                        result.at[i,"SRC_MATCH"] = ("CORRIDOR_DISTANT_REVIEW" if physical_dist > 15.0
+                                                    else ("CORRIDOR_AMBIGUOUS_NEAREST" if ambiguous
+                                                          else "CORRIDOR_ORDERED"))
                         result.at[i,"IS_DUMMY"] = 0
                         used.add(ident)
                         known.append((opos,srcpos,i))
@@ -5162,6 +5269,96 @@ def attribute_unmatched_structures_along_corridor(
                            "ALONG_OFFSET_M":round(choices[0][5],2) if choices else None})
     return result, pd.DataFrame(qa)
 
+
+
+def recover_source_circuit_mismatches(
+    structures: gpd.GeoDataFrame,
+    source_index: dict,
+    unit_to_m: float,
+    max_match_m: float = 15.0,
+) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
+    """Recover missing attribution when source LINE_NO differs from the circuit.
+
+    Accept only a single source point within 15 m not already used by another
+    output structure. Preserve physical XY, source GIS_NO and original SRC_LINE.
+    """
+    pack = source_index.get("global")
+    if not pack or structures is None or structures.empty:
+        return structures, pd.DataFrame()
+    source, tree = pack
+    result = structures.copy()
+    source_fields = source_index.get("delivery_source_fields", [])
+    field_map = source_index.get("source_field_map", {})
+    line_field = next((v for k, v in field_map.items() if k.upper() == "LINE_NO"), "LINE_NO")
+    used = set()
+    for _, r in result.iterrows():
+        if int(r.get("IS_DUMMY", 0) or 0):
+            continue
+        gid = txt(r.get("SRC_GID"))
+        if gid:
+            used.add(("GLOBALID", gid))
+        elif pd.notna(r.get("SRC_X")) and pd.notna(r.get("SRC_Y")):
+            used.add(("SOURCE_XY", round(float(r["SRC_X"]), 3),
+                      round(float(r["SRC_Y"]), 3), txt(r.get("SRC_STRUCT"))))
+
+    audit = []
+    proposed = []
+    for i, r in result.iterrows():
+        if not int(r.get("IS_DUMMY", 0) or 0):
+            continue
+        p = r.geometry
+        if p is None or p.is_empty:
+            continue
+        hits = tree.query_ball_point([float(p.x), float(p.y)], r=max_match_m / unit_to_m)
+        choices = sorted(
+            ((float(p.distance(source.iloc[j].geometry)) * unit_to_m, int(j)) for j in hits),
+            key=lambda item: (item[0], item[1]),
+        )
+        if not choices:
+            audit.append({"OUTPUT_INDEX": int(i), "CIRCUIT": txt(r.get("CIRCUIT")),
+                          "STATUS": "NO_SOURCE_WITHIN_15M"})
+            continue
+        if len(choices) != 1:
+            audit.append({"OUTPUT_INDEX": int(i), "CIRCUIT": txt(r.get("CIRCUIT")),
+                          "STATUS": "AMBIGUOUS_SOURCE_WITHIN_15M", "CANDIDATES": len(choices)})
+            continue
+        dist, j = choices[0]
+        proposed.append((dist, int(i), j))
+
+    for dist, i, j in sorted(proposed):
+        r = result.loc[i]
+        sr = source.iloc[j]
+        identity = _source_match_identity(sr)
+        circuit = txt(r.get("CIRCUIT"))
+        if identity in used:
+            audit.append({"OUTPUT_INDEX": i, "CIRCUIT": circuit,
+                          "STATUS": "SOURCE_ALREADY_ASSIGNED", "DIST_M": round(dist, 3)})
+            continue
+        source_line = txt(sr.get("LINE_NO"))
+        audit_status = ("RECOVERED_SAME_CIRCUIT" if circuit_key(source_line) == circuit_key(circuit)
+                        else "SOURCE_CIRCUIT_MISMATCH")
+        attrs = client_structure_values(sr, txt(r.get("TOPO_ID")))
+        mapped = client_structure_all_values(sr, source_index)
+        for fld in source_fields:
+            if fld in result.columns:
+                result.at[i, fld] = mapped.get(fld)
+        for fld in ("STRUCT_ID", "SRC_GID", "SRC_LINE", "SRC_STRUCT", "SRC_X", "SRC_Y"):
+            if fld in result.columns:
+                result.at[i, fld] = attrs.get(fld)
+        if line_field in result.columns:
+            result.at[i, line_field] = circuit
+        if "LINE_NO" in result.columns:
+            result.at[i, "LINE_NO"] = circuit
+        result.at[i, "SRC_DIST_M"] = float(dist)
+        result.at[i, "SRC_MATCH"] = audit_status
+        result.at[i, "IS_DUMMY"] = 0
+        used.add(identity)
+        audit.append({"OUTPUT_INDEX": i, "CIRCUIT": circuit,
+                      "STATUS": audit_status, "SOURCE_LINE_NO": source_line,
+                      "GIS_NO": txt(sr.get("GIS_NO")),
+                      "STRUCTURE_": txt(sr.get("STRUCTURE_")),
+                      "DIST_M": round(float(dist), 3)})
+    return result, pd.DataFrame(audit)
 
 def build_caydence_structures_by_row(
     structures_final: gpd.GeoDataFrame,
@@ -6151,7 +6348,10 @@ def run(wires_path,points_path,lidar_source,client_source,kmz_path,management_un
         info(f"  Management Unit features for FULL RoWs: {len(management_units):,}")
 
         info("\nAssigning complete physical tracks to client circuits...")
-        track_meta,track_review=assign_tracks_to_circuits(bundles,track_lookup,wires,client,kmz,u2m)
+        track_meta,track_review=assign_tracks_to_circuits(
+            bundles,track_lookup,wires,client,kmz,u2m,
+            raw_points=raw_points,client_structure_index=csi
+        )
         counts=track_review["CIRCUIT"].value_counts().to_dict() if not track_review.empty else {}
         info("  track attribution: "+", ".join(f"{k}={v}" for k,v in counts.items()))
 
@@ -7067,6 +7267,116 @@ def add_point_processing_summary(
     return out
 
 
+
+def load_mu_conflict_rows(client_source, kmz_path, crs):
+    """Read project-wide SoW areas; never infer exclusivity from local AOIs alone."""
+    env = txt(os.getenv("EVERSOURCE_SOW_SQLITE"))
+    roots = {Path(kmz_path).parent, Path(client_source).parent}
+    if Path(client_source).is_dir():
+        roots.add(Path(client_source))
+    paths = [Path(env)] if env else sorted({p for root in roots for p in root.glob("*.sqlite")})
+    paths = [p for p in paths if p.is_file()]
+    for path in paths:
+        try:
+            g = gpd.read_file(path, layer="areas")
+            if g.crs is None or "entity reference" not in g.columns:
+                continue
+            g = g.to_crs(crs)
+            grouped = defaultdict(list)
+            for _, r in g.iterrows():
+                key = row_key(r["entity reference"])
+                geom = r.geometry
+                if key and geom is not None and not geom.is_empty and geom.geom_type in ("Polygon", "MultiPolygon"):
+                    grouped[key].append(geom if geom.is_valid else geom.buffer(0))
+            if grouped:
+                refs = {k: (k, unary_union(v)) for k, v in grouped.items()}
+                info(f"  MU conflict reference: {path.name} ({len(refs)} RoWs)")
+                return refs, path
+        except Exception as exc:
+            info(f"  WARNING: MU SoW areas unavailable: {path}: {exc}")
+    info("  WARNING: no SoW areas SQLite; automatic MU reassignment disabled")
+    return {}, None
+
+
+def assign_management_units_to_aoi(mus, aois, min_area_m2=1.0, sow_refs=None):
+    """Repair uncovered AOI areas only; never duplicate a client MU across RoWs.
+
+    All decisions use the original source assignments, not earlier repairs.
+    Boundary touches and intersections <= min_area_m2 are ignored.
+    """
+    columns = ["ROW", "MU_ID", "SOURCE_ROW", "ASSIGNED_ROW", "OTHER_ROWS",
+               "OVERLAP_M2", "REMAINING_M2", "REASON", "SEVERITY"]
+    out = mus.copy().reset_index(drop=True)
+    qa = []
+    scale = unit_to_metre(CRS.from_user_input(mus.crs)) ** 2
+    def clean(g):
+        return g if g is None or g.is_empty or g.is_valid else g.buffer(0)
+    def area(g):
+        return 0.0 if g is None or g.is_empty else float(g.area) * scale
+    refs = {row_key(a["ROW"]): (txt(a["ROW"]), clean(a["geometry"]))
+            for a in aois.values() if a.get("geometry") is not None
+            and not a["geometry"].is_empty and a.get("CRS_COMPATIBLE", 1)}
+    if not refs:
+        return out, pd.DataFrame(qa, columns=columns)
+    source = out["ROW"].map(row_key)
+    geoms = [clean(g) for g in out.geometry]
+    spatial = gpd.GeoSeries(geoms, crs=mus.crs).sindex
+    ref_keys = sorted(refs)
+    # Include all SoW areas, plus locally published AOI geometry for each RoW.
+    conflict_refs = dict(sow_refs or {})
+    for k, (name, geom) in refs.items():
+        prior = conflict_refs.get(k)
+        conflict_refs[k] = (name, unary_union([prior[1], geom]) if prior else geom)
+    conflict_keys = sorted(conflict_refs)
+    ref_series = gpd.GeoSeries([conflict_refs[k][1] for k in conflict_keys], crs=mus.crs)
+    ref_index = ref_series.sindex
+    proposals = defaultdict(set)
+    gaps = {}
+    def report(reason, row, i=None, assigned="", others="", overlap=None, remaining=None):
+        qa.append(dict(ROW=row, MU_ID=txt(out.iloc[i].get("MU_ID")) if i is not None else "",
+                       SOURCE_ROW=txt(out.iloc[i]["ROW"]) if i is not None else "",
+                       ASSIGNED_ROW=assigned, OTHER_ROWS=others, OVERLAP_M2=overlap,
+                       REMAINING_M2=remaining, REASON=reason, SEVERITY="REVIEW"))
+    for key in ref_keys:
+        row, aoi = refs[key]
+        candidates = [int(i) for i in spatial.query(aoi, predicate="intersects")]
+        own = [geoms[i] for i in candidates if source.iloc[i] == key]
+        gap = aoi.difference(unary_union(own)) if own else aoi
+        if area(gap) <= min_area_m2:
+            continue
+        gaps[key] = gap
+        for i in candidates:
+            if source.iloc[i] == key:
+                continue
+            overlap = area(geoms[i].intersection(gap))
+            if overlap <= min_area_m2:
+                continue
+            if not sow_refs or key not in sow_refs or source.iloc[i] not in sow_refs:
+                report("MU_SOW_SCOPE_UNVERIFIED", row, i, overlap=overlap)
+                continue
+            others = [conflict_keys[int(j)] for j in ref_index.query(geoms[i], predicate="intersects")
+                      if conflict_keys[int(j)] != key and area(geoms[i].intersection(ref_series.iloc[int(j)])) > min_area_m2]
+            if others:
+                report("MU_MULTIPLE_ROW_CONFLICT", row, i, others=";".join(conflict_refs[k][0] for k in sorted(others)), overlap=overlap)
+            else:
+                proposals[i].add(key)
+    accepted = defaultdict(list)
+    for i, keys in sorted(proposals.items()):
+        if len(keys) != 1:
+            for k in sorted(keys):
+                report("MU_MULTIPLE_ROW_CONFLICT", refs[k][0], i, others=";".join(refs[x][0] for x in sorted(keys-{k})))
+            continue
+        key = next(iter(keys)); row = refs[key][0]
+        report("MU_ROW_REASSIGNED", row, i, assigned=row, overlap=area(geoms[i].intersection(gaps[key])))
+        accepted[key].append(geoms[i])
+        out.at[i, "ROW"] = row
+    for key, gap in gaps.items():
+        remaining = gap.difference(unary_union(accepted[key])) if accepted[key] else gap
+        if area(remaining) > min_area_m2:
+            report("MU_COVERAGE_GAP", refs[key][0], remaining=area(remaining))
+    return out, pd.DataFrame(qa, columns=columns)
+
+
 def build_preflight_table(
     management_units_all: gpd.GeoDataFrame,
     physical_tiles: gpd.GeoDataFrame,
@@ -7083,10 +7393,10 @@ def build_preflight_table(
     coverage_source = "LASBOUNDARY" if boundary_union is not None and not boundary_union.is_empty else "TILE_BOUNDS"
 
     rows = []
-    for row, sg in management_units_all[management_units_all["ROW"].apply(bool)].groupby("ROW", sort=True):
+    grouped = dict(tuple(management_units_all[management_units_all["ROW"].apply(bool)].groupby("ROW", sort=True)))
+    for row in sorted(set(grouped) | {txt(a["ROW"]) for a in aoi_lookup.values()}):
+        sg = grouped.get(row, management_units_all.iloc[:0])
         geoms = [g for g in sg.geometry if g is not None and not g.is_empty]
-        if not geoms:
-            continue
         mu_geom = unary_union(geoms)
         mu_cov = _coverage_ratio(mu_geom, coverage_geom)
         aoi = aoi_lookup.get(row_key(row))
@@ -7327,6 +7637,11 @@ def run_preflight(
 
         info(f"Checking AOIs under: {aoi_dir}")
         aois, aoi_review = discover_aoi_polygons(aoi_dir, crs, known_rows, td)
+        sow_mu_refs, sow_mu_path = load_mu_conflict_rows(client_source, kmz_path, crs)
+        mus, mu_aoi_review = assign_management_units_to_aoi(mus, aois, sow_refs=sow_mu_refs)
+        mu_review = pd.concat([mu_review, mu_aoi_review], ignore_index=True)
+        mu_review.to_csv(output / "00_preflight_mu_review.csv", index=False)
+        info(f"  MU coverage QA: {len(mu_aoi_review):,} findings")
 
         lasboundary_exe = find_lasboundary_exe(lasboundary_path)
         lidar_boundary = build_actual_lidar_boundary(
@@ -7358,10 +7673,11 @@ def run_preflight(
             cache_dir, "coverage_table",
             {"tiles": tiles_key, "mus": mus_key,
              "aoi": _path_fingerprint(aoi_dir),
+             "sow_mu": _path_fingerprint(sow_mu_path),
              "boundary": _path_fingerprint(output / "00_lidar_boundary_cache.json"),
              "boundary_tiles": _path_fingerprint(boundary_tiles_gpkg),
              "code": _code_fingerprint(build_preflight_table, add_point_processing_summary,
-                                       discover_aoi_polygons)},
+                                       discover_aoi_polygons, assign_management_units_to_aoi, load_mu_conflict_rows)},
             _coverage_table,
             "coverage table",
         )
@@ -9805,6 +10121,89 @@ def recover_terminal_2d_from_3d(
             out.at[idx,'LENGTH_M']=float(new_geom.length)*unit_to_m
     return out, pd.DataFrame(qa,columns=['CIRCUIT','PART','SIDE','ACTION','WIRE_ID','EXTENSION_M']), rows_to_gdf(extras,formal_2d.crs)
 
+def suppress_earth_only_2d_branches(formal_2d, source_3d, unit_to_m, role_audit=None):
+    """Drop secondary 2D parts only when EARTH-only evidence is unambiguous.
+
+    Retain the main representation, preserve every source/Caydence 3D wire, and
+    keep ambiguous/PHASE-bearing branches for operator QA. This check is run
+    after class 187/210 voting, not before.
+    """
+    cols = ["CIRCUIT", "ROW", "PART", "LENGTH_M", "EARTH_IDS",
+            "EARTH_COVERAGE_PCT", "PHASE_COVERAGE_PCT", "ACTION"]
+    qa = []
+    if formal_2d is None or formal_2d.empty or source_3d is None or source_3d.empty:
+        return formal_2d, pd.DataFrame(columns=cols)
+    out = formal_2d.copy()
+    verified_earth = set()
+    if role_audit is not None and not role_audit.empty:
+        verified_earth = {
+            txt(r.get("WIRE_ID")) for _, r in role_audit.iterrows()
+            if txt(r.get("FINAL_TYPE")).upper() == "EARTH"
+            and txt(r.get("METHOD")) in ("EXPLICIT_DXF_LEVEL", "LIDAR_CLASS_187_210")
+        }
+    radius_earth = 4.0 / unit_to_m
+    radius_phase = 6.0 / unit_to_m
+    join_tol = 8.0 / unit_to_m
+    for idx, rec in out.iterrows():
+        g = rec.geometry
+        parts = list(getattr(g, "geoms", [g]))
+        parts = [p for p in parts if isinstance(p, LineString) and p.length > 0]
+        if len(parts) < 2:
+            continue
+        # The longest physical run is not an automatically removable branch.
+        main = max(parts, key=lambda part: part.length)
+        retained = [main]
+        circ = txt(rec.get("CIRCUIT"))
+        own = source_3d[source_3d["CIRCUIT"].astype(str) == circ]
+        earth = [(txt(r.get("WIRE_ID")), force_2d(r.geometry)) for _, r in own.iterrows()
+                 if txt(r.get("WIRE_TYPE")).upper() == "EARTH"
+                 and txt(r.get("WIRE_ID")) in verified_earth and r.geometry is not None]
+        phase = [force_2d(r.geometry) for _, r in own.iterrows()
+                 if (txt(r.get("WIRE_TYPE")).upper() != "EARTH"
+                     or txt(r.get("WIRE_ID")) not in verified_earth)
+                 and r.geometry is not None]
+        changed = False
+        for part_no, part in enumerate(parts):
+            if part.equals(main):
+                continue
+            length_m = part.length * unit_to_m
+            endpoints = (Point(part.coords[0]), Point(part.coords[-1]))
+            # Only a genuine side branch from the retained 2D network.
+            if min(float(main.distance(p)) for p in endpoints) > join_tol:
+                retained.append(part)
+                continue
+            if length_m < 15.0 or not earth:
+                retained.append(part)
+                continue
+            # Exclude fork junctions from the classification sample because
+            # PHASE wires belonging to the main route naturally run there.
+            sample = [part.interpolate(f, normalized=True) for f in np.linspace(0.15, 0.85, 13)]
+            near_earth = [any(w.distance(p) <= radius_earth for _, w in earth) for p in sample]
+            near_phase = [any(w.distance(p) <= radius_phase for w in phase) for p in sample]
+            earth_ratio = sum(near_earth) / len(sample)
+            phase_ratio = sum(near_phase) / len(sample)
+            ids = sorted({wid for wid, w in earth if w.distance(part) <= radius_earth})
+            confirmed = earth_ratio >= 0.85 and phase_ratio <= 0.05 and len(ids) >= 1
+            qa.append({"CIRCUIT": circ, "ROW": txt(rec.get("ROW")),
+                       "PART": part_no, "LENGTH_M": round(length_m, 2),
+                       "EARTH_IDS": ";".join(ids),
+                       "EARTH_COVERAGE_PCT": round(earth_ratio * 100, 1),
+                       "PHASE_COVERAGE_PCT": round(phase_ratio * 100, 1),
+                       "ACTION": "EARTH_ONLY_BRANCH_EXCLUDED" if confirmed
+                                 else "REVIEW_OR_RETAIN"})
+            if confirmed:
+                changed = True
+            else:
+                retained.append(part)
+        if changed:
+            merged = _multipart_circuit_geometry(retained)
+            if merged is not None:
+                out.at[idx, "geometry"] = merged
+                if "LENGTH_M" in out.columns:
+                    out.at[idx, "LENGTH_M"] = merged.length * unit_to_m
+    return out, pd.DataFrame(qa, columns=cols)
+
+
 def trim_branch_overlaps(formal_2d, unit_to_m, tol_m=3.0, min_overlap_m=3.0, step_m=1.0,
                          node_snap_m=5.0):
     """R01.05 (20/11): a branch part must not run on top of the main line.
@@ -10309,7 +10708,29 @@ def run_geometry_stage(
         csi=build_client_structure_index(client_structures)
         kmz_refs=project_kmz(parse_sow_kmz(kmz_path),crs);kmz=kmz_lookup(kmz_refs)
 
-        track_meta,track_review=assign_tracks_to_circuits(bundles,track_lookup,wires,client,kmz,u2m)
+        track_meta,track_review=assign_tracks_to_circuits(
+            bundles,track_lookup,wires,client,kmz,u2m,
+            raw_points=raw_points,client_structure_index=csi
+        )
+        if not track_review.empty:
+            changed_tracks = track_review[
+                track_review["LAYER_RULE"].astype(str) == "POA_SOURCE_CORRECTED"
+            ]
+            conflicts = track_review[
+                track_review["LAYER_RULE"].astype(str) ==
+                "POA_SOURCE_VOLTAGE_CONFLICT"
+            ]
+            for _, warning in conflicts.iterrows():
+                info("  QA POA/SOURCE vs DXF voltage conflict "
+                     f"track {warning['TRACK_ID']}: kept {warning['ORIGINAL_CKEY']} "
+                     f"({warning['LAYER_KV']}kV source DXF); POA indicated "
+                     f"{warning['POA_SOURCE_CKEY']} "
+                     f"({warning['POA_SOURCE_TARGET_KV']}kV)")
+            for _, fix in changed_tracks.iterrows():
+                info("  POA+SOURCE track correction "
+                     f"{fix['TRACK_ID']}: {fix['ORIGINAL_CKEY']} -> {fix['CKEY']} "
+                     f"({int(fix['POA_SOURCE_MATCHES'])}/{int(fix['POA_SOURCE_TOTAL'])} "
+                     "validated physical supports)")
         paths,dropped=build_circuit_paths(bundles,supports,u2m)
         final_wires,span_edges,structures_xy,phase_discarded,join_review=build_final_products(
             paths,bundles,supports,raw_points,client,kmz,csi,u2m,max_join_review_m,wire_simplify_m
@@ -10388,10 +10809,20 @@ def run_geometry_stage(
         # Second-pass source attribution follows order along each circuit.
         # It only fills blank source fields and does not move a POA Structure.
         structures_xy, corridor_qa = attribute_unmatched_structures_along_corridor(
-            structures_xy, csi, client, kmz, u2m
+            structures_xy, csi, client, kmz, u2m, raw_points=raw_points
         )
         corridor_qa.to_csv(output/"01_structure_corridor_attribution.csv", index=False)
         info("Corridor source attribution: " + str(int((corridor_qa.get("STATUS", pd.Series(dtype=str)) == "MATCHED").sum())) + " newly matched structures")
+
+        # Resolve unambiguous source circuit mismatches after normal matching.
+        structures_xy, mismatch_qa = recover_source_circuit_mismatches(
+            structures_xy, csi, u2m
+        )
+        mismatch_qa.to_csv(output / "01_structure_source_circuit_mismatch.csv", index=False)
+        info("Source circuit mismatch recovered: " + str(int(
+            (mismatch_qa.get("STATUS", pd.Series(dtype=str)) == "SOURCE_CIRCUIT_MISMATCH").sum()
+        )))
+
 
         # Ground sampling returns 0-based rows; preserve that indexing even
         # when selected RoWs have filtered a non-contiguous source index.
@@ -10467,6 +10898,16 @@ def run_geometry_stage(
                  f"EARTH-on-2D spans replaced; {len(moved_idx)} Structures moved onto the new 2D")
         pd.DataFrame(reselect_qa, columns=["WIRE_ID", "ACTION"]).to_csv(
             output/"01_2d_lidar_earth_reselect.csv", index=False)
+
+        # Remove only independently confirmed EARTH-only secondary 2D runs.
+        # Product 267 remains a lossless inventory of original 3D conductors.
+        final_wires, earth_branch_qa = suppress_earth_only_2d_branches(
+            final_wires, cayd_w, u2m, role_audit=lidar_role_qa
+        )
+        earth_branch_qa.to_csv(output/"01_earth_only_2d_branches.csv", index=False)
+        info("EARTH-only 2D branches excluded: " +
+             str(int((earth_branch_qa.get("ACTION", pd.Series(dtype=str)) ==
+                      "EARTH_ONLY_BRANCH_EXCLUDED").sum())))
 
         # SCHF and single-top SCSH use three classified horizontal PHASE
         # wires. SCSH with neighboring same-circuit POA stays untouched.
@@ -12626,6 +13067,11 @@ def run_points_stage(
 
         mu_gdb=resolve_management_units_gdb(management_units_source,client_source,td)
         mus_all,mu_review=load_management_units(mu_gdb,crs,kmz_refs,'Eversource')
+        sow_mu_refs, sow_mu_path = load_mu_conflict_rows(client_source, kmz_path, crs)
+        mus_all,mu_aoi_review=assign_management_units_to_aoi(mus_all,aois,sow_refs=sow_mu_refs)
+        mu_review=pd.concat([mu_review,mu_aoi_review],ignore_index=True)
+        mu_review.to_csv(output/'02_mu_review.csv',index=False)
+        info(f'  MU coverage QA: {len(mu_aoi_review):,} findings')
         physical_tiles,tile_size=build_lidar_tile_footprints(lidar_source,crs,td,year,None)
         lidar_files=discover_lidar_files(lidar_source,td) if need_point_data else []
 

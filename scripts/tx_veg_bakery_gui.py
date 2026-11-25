@@ -460,6 +460,13 @@ class BakeryGUI(tk.Tk):
                      font=("Segoe UI", 8)).pack(anchor="w")
             self.stage_labels[name] = (box, lbl)
 
+        # Independent QA can validate a previous Bakery run without invoking
+        # this project's Preflight, Geometry or the in-batch QA controls.
+        ttk.Button(
+            sidebar, text="QA Inspector", style="Secondary.TButton",
+            command=self._launch_standalone_qa
+        ).pack(fill="x", pady=(14, 5))
+
         # Always-visible help action, bottom of left navigation.
         ttk.Button(
             sidebar, text="Operator Manual", style="Secondary.TButton",
@@ -941,6 +948,22 @@ class BakeryGUI(tk.Tk):
         if not self.output_var.get().strip():
             return
         self._open_folder(Path(self.output_var.get()) / "deliverables")
+
+    def _launch_standalone_qa(self):
+        """Open the independent inspector using the existing Bakery venv."""
+        script = SCRIPT_DIR / "qa_inspector_standalone_gui.py"
+        if not script.is_file():
+            messagebox.showerror("QA Inspector", f"Standalone Inspector not found:\\n{script}")
+            return
+        try:
+            subprocess.Popen(
+                [PY, str(script)],
+                cwd=str(ROOT),
+                stdin=subprocess.DEVNULL,
+                **hidden_process_kwargs(),
+            )
+        except Exception as exc:
+            messagebox.showerror("QA Inspector", f"Could not start QA Inspector:\\n{exc}")
 
     def _open_qa_results(self):
         out = self.output_var.get().strip()
