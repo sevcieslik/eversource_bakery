@@ -7267,6 +7267,70 @@ def add_point_processing_summary(
     return out
 
 
+
+def assign_management_units_to_aoi(mus, aois, min_overlap_m2=1.0, min_overlap_fraction=0.001):
+    """Use available published AOIs for delivery ownership; keep original MU geometry/ID.
+
+    Missing AOIs retain source ownership for preflight discovery only. Stage 02
+    already requires an AOI for every selected RoW. Ignore boundary-only and
+    tiny sliver intersections. Report every changed or unresolved assignment.
+    """
+    if mus.empty:
+        return mus.copy(), pd.DataFrame()
+    valid = [r for r in aois.values()
+             if r.get("geometry") is not None and not r["geometry"].is_empty
+             and r.get("CRS_COMPATIBLE", 1)]
+    if not valid:
+        return mus.copy(), pd.DataFrame([{"REASON": "MU_AOI_UNAVAILABLE", "SEVERITY": "REVIEW"}])
+    areas = gpd.GeoDataFrame(valid, geometry="geometry", crs=mus.crs)
+    spatial = areas.sindex
+    scale = unit_to_metre(CRS.from_user_input(mus.crs)) ** 2
+    available = {row_key(r["ROW"]) for r in valid}
+    records, review = [], []
+    for _, r in mus.iterrows():
+        original = txt(r.get("ROW"))
+        geom = r.geometry
+        hits = []
+        if geom is not None and not geom.is_empty:
+            test = geom if geom.is_valid else geom.buffer(0)
+            if not test.is_empty and test.area > 0:
+                for i in spatial.query(test, predicate="intersects"):
+                    a = areas.iloc[int(i)]
+                    ag = a.geometry if a.geometry.is_valid else a.geometry.buffer(0)
+                    overlap = test.intersection(ag).area
+                    fraction = overlap / test.area
+                    if overlap * scale >= min_overlap_m2 and fraction >= min_overlap_fraction:
+                        hits.append((txt(a["ROW"]), fraction, overlap * scale))
+        assigned = set()
+        for row, fraction, area in sorted(hits):
+            if row_key(row) in assigned:
+                continue
+            assigned.add(row_key(row))
+            rec = r.to_dict()
+            rec["ROW"] = row
+            records.append(rec)
+            if row_key(row) != row_key(original):
+                review.append({"MU_ID": txt(r.get("MU_ID")), "SOURCE_ROW": original,
+                               "ASSIGNED_ROW": row, "OVERLAP_PCT": 100 * fraction,
+                               "OVERLAP_M2": area, "ASSIGNMENT_METHOD": "AOI_POLYGON",
+                               "REASON": "MU_ROW_SCOPE_CONFLICT", "SEVERITY": "REVIEW"})
+        # An unpublished source RoW must remain discoverable in preflight.
+        # Never retain a source assignment contradicted by its published AOI.
+        if row_key(original) not in available:
+            if row_key(original) not in assigned:
+                records.append(r.to_dict())
+            if hits:
+                review.append({"MU_ID": txt(r.get("MU_ID")), "SOURCE_ROW": original,
+                               "ASSIGNED_ROW": original, "REASON": "MU_SOURCE_AOI_UNAVAILABLE",
+                               "SEVERITY": "REVIEW"})
+        elif not hits:
+            review.append({"MU_ID": txt(r.get("MU_ID")), "SOURCE_ROW": original,
+                           "ASSIGNED_ROW": "", "REASON": "MU_OUTSIDE_PUBLISHED_AOI",
+                           "SEVERITY": "REVIEW"})
+    result = gpd.GeoDataFrame(records, geometry="geometry", crs=mus.crs) if records else mus.iloc[:0].copy()
+    return result, pd.DataFrame(review)
+
+
 def build_preflight_table(
     management_units_all: gpd.GeoDataFrame,
     physical_tiles: gpd.GeoDataFrame,
@@ -7527,6 +7591,10 @@ def run_preflight(
 
         info(f"Checking AOIs under: {aoi_dir}")
         aois, aoi_review = discover_aoi_polygons(aoi_dir, crs, known_rows, td)
+        mus, mu_aoi_review = assign_management_units_to_aoi(mus, aois)
+        mu_review = pd.concat([mu_review, mu_aoi_review], ignore_index=True)
+        mu_review.to_csv(output / "00_preflight_mu_review.csv", index=False)
+        info(f"  MU AOI assignment review: {len(mu_aoi_review):,} findings")
 
         lasboundary_exe = find_lasboundary_exe(lasboundary_path)
         lidar_boundary = build_actual_lidar_boundary(
@@ -7561,7 +7629,7 @@ def run_preflight(
              "boundary": _path_fingerprint(output / "00_lidar_boundary_cache.json"),
              "boundary_tiles": _path_fingerprint(boundary_tiles_gpkg),
              "code": _code_fingerprint(build_preflight_table, add_point_processing_summary,
-                                       discover_aoi_polygons)},
+                                       discover_aoi_polygons, assign_management_units_to_aoi)},
             _coverage_table,
             "coverage table",
         )
@@ -12951,6 +13019,10 @@ def run_points_stage(
 
         mu_gdb=resolve_management_units_gdb(management_units_source,client_source,td)
         mus_all,mu_review=load_management_units(mu_gdb,crs,kmz_refs,'Eversource')
+        mus_all,mu_aoi_review=assign_management_units_to_aoi(mus_all,aois)
+        mu_review=pd.concat([mu_review,mu_aoi_review],ignore_index=True)
+        mu_review.to_csv(output/'02_mu_review.csv',index=False)
+        info(f'  MU AOI assignment review: {len(mu_aoi_review):,} findings')
         physical_tiles,tile_size=build_lidar_tile_footprints(lidar_source,crs,td,year,None)
         lidar_files=discover_lidar_files(lidar_source,td) if need_point_data else []
 
